@@ -1,39 +1,106 @@
 # Equations
 
-This repository models only transfer/staging time on the host link.
+This model includes transfer costs and deterministic queueing from shared resources.
 Compute time is out of scope.
 
-## Per-transfer time
+## Transfer time
+
+Per transfer:
 
 \[
-T = L + \frac{B}{BW}
+T = T_{fixed} + \frac{B}{BW}
 \]
 
 - `B`: bytes transferred
-- `BW`: one-way link bandwidth in bytes/second
-- `L`: fixed transfer latency in seconds
+- `BW`: one-way bandwidth in bytes/s
 
-## Total transfer time
+PCIe fixed cost:
 
 \[
-T_{total} = \sum_{k=1}^{N} T_k
+T_{fixed,pcie} = T_{enqueue} + T_{driver} + T_{wire}
 \]
 
-Where `N` is the number of transfers in a scenario.
+\[
+T_{pcie}(B) = T_{fixed,pcie} + \frac{B}{BW_{pcie}}
+\]
 
-## Queueing / contention
+CXL fixed cost:
 
-Queueing is fixed to `0` in this model. Transfers are serialized.
+\[
+T_{cxl}(B) = L_{cxl} + \frac{B}{BW_{cxl}}
+\]
 
-## Scenarios
+## Resource scheduling and queue attribution
 
-- `conventional_host_bounce`: for each stage (4 total), one `H2D` transfer and one `D2H` transfer.
-  - Total transfers: `2 * num_stages = 8`
-- `flowcxl_chain`: one initial `H2D` and one final `D2H` transfer.
-  - Total transfers: `2`
+For an operation requested at `t_req` on resources `R`:
 
-## Derived outputs
+\[
+wait_r = \max(0, t_{free,r} - t_{req})
+\]
+\[
+blocking\_wait = \max_{r \in R}(wait_r)
+\]
+\[
+t_{start} = t_{req} + blocking\_wait
+\]
+\[
+t_{end} = t_{start} + duration
+\]
 
-- `total_bytes_moved_over_host_link` (stored as `total_bytes_moved`)
-- `total_transfer_time_s`
-- `speedup = time_bounce / time_chain`
+Resource updates:
+
+\[
+t_{free,r} \leftarrow t_{end}, \quad busy\_time_r \leftarrow busy\_time_r + duration
+\]
+
+Queue attribution rule in this repo:
+
+- Identify bottleneck winner resources where `wait_r == blocking_wait`.
+- Split `blocking_wait` equally across winners.
+- Add only the attributed share to each winner resource queue counter.
+
+Totals reported:
+
+- `queue_total_blocking_s`: sum of `blocking_wait` across operations.
+- `queue_total_attributed_s`: sum of per-resource attributed queue times.
+
+## Two-resource gating for PCIe
+
+PCIe H2D requires DMA + link:
+
+- Duplex mode: `dma_h2d` and `pcie_h2d`
+- Shared-link mode: `dma_h2d` and `pcie_shared`
+
+PCIe D2H requires DMA + link:
+
+- Duplex mode: `dma_d2h` and `pcie_d2h`
+- Shared-link mode: `dma_d2h` and `pcie_shared`
+
+CXL uses only link resources:
+
+- Duplex mode: `cxl_h2d` or `cxl_d2h`
+- Shared-link mode: `cxl_shared`
+
+## Completion time
+
+Run completion is event makespan:
+
+\[
+T_{makespan} = \max\limits_{events}(t_{end})
+\]
+
+## Bytes moved
+
+For boundaries `[X0, X1, ..., XN]` and `num_chunks = k`:
+
+Bounce (`pim_no_cxl_bounce` or `pim_cxl_bounce`):
+
+\[
+bytes = k \cdot \sum_{i=1}^{N}(X_{i-1}+X_i)
+\]
+
+Chain (`pim_cxl_chain`):
+
+\[
+bytes = k \cdot (X_0 + X_N)
+\]

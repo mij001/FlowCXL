@@ -1,0 +1,28 @@
+num_chunks:
+  - 1
+  - 8
+
+dataset_profiles:
+  - PROFILE_ONT_100Gbases
+  - PROFILE_ILLUMINA_NA12878
+
+scenario_matrix:
+  - scenario: pim_no_cxl_bounce
+    links:
+      - PCIe Gen4 x16
+    shared_link_modes:
+      - false
+  - scenario: pim_cxl_bounce
+    links:
+      - CXL_LOCAL
+      - CXL_REMOTE
+    shared_link_modes:
+      - false
+      - true
+  - scenario: pim_cxl_chain
+    links:
+      - CXL_LOCAL
+      - CXL_REMOTE
+    shared_link_modes:
+      - false
+      - true
