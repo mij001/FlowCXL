@@ -78,7 +78,11 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
     for col in [
         "makespan_s",
         "total_energy_J",
+        "host_touch_energy_J",
         "lb_compute_stage_max_s",
+        "lb_host_h2d_ingress_s",
+        "lb_host_h2d_stage_s",
+        "lb_host_d2h_s",
         "lb_host_link_s",
         "lb_host_touch_s",
         "lb_cxl_direct_s",
@@ -101,6 +105,9 @@ def _dataset_diagnostic_table(metrics_df: pd.DataFrame, dataset_profile: str) ->
         "total_energy_J",
         "dominant_lb_component",
         "lb_compute_stage_max_s",
+        "lb_host_h2d_ingress_s",
+        "lb_host_h2d_stage_s",
+        "lb_host_d2h_s",
         "lb_host_link_s",
         "lb_host_touch_s",
         "lb_cxl_direct_s",
@@ -109,12 +116,13 @@ def _dataset_diagnostic_table(metrics_df: pd.DataFrame, dataset_profile: str) ->
     return _format_metric_fields(subset)
 
 
-def _ont_bottleneck_narrative(metrics_df: pd.DataFrame) -> str:
+def _ont_gain_narrative(metrics_df: pd.DataFrame) -> str:
     ont = metrics_df[metrics_df["dataset_profile"] == sources.PROFILE_ONT_100Gbases].copy()
     if ont.empty:
         return "No ONT rows found."
 
     lines: List[str] = []
+    ratio_1x = None
     for multiplier in sorted(ont["stage_size_multiplier"].unique()):
         bounce = ont[
             (ont["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE)
@@ -129,27 +137,27 @@ def _ont_bottleneck_narrative(metrics_df: pd.DataFrame) -> str:
         b = bounce.iloc[0]
         d = direct.iloc[0]
         ratio = float(b["makespan_s"]) / float(d["makespan_s"])
-        delta_pct = (ratio - 1.0) * 100.0
+        if abs(float(multiplier) - 1.0) < 1e-12:
+            ratio_1x = ratio
+        gain_pct = (ratio - 1.0) * 100.0
         lines.append(
-            f"- {_format_multiplier(multiplier)}: bounce dominant `{b['dominant_lb_component']}`, "
-            f"direct dominant `{d['dominant_lb_component']}`, "
-            f"bounce/direct makespan ratio `{ratio:.6f}` ({delta_pct:.3f}% gain)."
+            f"- {_format_multiplier(multiplier)}: bounce/direct ratio `{ratio:.6f}` "
+            f"({gain_pct:.3f}% gain), bounce dominant `{b['dominant_lb_component']}`, "
+            f"direct dominant `{d['dominant_lb_component']}`."
         )
 
-    shared_bound = ont[
-        (ont["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT)
-        & (ont["dominant_lb_component"].isin(["compute_stage_max", "host_link"]))
-    ]
-    if not shared_bound.empty:
-        lines.append(
-            "- Interpretation: ONT remains largely compute/ingress-bound in FlowCXL-direct runs, "
-            "so inter-stage bounce removal helps only when host-touch/link terms are competitive."
-        )
+    if ratio_1x is None:
+        lines.append("- ONT 1x ratio unavailable.")
     else:
+        gain_1x = (ratio_1x - 1.0) * 100.0
+        status = "PASS" if ratio_1x >= 1.05 else "FAIL"
         lines.append(
-            "- Interpretation: ONT shifts away from compute/ingress dominance and shows stronger "
-            "inter-stage transfer sensitivity."
+            f"- ONT 1x target (`>=5%`): ratio `{ratio_1x:.6f}` ({gain_1x:.3f}% gain) -> `{status}`."
         )
+    lines.append(
+        "- Streaming admission (`max_inflight_tiles`) and split H2D pools separate ingress pressure "
+        "from inter-stage staging, making overlap/transfer effects easier to attribute."
+    )
     return "\n".join(lines)
 
 
@@ -205,16 +213,17 @@ def main() -> None:
     report_text = (
         "# FlowCXL Tiled Stage-Capacity Report\n\n"
         "## Single Claim\n"
-        "When each stage has fixed compute units and large boundaries must be tiled, direct PIM-to-PIM transfers "
-        "reduce host-bounce overhead and improve end-to-end makespan/energy relative to host-bounced PIM execution.\n\n"
+        "With bounded streaming admission and split host H2D topology, FlowCXL direct transfer isolates "
+        "inter-stage staging costs from ingress contention and exposes overlap-dependent gains.\n\n"
         "## Modeled\n"
         "- Stage-limited compute capacity (CPU or PIM units)\n"
-        "- Tile-by-tile pipelined execution with resource contention\n"
-        "- True host bounce for intermediates: D2H -> HOST_TOUCH -> H2D\n"
+        "- Tile-by-tile pipelined execution with bounded in-flight admission\n"
+        "- True host bounce for intermediates: D2H -> HOST_TOUCH -> H2D(stage)\n"
+        "- Split host H2D resources: ingress vs inter-stage staging\n"
         "- Absolute makespan (seconds) and total energy (joules)\n"
         "- Lower-bound bottleneck diagnostics by resource family\n\n"
-        "## ONT Bottleneck Interpretation\n"
-        f"{_ont_bottleneck_narrative(metrics_df)}\n\n"
+        "## ONT Gain Check\n"
+        f"{_ont_gain_narrative(metrics_df)}\n\n"
         "## Plot Artifacts\n"
         "- plot_makespan_grouped_PROFILE_ONT_100Gbases.png\n"
         "- plot_makespan_grouped_PROFILE_ILLUMINA_NA12878.png\n"

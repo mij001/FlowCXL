@@ -34,9 +34,10 @@ All cited numeric constants live in `sources.py` with URL, quote, and how-used m
 The following are model defaults in `configs/runs.yaml` and can be changed:
 
 - Stage compute-unit counts/rates/power for CPU and PIM
-- Transfer-channel counts
-- Transfer power per channel
+- Transfer-channel counts (including split host H2D ingress vs stage channels)
+- Transfer power per channel (including split host H2D ingress vs stage power)
 - Host-touch throughput and fixed overhead used by true-bounce modeling
 - Tile size
+- Max in-flight tile admission window
 
 These defaults are simulation knobs, not measured constants from literature.

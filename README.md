@@ -11,10 +11,13 @@ The model enforces fixed compute units per stage, tiles large boundaries, and sc
 ## What is modeled
 
 - Stage-limited compute pools (CPU or PIM)
-- Tile-by-tile pipeline overlap
+- Tile-by-tile pipeline overlap with bounded in-flight admission (`max_inflight_tiles`)
 - Inter-stage transfer behavior:
   - true host bounce (`D2H -> HOST_TOUCH -> H2D`)
   - direct CXL (`PIM -> PIM`)
+- Split host H2D topology:
+  - ingress H2D pool
+  - inter-stage staging H2D pool
 - Absolute makespan (seconds)
 - Absolute total energy (joules)
 - Bottleneck lower-bound diagnostics (`compute`, `host_link`, `host_touch`, `cxl_direct`)
@@ -72,6 +75,11 @@ FlowCXL gains depend on the dominant bottleneck:
 
 - if `compute_stage_max` or shared ingress/egress dominates, bounce-removal gains can be small,
 - if bounce-specific `host_touch`/host-link costs dominate, FlowCXL direct gains become large.
+
+Default overlap-focused knobs in `configs/runs.yaml`:
+
+- `pim_units = 32`
+- `max_inflight_tiles = 128`
 
 ## Tests
 

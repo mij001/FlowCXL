@@ -129,7 +129,7 @@ def _build_tile_operations(num_stages: int, scenario: str) -> List[TileOperation
         return operations
 
     operations.append(
-        TileOperation(op_type="TRANSFER", stage_id=1, boundary_index=0, transfer_path="host_h2d")
+        TileOperation(op_type="TRANSFER", stage_id=1, boundary_index=0, transfer_path="host_h2d_ingress")
     )
 
     for stage_id in range(1, num_stages + 1):
@@ -157,7 +157,7 @@ def _build_tile_operations(num_stages: int, scenario: str) -> List[TileOperation
                         op_type="TRANSFER",
                         stage_id=stage_id + 1,
                         boundary_index=stage_id,
-                        transfer_path="host_h2d",
+                        transfer_path="host_h2d_stage",
                     )
                 )
             elif scenario == sources.SCENARIO_PIM_FLOWCXL_DIRECT:
@@ -237,6 +237,7 @@ def _validate_config(config: Dict[str, object]) -> None:
         "dataset_profiles",
         "size_multipliers",
         "tile_size_bytes",
+        "max_inflight_tiles",
         "scenarios",
         "link_profile",
         "resource_capacity",
@@ -252,14 +253,26 @@ def _validate_config(config: Dict[str, object]) -> None:
         raise KeyError("link_profile must include host_link and cxl_direct_link")
 
     resource_capacity = config["resource_capacity"]
-    for key in ["host_h2d_channels", "host_d2h_channels", "cxl_direct_channels", "host_touch_channels"]:
+    for key in [
+        "host_h2d_ingress_channels",
+        "host_h2d_stage_channels",
+        "host_d2h_channels",
+        "cxl_direct_channels",
+        "host_touch_channels",
+    ]:
         if key not in resource_capacity:
             raise KeyError(f"resource_capacity missing key: {key}")
         if int(resource_capacity[key]) <= 0:
             raise ValueError(f"{key} must be > 0")
 
     transfer_power_W = config["transfer_power_W"]
-    for key in ["host_h2d_channel", "host_d2h_channel", "cxl_direct_channel", "host_touch_channel"]:
+    for key in [
+        "host_h2d_ingress_channel",
+        "host_h2d_stage_channel",
+        "host_d2h_channel",
+        "cxl_direct_channel",
+        "host_touch_channel",
+    ]:
         if key not in transfer_power_W:
             raise KeyError(f"transfer_power_W missing key: {key}")
         if float(transfer_power_W[key]) < 0.0:
@@ -284,6 +297,8 @@ def _validate_config(config: Dict[str, object]) -> None:
 
     if int(config["tile_size_bytes"]) <= 0:
         raise ValueError("tile_size_bytes must be > 0")
+    if int(config["max_inflight_tiles"]) <= 0:
+        raise ValueError("max_inflight_tiles must be > 0")
 
 
 def _pool_lower_bound_s(resource: ResourcePool) -> float:
@@ -313,6 +328,7 @@ def simulate_configuration(
     size_multiplier: float,
     scenario: str,
     tile_size_bytes: int,
+    max_inflight_tiles: int,
     host_link: str,
     cxl_direct_link: str,
     resource_capacity: Dict[str, object],
@@ -342,10 +358,15 @@ def simulate_configuration(
         stage_overrides=stage_overrides,
     )
 
-    host_h2d_pool = ResourcePool(
-        name="host_h2d",
-        capacity=int(resource_capacity["host_h2d_channels"]),
-        power_W=float(transfer_power_W["host_h2d_channel"]),
+    host_h2d_ingress_pool = ResourcePool(
+        name="host_h2d_ingress",
+        capacity=int(resource_capacity["host_h2d_ingress_channels"]),
+        power_W=float(transfer_power_W["host_h2d_ingress_channel"]),
+    )
+    host_h2d_stage_pool = ResourcePool(
+        name="host_h2d_stage",
+        capacity=int(resource_capacity["host_h2d_stage_channels"]),
+        power_W=float(transfer_power_W["host_h2d_stage_channel"]),
     )
     host_d2h_pool = ResourcePool(
         name="host_d2h",
@@ -388,12 +409,18 @@ def simulate_configuration(
     traces: List[Dict[str, object]] = []
     completion_times = [0.0 for _ in range(num_tiles)]
     next_op_index = [0 for _ in range(num_tiles)]
-    request_heap: List[Tuple[float, int]] = [(0.0, tile_id) for tile_id in range(num_tiles)]
+
+    inflight_seed = min(int(max_inflight_tiles), num_tiles)
+    next_tile_to_admit = inflight_seed
+    request_heap: List[Tuple[float, int]] = [(0.0, tile_id) for tile_id in range(inflight_seed)]
     heapq.heapify(request_heap)
 
     total_bytes_host_link = 0
     total_bytes_cxl_direct = 0
     total_bytes_host_touch = 0
+    total_bytes_host_h2d_ingress = 0
+    total_bytes_host_h2d_stage = 0
+    total_bytes_host_d2h = 0
 
     while request_heap:
         t_req, tile_id = heapq.heappop(request_heap)
@@ -425,14 +452,21 @@ def simulate_configuration(
             transfer_path = operation.transfer_path
             total_bytes_host_touch += bytes_moved
         else:
-            if operation.transfer_path == "host_h2d":
-                pool = host_h2d_pool
+            if operation.transfer_path == "host_h2d_ingress":
+                pool = host_h2d_ingress_pool
                 link_used = host_link
                 total_bytes_host_link += bytes_moved
+                total_bytes_host_h2d_ingress += bytes_moved
+            elif operation.transfer_path == "host_h2d_stage":
+                pool = host_h2d_stage_pool
+                link_used = host_link
+                total_bytes_host_link += bytes_moved
+                total_bytes_host_h2d_stage += bytes_moved
             elif operation.transfer_path == "host_d2h":
                 pool = host_d2h_pool
                 link_used = host_link
                 total_bytes_host_link += bytes_moved
+                total_bytes_host_d2h += bytes_moved
             elif operation.transfer_path == "cxl_direct":
                 pool = cxl_direct_pool
                 link_used = cxl_direct_link
@@ -471,18 +505,30 @@ def simulate_configuration(
         completion_times[tile_id] = t_end
         if next_op_index[tile_id] < len(operations):
             heapq.heappush(request_heap, (t_end, tile_id))
+        elif next_tile_to_admit < num_tiles:
+            heapq.heappush(request_heap, (t_end, next_tile_to_admit))
+            next_tile_to_admit += 1
 
     makespan_s = max(completion_times) if completion_times else 0.0
 
     compute_energy_J = sum(pool.busy_time_s * pool.power_W for pool in compute_pools)
     host_touch_energy_J = host_touch_pool.busy_time_s * host_touch_pool.power_W
     transfer_energy_J = sum(
-        pool.busy_time_s * pool.power_W for pool in [host_h2d_pool, host_d2h_pool, cxl_direct_pool]
+        pool.busy_time_s * pool.power_W
+        for pool in [
+            host_h2d_ingress_pool,
+            host_h2d_stage_pool,
+            host_d2h_pool,
+            cxl_direct_pool,
+        ]
     ) + host_touch_energy_J
     total_energy_J = compute_energy_J + transfer_energy_J
 
     lb_compute_stage_max_s = max(_pool_lower_bound_s(pool) for pool in compute_pools) if compute_pools else 0.0
-    lb_host_link_s = max(_pool_lower_bound_s(host_h2d_pool), _pool_lower_bound_s(host_d2h_pool))
+    lb_host_h2d_ingress_s = _pool_lower_bound_s(host_h2d_ingress_pool)
+    lb_host_h2d_stage_s = _pool_lower_bound_s(host_h2d_stage_pool)
+    lb_host_d2h_s = _pool_lower_bound_s(host_d2h_pool)
+    lb_host_link_s = max(lb_host_h2d_ingress_s, lb_host_h2d_stage_s, lb_host_d2h_s)
     lb_host_touch_s = _pool_lower_bound_s(host_touch_pool)
     lb_cxl_direct_s = _pool_lower_bound_s(cxl_direct_pool)
     dominant_lb_component = _dominant_lb_component(
@@ -507,8 +553,14 @@ def simulate_configuration(
         "total_bytes_host_link": total_bytes_host_link,
         "total_bytes_cxl_direct": total_bytes_cxl_direct,
         "total_bytes_host_touch": total_bytes_host_touch,
+        "total_bytes_host_h2d_ingress": total_bytes_host_h2d_ingress,
+        "total_bytes_host_h2d_stage": total_bytes_host_h2d_stage,
+        "total_bytes_host_d2h": total_bytes_host_d2h,
         "total_bytes_moved": total_bytes_host_link + total_bytes_cxl_direct,
         "lb_compute_stage_max_s": lb_compute_stage_max_s,
+        "lb_host_h2d_ingress_s": lb_host_h2d_ingress_s,
+        "lb_host_h2d_stage_s": lb_host_h2d_stage_s,
+        "lb_host_d2h_s": lb_host_d2h_s,
         "lb_host_link_s": lb_host_link_s,
         "lb_host_touch_s": lb_host_touch_s,
         "lb_cxl_direct_s": lb_cxl_direct_s,
@@ -527,6 +579,7 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
     size_multipliers = config["size_multipliers"]
     scenarios = config["scenarios"]
     tile_size_bytes = int(config["tile_size_bytes"])
+    max_inflight_tiles = int(config["max_inflight_tiles"])
     host_link = config["link_profile"]["host_link"]
     cxl_direct_link = config["link_profile"]["cxl_direct_link"]
     resource_capacity = config["resource_capacity"]
@@ -562,6 +615,7 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                     size_multiplier=float(size_multiplier),
                     scenario=scenario,
                     tile_size_bytes=tile_size_bytes,
+                    max_inflight_tiles=max_inflight_tiles,
                     host_link=host_link,
                     cxl_direct_link=cxl_direct_link,
                     resource_capacity=resource_capacity,

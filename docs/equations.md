@@ -30,6 +30,20 @@ Each boundary \(X_i'\) is partitioned exactly into tile bytes:
 X_i' = \sum_{k=1}^{K} X_{i,k}
 \]
 
+## Streaming admission
+
+Only a bounded number of tiles are admitted at once:
+
+\[
+K_{active,0} = \min(K, max\_inflight\_tiles)
+\]
+
+When tile \(k\) completes its final operation at \(t_{done,k}\), one new tile is admitted at:
+
+\[
+t_{admit,next} = t_{done,k}
+\]
+
 ## Compute duration
 
 For stage \(s\), tile \(k\), compute rate \(R_s\) (bytes/s):
@@ -81,11 +95,11 @@ t_{free,slot} \leftarrow t_{end}
 
 - `cpu_only`: compute only, no transfers.
 - `pim_host_bounce`:
-  - ingress: host \(H2D\) to stage 1
+  - ingress: host \(H2D\_ingress\) to stage 1
   - between stages: \(D2H\) then \(HOST\_TOUCH\) then \(H2D\)
   - egress: host \(D2H\) from final stage
 - `pim_flowcxl_direct`:
-  - ingress: host \(H2D\) to stage 1
+  - ingress: host \(H2D\_ingress\) to stage 1
   - between stages: direct CXL transfer
   - egress: host \(D2H\) from final stage
 
@@ -119,7 +133,7 @@ E_{total} = E_{compute} + E_{transfer}
 
 ## Bottleneck lower-bound diagnostics
 
-For any resource pool \(r\) with capacity \(C_r\):
+For any resource pool \(r\) with capacity \(C_r\) and busy time \(busy\_time_r\):
 
 \[
 LB_r = \frac{busy\_time_r}{C_r}
@@ -128,16 +142,25 @@ LB_r = \frac{busy\_time_r}{C_r}
 Reported aggregate lower bounds:
 
 \[
-LB_{compute\_stage\_max} = \max_{r \in compute}(LB_r)
+LB_{compute\_stage\_max} = \max_{r \in compute\_pools}(LB_r)
 \]
 \[
-LB_{host\_link} = \max(LB_{host\_h2d}, LB_{host\_d2h})
+LB_{host\_h2d\_ingress} = LB_{pool(host\_h2d\_ingress)}
 \]
 \[
-LB_{host\_touch} = LB_{host\_touch}
+LB_{host\_h2d\_stage} = LB_{pool(host\_h2d\_stage)}
 \]
 \[
-LB_{cxl\_direct} = LB_{cxl\_direct}
+LB_{host\_d2h} = LB_{pool(host\_d2h)}
+\]
+\[
+LB_{host\_link} = \max(LB_{host\_h2d\_ingress}, LB_{host\_h2d\_stage}, LB_{host\_d2h})
+\]
+\[
+LB_{host\_touch} = LB_{pool(host\_touch)}
+\]
+\[
+LB_{cxl\_direct} = LB_{pool(cxl\_direct)}
 \]
 
 `dominant_lb_component` is the component with largest lower bound in a run.

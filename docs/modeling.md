@@ -5,6 +5,7 @@
 - Model includes stage-limited compute, transfer costs, contention, and energy.
 - Large stage boundaries are tiled and processed chunk-by-chunk.
 - Pipeline overlap is enabled across tiles and stages.
+- Tile admission is bounded by `max_inflight_tiles` to avoid all-at-once ingress flooding.
 
 ## Stage Compute Capacity
 
@@ -28,7 +29,8 @@ Host-touch is applied only for inter-stage bounce operations, not ingress/egress
 
 - Host transfers use `link_profile.host_link` parameters from `sources.LINKS`.
 - Direct transfers use `link_profile.cxl_direct_link`.
-- Channel counts are limited (`host_h2d_channels`, `host_d2h_channels`, `cxl_direct_channels`, `host_touch_channels`), which introduces queueing at transfer resources.
+- Channel counts are limited (`host_h2d_ingress_channels`, `host_h2d_stage_channels`, `host_d2h_channels`, `cxl_direct_channels`, `host_touch_channels`), which introduces queueing at transfer resources.
+- Host ingress and inter-stage staging use separate H2D pools to decouple their contention effects.
 - Host-touch uses shared host resource contention and a configurable per-touch model (`host_touch_fixed_s + bytes / host_touch_Bps`).
 
 ## Stage-size Sweep
@@ -41,6 +43,7 @@ Default x-axis categories for grouped bars are:
 - `4x`
 
 All boundaries in a dataset profile are scaled together to preserve relative pipeline shape.
+Default overlap-focused settings use `pim_units=32` and `max_inflight_tiles=128`.
 
 ## Trace Sampling
 
