@@ -1,28 +1,41 @@
-num_chunks:
-  - 1
-  - 8
-
 dataset_profiles:
   - PROFILE_ONT_100Gbases
   - PROFILE_ILLUMINA_NA12878
 
-scenario_matrix:
-  - scenario: pim_no_cxl_bounce
-    links:
-      - PCIe Gen4 x16
-    shared_link_modes:
-      - false
-  - scenario: pim_cxl_bounce
-    links:
-      - CXL_LOCAL
-      - CXL_REMOTE
-    shared_link_modes:
-      - false
-      - true
-  - scenario: pim_cxl_chain
-    links:
-      - CXL_LOCAL
-      - CXL_REMOTE
-    shared_link_modes:
-      - false
-      - true
+size_multipliers:
+  - 0.5
+  - 1.0
+  - 2.0
+  - 4.0
+
+tile_size_bytes: 268435456
+trace_max_tiles: 512
+
+scenarios:
+  - cpu_only
+  - pim_host_bounce
+  - pim_flowcxl_direct
+
+link_profile:
+  host_link: PCIe Gen4 x16
+  cxl_direct_link: CXL_LOCAL
+
+resource_capacity:
+  host_h2d_channels: 1
+  host_d2h_channels: 1
+  cxl_direct_channels: 1
+
+stage_defaults:
+  cpu_units: 32
+  cpu_unit_compute_Bps: 800000000.0
+  cpu_unit_power_W: 15.0
+  pim_units: 8
+  pim_unit_compute_Bps: 2500000000.0
+  pim_unit_power_W: 7.5
+
+transfer_power_W:
+  host_h2d_channel: 20.0
+  host_d2h_channel: 20.0
+  cxl_direct_channel: 16.0
+
+stage_overrides: {}

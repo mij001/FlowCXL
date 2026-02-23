@@ -1,106 +1,112 @@
 # Equations
 
-This model includes transfer costs and deterministic queueing from shared resources.
-Compute time is out of scope.
+This model includes stage compute, inter-stage transfers, tile-level resource contention, makespan, and energy.
 
-## Transfer time
+## Stage-size scaling
 
-Per transfer:
-
-\[
-T = T_{fixed} + \frac{B}{BW}
-\]
-
-- `B`: bytes transferred
-- `BW`: one-way bandwidth in bytes/s
-
-PCIe fixed cost:
+For original boundaries:
 
 \[
-T_{fixed,pcie} = T_{enqueue} + T_{driver} + T_{wire}
+[X_0, X_1, \dots, X_N]
 \]
+
+and multiplier \(m\), each boundary is scaled with integer rounding while preserving:
 
 \[
-T_{pcie}(B) = T_{fixed,pcie} + \frac{B}{BW_{pcie}}
+\sum_i X_i' = round\left(m \cdot \sum_i X_i\right)
 \]
 
-CXL fixed cost:
+## Tiling
+
+Tile count:
+
+\[
+K = \max\left(1, \left\lceil \frac{\max_i(X_i')}{tile\_size} \right\rceil \right)
+\]
+
+Each boundary \(X_i'\) is partitioned exactly into tile bytes:
+
+\[
+X_i' = \sum_{k=1}^{K} X_{i,k}
+\]
+
+## Compute duration
+
+For stage \(s\), tile \(k\), compute rate \(R_s\) (bytes/s):
+
+\[
+T_{compute}(s,k) = \frac{X_{s-1,k}}{R_s}
+\]
+
+CPU scenario uses CPU stage rates. PIM scenarios use PIM stage rates.
+
+## Transfer duration
+
+Host-link transfer (PCIe style fixed cost):
+
+\[
+T_{host}(B) = T_{fixed,host} + \frac{B}{BW_{host}}
+\]
+
+Direct CXL transfer:
 
 \[
 T_{cxl}(B) = L_{cxl} + \frac{B}{BW_{cxl}}
 \]
 
-## Resource scheduling and queue attribution
+## Resource-pool scheduling
 
-For an operation requested at `t_req` on resources `R`:
+Each operation requests one resource pool with limited capacity (units/channels). For request time \(t_{req}\):
 
 \[
-wait_r = \max(0, t_{free,r} - t_{req})
-\]
-\[
-blocking\_wait = \max_{r \in R}(wait_r)
-\]
-\[
-t_{start} = t_{req} + blocking\_wait
+t_{start} = \max(t_{req}, t_{free,earliest})
 \]
 \[
 t_{end} = t_{start} + duration
 \]
 
-Resource updates:
+The chosen slot updates:
 
 \[
-t_{free,r} \leftarrow t_{end}, \quad busy\_time_r \leftarrow busy\_time_r + duration
+t_{free,slot} \leftarrow t_{end}
 \]
 
-Queue attribution rule in this repo:
+## Scenario transfer paths
 
-- Identify bottleneck winner resources where `wait_r == blocking_wait`.
-- Split `blocking_wait` equally across winners.
-- Add only the attributed share to each winner resource queue counter.
-
-Totals reported:
-
-- `queue_total_blocking_s`: sum of `blocking_wait` across operations.
-- `queue_total_attributed_s`: sum of per-resource attributed queue times.
-
-## Two-resource gating for PCIe
-
-PCIe H2D requires DMA + link:
-
-- Duplex mode: `dma_h2d` and `pcie_h2d`
-- Shared-link mode: `dma_h2d` and `pcie_shared`
-
-PCIe D2H requires DMA + link:
-
-- Duplex mode: `dma_d2h` and `pcie_d2h`
-- Shared-link mode: `dma_d2h` and `pcie_shared`
-
-CXL uses only link resources:
-
-- Duplex mode: `cxl_h2d` or `cxl_d2h`
-- Shared-link mode: `cxl_shared`
+- `cpu_only`: compute only, no transfers.
+- `pim_host_bounce`:
+  - ingress: host \(H2D\) to stage 1
+  - between stages: \(D2H\) then \(H2D\)
+  - egress: host \(D2H\) from final stage
+- `pim_flowcxl_direct`:
+  - ingress: host \(H2D\) to stage 1
+  - between stages: direct CXL transfer
+  - egress: host \(D2H\) from final stage
 
 ## Completion time
 
-Run completion is event makespan:
+Run completion is the maximum tile completion time:
 
 \[
-T_{makespan} = \max\limits_{events}(t_{end})
+T_{makespan} = \max_k(t_{end,k})
 \]
 
-## Bytes moved
+## Energy
 
-For boundaries `[X0, X1, ..., XN]` and `num_chunks = k`:
-
-Bounce (`pim_no_cxl_bounce` or `pim_cxl_bounce`):
+Per resource:
 
 \[
-bytes = k \cdot \sum_{i=1}^{N}(X_{i-1}+X_i)
+E_r = busy\_time_r \cdot P_r
 \]
 
-Chain (`pim_cxl_chain`):
+Totals:
 
 \[
-bytes = k \cdot (X_0 + X_N)
+E_{compute} = \sum_{r \in compute} E_r
+\]
+\[
+E_{transfer} = \sum_{r \in transfer} E_r
+\]
+\[
+E_{total} = E_{compute} + E_{transfer}
 \]

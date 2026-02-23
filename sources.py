@@ -1,4 +1,4 @@
-"""Cited constants, dataset profiles, and run vocabulary for the contention model."""
+"""Cited constants, dataset profiles, and run vocabulary for pipeline experiments."""
 
 from __future__ import annotations
 
@@ -6,24 +6,19 @@ MB = 10**6
 GB = 10**9
 TB = 10**12
 
-SCENARIO_PIM_NO_CXL_BOUNCE = "pim_no_cxl_bounce"
-SCENARIO_PIM_CXL_BOUNCE = "pim_cxl_bounce"
-SCENARIO_PIM_CXL_CHAIN = "pim_cxl_chain"
+SCENARIO_CPU_ONLY = "cpu_only"
+SCENARIO_PIM_HOST_BOUNCE = "pim_host_bounce"
+SCENARIO_PIM_FLOWCXL_DIRECT = "pim_flowcxl_direct"
+
+SCENARIOS = (
+    SCENARIO_CPU_ONLY,
+    SCENARIO_PIM_HOST_BOUNCE,
+    SCENARIO_PIM_FLOWCXL_DIRECT,
+)
 
 LINK_PCIE_GEN4_X16 = "PCIe Gen4 x16"
 LINK_CXL_LOCAL = "CXL_LOCAL"
 LINK_CXL_REMOTE = "CXL_REMOTE"
-
-RESOURCE_NAMES = (
-    "dma_h2d",
-    "dma_d2h",
-    "pcie_h2d",
-    "pcie_d2h",
-    "pcie_shared",
-    "cxl_h2d",
-    "cxl_d2h",
-    "cxl_shared",
-)
 
 PCIE4_X16_BW_Bps = 32e9
 PCIE_WIRE_LATENCY_s = 900e-9
@@ -67,17 +62,17 @@ LINKS = {
     LINK_PCIE_GEN4_X16: {
         "bandwidth_Bps": PCIE4_X16_BW_Bps,
         "latency_s": PCIE_FIXED_OVERHEAD_s,
-        "how_used": "Used by pim_no_cxl_bounce transfer equation.",
+        "how_used": "Used by host-link transfer equation.",
     },
     LINK_CXL_LOCAL: {
         "bandwidth_Bps": CXL_LOCAL_BW_Bps,
         "latency_s": CXL_LOCAL_LAT_s,
-        "how_used": "Used by CXL bounce/chain transfer equation (local point).",
+        "how_used": "Used by direct PIM-to-PIM transfer equation (local point).",
     },
     LINK_CXL_REMOTE: {
         "bandwidth_Bps": CXL_REMOTE_BW_Bps,
         "latency_s": CXL_REMOTE_LAT_s,
-        "how_used": "Used by CXL bounce/chain transfer equation (remote point).",
+        "how_used": "Used by direct PIM-to-PIM transfer equation (remote point).",
     },
 }
 
@@ -86,7 +81,7 @@ CITED_VALUES = {
         "value": PCIE4_X16_BW_Bps,
         "url": "https://ww1.microchip.com/downloads/en/DeviceDoc/00003818.pdf",
         "quote": "Per-Link (16-Lane) Maximum One-Way Data Rate ... ~32",
-        "how_used": "PCIe one-way bandwidth for B/BW.",
+        "how_used": "Host-link one-way bandwidth for B/BW.",
     },
     "PCIE_WIRE_LATENCY_s": {
         "value": PCIE_WIRE_LATENCY_s,
@@ -110,25 +105,25 @@ CITED_VALUES = {
         "value": CXL_LOCAL_LAT_s,
         "url": "https://huaicheng.github.io/p/asplos25-melody.pdf",
         "quote": "average latency and bandwidth are 214-394ns and 18-52GB/s",
-        "how_used": "Representative best-local latency point for CXL_LOCAL.",
+        "how_used": "Representative local latency point for CXL direct transfers.",
     },
     "CXL_LOCAL_BW_Bps": {
         "value": CXL_LOCAL_BW_Bps,
         "url": "https://huaicheng.github.io/p/asplos25-melody.pdf",
         "quote": "average latency and bandwidth are 214-394ns and 18-52GB/s",
-        "how_used": "Representative best-local bandwidth point for CXL_LOCAL.",
+        "how_used": "Representative local bandwidth point for CXL direct transfers.",
     },
     "CXL_REMOTE_LAT_s": {
         "value": CXL_REMOTE_LAT_s,
         "url": "https://huaicheng.github.io/s/asplos25-melody-slides.pdf",
         "quote": "locally-attached ... 200-400ns ... switch(es) ... approximately 600ns",
-        "how_used": "Representative remote-ish latency point for CXL_REMOTE.",
+        "how_used": "Representative remote-ish latency point for CXL direct transfers.",
     },
     "CXL_REMOTE_BW_Bps": {
         "value": CXL_REMOTE_BW_Bps,
         "url": "https://huaicheng.github.io/p/asplos25-melody.pdf",
         "quote": "remote entries show higher latency and reduced bandwidth (~13-14GB/s)",
-        "how_used": "Representative remote bandwidth point for CXL_REMOTE.",
+        "how_used": "Representative remote bandwidth point for CXL direct transfers.",
     },
     "ONT_FAST5_X0": {
         "value": ONT_X0,

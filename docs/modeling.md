@@ -2,34 +2,54 @@
 
 ## Scope
 
-- Model includes transfer time and deterministic queueing only.
-- Model excludes compute time.
-- Concurrency comes from multiple chunks (`num_chunks` in `{1, 8}`) sharing resources.
+- Model includes stage-limited compute, transfer costs, contention, and energy.
+- Large stage boundaries are tiled and processed chunk-by-chunk.
+- Pipeline overlap is enabled across tiles and stages.
 
-## Link Resource Modes
+## Stage Compute Capacity
 
-- `shared_link = false` (duplex): direction-specific link resources (`*_h2d`, `*_d2h`).
-- `shared_link = true` (shared): one link resource is used for both directions (`pcie_shared` or `cxl_shared`).
+Each stage has a fixed number of compute units with a fixed per-unit throughput and power:
 
-Shared mode is a modeling choice to represent worst-case serialized bidirectional link contention.
+- CPU baseline uses `cpu_units`, `cpu_unit_compute_Bps`, `cpu_unit_power_W`.
+- PIM scenarios use `pim_units`, `pim_unit_compute_Bps`, `pim_unit_power_W`.
 
-## CXL Operating Points
+Optional `stage_overrides` let any stage deviate from defaults.
 
-Two representative points are used from Melody's measured ranges:
+## Transfer Paths
 
-- `CXL_LOCAL`: `214 ns`, `52 GB/s` (best local point)
-- `CXL_REMOTE`: `621 ns`, `13 GB/s` (remote/worst-side representative point)
+- `cpu_only`: no inter-stage transfer modeling.
+- `pim_host_bounce`: data between PIM stages goes through host memory (`D2H` then `H2D`).
+- `pim_flowcxl_direct`: data between PIM stages uses direct CXL device-to-device transfer.
 
-These are fixed points selected to keep design space small while covering local and remote regimes.
+Both PIM scenarios include host ingress (to stage 1) and host egress (from final stage).
 
-## Dataset Boundary Coherence
+## Links and Channels
 
-`PROFILE_ONT_100Gbases` is explicitly a representative boundary profile assembled from multiple cited sources:
+- Host transfers use `link_profile.host_link` parameters from `sources.LINKS`.
+- Direct transfers use `link_profile.cxl_direct_link`.
+- Channel counts are limited (`host_h2d_channels`, `host_d2h_channels`, `cxl_direct_channels`), which introduces queueing at transfer resources.
 
-- ONT raw and FASTQ boundaries from Nanopore data slides.
-- Filtering ratio from TargetCall.
-- Later BAM/VCF boundaries from GIAB/NA12878 representative sizes.
+## Stage-size Sweep
 
-This profile is used as a transfer-boundary stress case, not as a single-source end-to-end measured dataset.
+Default x-axis categories for grouped bars are:
 
-`PROFILE_ILLUMINA_NA12878` uses the NA12878 input boundary and GIAB representative BAM/VCF boundaries.
+- `0.5x`
+- `1x`
+- `2x`
+- `4x`
+
+All boundaries in a dataset profile are scaled together to preserve relative pipeline shape.
+
+## Trace Sampling
+
+`trace_max_tiles` controls how many tile IDs are written to `traces.csv`/`traces.yaml`.
+Run metrics always use all tiles; only trace artifact size is bounded.
+
+## Metrics
+
+Per run:
+
+- Absolute makespan (`makespan_s`)
+- Absolute total energy (`total_energy_J`)
+- Compute and transfer energy split
+- Host-link bytes, direct-CXL bytes, and total bytes moved
