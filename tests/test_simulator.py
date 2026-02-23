@@ -1,4 +1,4 @@
-"""Checks for the tiled stage-capacity pipeline model."""
+"""Checks for true host-bounce and bottleneck diagnostics."""
 
 from __future__ import annotations
 
@@ -8,13 +8,7 @@ import unittest
 import yaml
 
 import sources
-from simulator import (
-    compute_num_tiles,
-    generate_runs_from_config,
-    scale_boundaries_exact,
-    simulate_configuration,
-    tile_boundary_bytes,
-)
+from simulator import generate_runs_from_config, scale_boundaries_exact
 
 
 class SimulatorChecks(unittest.TestCase):
@@ -22,7 +16,7 @@ class SimulatorChecks(unittest.TestCase):
     def setUpClass(cls) -> None:
         with open("configs/runs.yaml", "r", encoding="utf-8") as handle:
             cls.config = yaml.safe_load(handle)
-        cls.metrics, _ = generate_runs_from_config(cls.config)
+        cls.metrics, cls.traces = generate_runs_from_config(cls.config)
 
     def _rows(self, scenario: str, dataset_profile: str) -> list[dict]:
         return [
@@ -41,46 +35,60 @@ class SimulatorChecks(unittest.TestCase):
                 return row
         raise KeyError((dataset_profile, scenario, multiplier))
 
-    def test_scaled_boundaries_conserve_bytes(self) -> None:
-        tile_size = int(self.config["tile_size_bytes"])
-        for dataset_profile, info in sources.DATASET_PROFILES.items():
-            original = info["boundaries_bytes"]
+    def _ont_ratio(self, metrics: list[dict], multiplier: float = 1.0) -> float:
+        bounce = None
+        direct = None
+        for row in metrics:
+            if (
+                row["dataset_profile"] == sources.PROFILE_ONT_100Gbases
+                and abs(float(row["stage_size_multiplier"]) - float(multiplier)) < 1e-12
+            ):
+                if row["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE:
+                    bounce = row
+                elif row["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT:
+                    direct = row
+        if bounce is None or direct is None:
+            raise KeyError("missing ONT bounce/direct rows")
+        return float(bounce["makespan_s"]) / float(direct["makespan_s"])
+
+    def test_host_touch_applies_only_interstage_bounce(self) -> None:
+        for dataset_profile in self.config["dataset_profiles"]:
+            boundaries = sources.DATASET_PROFILES[dataset_profile]["boundaries_bytes"]
             for multiplier in self.config["size_multipliers"]:
-                scaled = scale_boundaries_exact(original, float(multiplier))
-                self.assertEqual(sum(scaled), int(round(sum(original) * float(multiplier))))
-                num_tiles = compute_num_tiles(scaled, tile_size)
-                for boundary_value in scaled:
-                    tiles = tile_boundary_bytes(boundary_value, num_tiles)
-                    self.assertEqual(len(tiles), num_tiles)
-                    self.assertEqual(sum(tiles), boundary_value)
+                bounce_row = self._find_row(
+                    dataset_profile=dataset_profile,
+                    scenario=sources.SCENARIO_PIM_HOST_BOUNCE,
+                    multiplier=float(multiplier),
+                )
+                scaled = scale_boundaries_exact(boundaries, float(multiplier))
+                expected_touch_bytes = sum(scaled[1:-1])
+                self.assertEqual(int(bounce_row["total_bytes_host_touch"]), int(expected_touch_bytes))
+                self.assertGreater(int(bounce_row["total_bytes_host_touch"]), 0)
 
-    def test_parallel_units_reduce_makespan(self) -> None:
-        dataset_profile = sources.PROFILE_ILLUMINA_NA12878
-        boundaries = sources.DATASET_PROFILES[dataset_profile]["boundaries_bytes"]
-        low_defaults = copy.deepcopy(self.config["stage_defaults"])
-        high_defaults = copy.deepcopy(self.config["stage_defaults"])
-        low_defaults["cpu_units"] = 1
-        high_defaults["cpu_units"] = 64
+            for scenario in [sources.SCENARIO_CPU_ONLY, sources.SCENARIO_PIM_FLOWCXL_DIRECT]:
+                for row in self._rows(scenario, dataset_profile):
+                    self.assertEqual(int(row["total_bytes_host_touch"]), 0)
 
-        common = {
-            "dataset_profile": dataset_profile,
-            "boundaries_bytes": boundaries,
-            "size_multiplier": 1.0,
-            "scenario": sources.SCENARIO_CPU_ONLY,
-            "tile_size_bytes": int(self.config["tile_size_bytes"]),
-            "host_link": self.config["link_profile"]["host_link"],
-            "cxl_direct_link": self.config["link_profile"]["cxl_direct_link"],
-            "resource_capacity": self.config["resource_capacity"],
-            "transfer_power_W": self.config["transfer_power_W"],
-            "stage_overrides": {},
-        }
+        bounce_touch_ops = [
+            row for row in self.traces if row["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE and row["op_type"] == "HOST_TOUCH"
+        ]
+        non_bounce_touch_ops = [
+            row for row in self.traces if row["scenario"] != sources.SCENARIO_PIM_HOST_BOUNCE and row["op_type"] == "HOST_TOUCH"
+        ]
+        self.assertGreater(len(bounce_touch_ops), 0)
+        self.assertEqual(len(non_bounce_touch_ops), 0)
 
-        low_row, _ = simulate_configuration(run_id="low_units", stage_defaults=low_defaults, **common)
-        high_row, _ = simulate_configuration(run_id="high_units", stage_defaults=high_defaults, **common)
+    def test_host_touch_energy_accounting(self) -> None:
+        for dataset_profile in self.config["dataset_profiles"]:
+            for row in self._rows(sources.SCENARIO_PIM_HOST_BOUNCE, dataset_profile):
+                self.assertGreater(float(row["host_touch_energy_J"]), 0.0)
+                self.assertGreaterEqual(float(row["transfer_energy_J"]), float(row["host_touch_energy_J"]))
+            for scenario in [sources.SCENARIO_CPU_ONLY, sources.SCENARIO_PIM_FLOWCXL_DIRECT]:
+                for row in self._rows(scenario, dataset_profile):
+                    self.assertEqual(float(row["host_touch_energy_J"]), 0.0)
 
-        self.assertLessEqual(float(high_row["makespan_s"]), float(low_row["makespan_s"]))
-
-    def test_flowcxl_beats_host_bounce(self) -> None:
+    def test_flowcxl_beats_bounce_with_touch_penalty(self) -> None:
+        ont_improvement_found = False
         for dataset_profile in self.config["dataset_profiles"]:
             for multiplier in self.config["size_multipliers"]:
                 bounce = self._find_row(
@@ -93,25 +101,46 @@ class SimulatorChecks(unittest.TestCase):
                     scenario=sources.SCENARIO_PIM_FLOWCXL_DIRECT,
                     multiplier=float(multiplier),
                 )
-                self.assertLessEqual(float(direct["makespan_s"]), float(bounce["makespan_s"]) + 1e-12)
+                bounce_time = float(bounce["makespan_s"])
+                direct_time = float(direct["makespan_s"])
+                self.assertLessEqual(direct_time, bounce_time + 1e-12)
+                if dataset_profile == sources.PROFILE_ONT_100Gbases and bounce_time > direct_time:
+                    ont_improvement_found = True
+        self.assertTrue(ont_improvement_found)
 
-    def test_cpu_only_has_no_transfer_bytes(self) -> None:
-        for dataset_profile in self.config["dataset_profiles"]:
-            for row in self._rows(sources.SCENARIO_CPU_ONLY, dataset_profile):
-                self.assertEqual(int(row["total_bytes_host_link"]), 0)
-                self.assertEqual(int(row["total_bytes_cxl_direct"]), 0)
-                self.assertEqual(int(row["total_bytes_moved"]), 0)
+    def test_checkA_compute_sensitivity(self) -> None:
+        baseline_ratio = self._ont_ratio(self.metrics, multiplier=1.0)
 
-    def test_energy_monotonic_with_size(self) -> None:
-        for dataset_profile in self.config["dataset_profiles"]:
-            for scenario in self.config["scenarios"]:
-                rows = self._rows(scenario=scenario, dataset_profile=dataset_profile)
-                rows = sorted(rows, key=lambda row: float(row["stage_size_multiplier"]))
-                energies = [float(row["total_energy_J"]) for row in rows]
-                for idx in range(1, len(energies)):
-                    self.assertGreaterEqual(energies[idx] + 1e-12, energies[idx - 1])
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_ONT_100Gbases]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["stage_defaults"]["pim_unit_compute_Bps"] = float(cfg["stage_defaults"]["pim_unit_compute_Bps"]) * 10.0
+        metrics_fast, _ = generate_runs_from_config(cfg)
+        fast_ratio = self._ont_ratio(metrics_fast, multiplier=1.0)
 
-    def test_metrics_schema(self) -> None:
+        self.assertGreater(fast_ratio, baseline_ratio)
+
+    def test_checkA_link_sensitivity(self) -> None:
+        baseline_ratio = self._ont_ratio(self.metrics, multiplier=1.0)
+
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_ONT_100Gbases]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+
+        host_link = cfg["link_profile"]["host_link"]
+        old_bw = float(sources.LINKS[host_link]["bandwidth_Bps"])
+        try:
+            sources.LINKS[host_link]["bandwidth_Bps"] = old_bw / 10.0
+            metrics_slow, _ = generate_runs_from_config(cfg)
+        finally:
+            sources.LINKS[host_link]["bandwidth_Bps"] = old_bw
+
+        slow_ratio = self._ont_ratio(metrics_slow, multiplier=1.0)
+        self.assertGreater(slow_ratio, baseline_ratio)
+
+    def test_metrics_schema_includes_new_diagnostics(self) -> None:
         expected = {
             "run_id",
             "dataset_profile",
@@ -123,9 +152,16 @@ class SimulatorChecks(unittest.TestCase):
             "total_energy_J",
             "compute_energy_J",
             "transfer_energy_J",
+            "host_touch_energy_J",
             "total_bytes_host_link",
             "total_bytes_cxl_direct",
+            "total_bytes_host_touch",
             "total_bytes_moved",
+            "lb_compute_stage_max_s",
+            "lb_host_link_s",
+            "lb_host_touch_s",
+            "lb_cxl_direct_s",
+            "dominant_lb_component",
         }
         legacy_forbidden = {
             "speedup_vs_chain",

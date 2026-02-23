@@ -54,6 +54,12 @@ Direct CXL transfer:
 T_{cxl}(B) = L_{cxl} + \frac{B}{BW_{cxl}}
 \]
 
+Host-touch operation for bounced intermediates:
+
+\[
+T_{touch}(B) = T_{touch,fixed} + \frac{B}{BW_{touch}}
+\]
+
 ## Resource-pool scheduling
 
 Each operation requests one resource pool with limited capacity (units/channels). For request time \(t_{req}\):
@@ -76,7 +82,7 @@ t_{free,slot} \leftarrow t_{end}
 - `cpu_only`: compute only, no transfers.
 - `pim_host_bounce`:
   - ingress: host \(H2D\) to stage 1
-  - between stages: \(D2H\) then \(H2D\)
+  - between stages: \(D2H\) then \(HOST\_TOUCH\) then \(H2D\)
   - egress: host \(D2H\) from final stage
 - `pim_flowcxl_direct`:
   - ingress: host \(H2D\) to stage 1
@@ -110,3 +116,28 @@ E_{transfer} = \sum_{r \in transfer} E_r
 \[
 E_{total} = E_{compute} + E_{transfer}
 \]
+
+## Bottleneck lower-bound diagnostics
+
+For any resource pool \(r\) with capacity \(C_r\):
+
+\[
+LB_r = \frac{busy\_time_r}{C_r}
+\]
+
+Reported aggregate lower bounds:
+
+\[
+LB_{compute\_stage\_max} = \max_{r \in compute}(LB_r)
+\]
+\[
+LB_{host\_link} = \max(LB_{host\_h2d}, LB_{host\_d2h})
+\]
+\[
+LB_{host\_touch} = LB_{host\_touch}
+\]
+\[
+LB_{cxl\_direct} = LB_{cxl\_direct}
+\]
+
+`dominant_lb_component` is the component with largest lower bound in a run.

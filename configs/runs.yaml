@@ -24,6 +24,7 @@ resource_capacity:
   host_h2d_channels: 1
   host_d2h_channels: 1
   cxl_direct_channels: 1
+  host_touch_channels: 1
 
 stage_defaults:
   cpu_units: 32
@@ -32,10 +33,13 @@ stage_defaults:
   pim_units: 8
   pim_unit_compute_Bps: 2500000000.0
   pim_unit_power_W: 7.5
+  host_touch_Bps: 25000000000.0
+  host_touch_fixed_s: 0.000002
 
 transfer_power_W:
   host_h2d_channel: 20.0
   host_d2h_channel: 20.0
   cxl_direct_channel: 16.0
+  host_touch_channel: 30.0
 
 stage_overrides: {}

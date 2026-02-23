@@ -21,11 +21,49 @@ BASE_METRICS_COLUMNS = [
     "total_energy_J",
     "compute_energy_J",
     "transfer_energy_J",
+    "host_touch_energy_J",
     "total_bytes_host_link",
     "total_bytes_cxl_direct",
+    "total_bytes_host_touch",
     "total_bytes_moved",
+    "lb_compute_stage_max_s",
+    "lb_host_link_s",
+    "lb_host_touch_s",
+    "lb_cxl_direct_s",
+    "dominant_lb_component",
 ]
 TRACE_YAML_MAX_EVENTS = 2000
+
+
+def _sample_yaml_events(traces: List[Dict[str, object]], max_events: int) -> List[Dict[str, object]]:
+    if max_events <= 0 or not traces:
+        return []
+
+    scenarios = sorted({str(row.get("scenario", "")) for row in traces})
+    if not scenarios:
+        return traces[:max_events]
+
+    quota = max(1, max_events // len(scenarios))
+    selected: List[Dict[str, object]] = []
+    selected_ids: set[int] = set()
+    used_per_scenario = {scenario: 0 for scenario in scenarios}
+
+    for idx, row in enumerate(traces):
+        scenario = str(row.get("scenario", ""))
+        if scenario in used_per_scenario and used_per_scenario[scenario] < quota:
+            selected.append(row)
+            selected_ids.add(idx)
+            used_per_scenario[scenario] += 1
+            if len(selected) >= max_events:
+                return selected
+
+    for idx, row in enumerate(traces):
+        if len(selected) >= max_events:
+            break
+        if idx not in selected_ids:
+            selected.append(row)
+
+    return selected
 
 
 def metrics_columns() -> List[str]:
@@ -58,7 +96,7 @@ def main() -> None:
     traces_df.to_csv(traces_csv_path, index=False)
 
     traces_yaml_path = artifacts_dir / "traces.yaml"
-    yaml_events = traces[:TRACE_YAML_MAX_EVENTS]
+    yaml_events = _sample_yaml_events(traces=traces, max_events=TRACE_YAML_MAX_EVENTS)
     with traces_yaml_path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(
             {

@@ -73,6 +73,86 @@ def _plot_grouped_metric(
     plt.close()
 
 
+def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
+    out = table_df.copy()
+    for col in [
+        "makespan_s",
+        "total_energy_J",
+        "lb_compute_stage_max_s",
+        "lb_host_link_s",
+        "lb_host_touch_s",
+        "lb_cxl_direct_s",
+    ]:
+        if col in out:
+            out[col] = out[col].map(lambda value: f"{float(value):.6f}")
+    return out
+
+
+def _dataset_diagnostic_table(metrics_df: pd.DataFrame, dataset_profile: str) -> pd.DataFrame:
+    subset = metrics_df[metrics_df["dataset_profile"] == dataset_profile].copy()
+    subset = subset.sort_values(["stage_size_multiplier", "scenario"])
+    subset["scenario"] = subset["scenario"].map(SCENARIO_LABELS)
+    subset["stage_size_multiplier"] = subset["stage_size_multiplier"].map(_format_multiplier)
+    cols = [
+        "dataset_profile",
+        "stage_size_multiplier",
+        "scenario",
+        "makespan_s",
+        "total_energy_J",
+        "dominant_lb_component",
+        "lb_compute_stage_max_s",
+        "lb_host_link_s",
+        "lb_host_touch_s",
+        "lb_cxl_direct_s",
+    ]
+    subset = subset[cols]
+    return _format_metric_fields(subset)
+
+
+def _ont_bottleneck_narrative(metrics_df: pd.DataFrame) -> str:
+    ont = metrics_df[metrics_df["dataset_profile"] == sources.PROFILE_ONT_100Gbases].copy()
+    if ont.empty:
+        return "No ONT rows found."
+
+    lines: List[str] = []
+    for multiplier in sorted(ont["stage_size_multiplier"].unique()):
+        bounce = ont[
+            (ont["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE)
+            & (ont["stage_size_multiplier"] == multiplier)
+        ]
+        direct = ont[
+            (ont["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT)
+            & (ont["stage_size_multiplier"] == multiplier)
+        ]
+        if bounce.empty or direct.empty:
+            continue
+        b = bounce.iloc[0]
+        d = direct.iloc[0]
+        ratio = float(b["makespan_s"]) / float(d["makespan_s"])
+        delta_pct = (ratio - 1.0) * 100.0
+        lines.append(
+            f"- {_format_multiplier(multiplier)}: bounce dominant `{b['dominant_lb_component']}`, "
+            f"direct dominant `{d['dominant_lb_component']}`, "
+            f"bounce/direct makespan ratio `{ratio:.6f}` ({delta_pct:.3f}% gain)."
+        )
+
+    shared_bound = ont[
+        (ont["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT)
+        & (ont["dominant_lb_component"].isin(["compute_stage_max", "host_link"]))
+    ]
+    if not shared_bound.empty:
+        lines.append(
+            "- Interpretation: ONT remains largely compute/ingress-bound in FlowCXL-direct runs, "
+            "so inter-stage bounce removal helps only when host-touch/link terms are competitive."
+        )
+    else:
+        lines.append(
+            "- Interpretation: ONT shifts away from compute/ingress dominance and shows stronger "
+            "inter-stage transfer sensitivity."
+        )
+    return "\n".join(lines)
+
+
 def main() -> None:
     metrics_path = Path("artifacts/metrics.csv")
     if not metrics_path.exists():
@@ -102,12 +182,25 @@ def main() -> None:
         )
 
     summary_df = metrics_df[
-        ["dataset_profile", "stage_size_multiplier", "scenario", "makespan_s", "total_energy_J"]
+        [
+            "dataset_profile",
+            "stage_size_multiplier",
+            "scenario",
+            "makespan_s",
+            "total_energy_J",
+            "host_touch_energy_J",
+            "total_bytes_host_touch",
+            "dominant_lb_component",
+        ]
     ].copy()
     summary_df["scenario"] = summary_df["scenario"].map(SCENARIO_LABELS)
     summary_df["stage_size_multiplier"] = summary_df["stage_size_multiplier"].map(_format_multiplier)
-    summary_df["makespan_s"] = summary_df["makespan_s"].map(lambda value: f"{float(value):.6f}")
-    summary_df["total_energy_J"] = summary_df["total_energy_J"].map(lambda value: f"{float(value):.6f}")
+    summary_df = _format_metric_fields(summary_df)
+
+    diagnostic_tables = []
+    for dataset_profile in metrics_df["dataset_profile"].dropna().unique():
+        diag_df = _dataset_diagnostic_table(metrics_df=metrics_df, dataset_profile=dataset_profile)
+        diagnostic_tables.append(f"### {dataset_profile}\n\n{_build_markdown_table(diag_df)}")
 
     report_text = (
         "# FlowCXL Tiled Stage-Capacity Report\n\n"
@@ -117,8 +210,11 @@ def main() -> None:
         "## Modeled\n"
         "- Stage-limited compute capacity (CPU or PIM units)\n"
         "- Tile-by-tile pipelined execution with resource contention\n"
-        "- Host bounce path vs direct CXL stage-to-stage path\n"
-        "- Absolute makespan (seconds) and total energy (joules)\n\n"
+        "- True host bounce for intermediates: D2H -> HOST_TOUCH -> H2D\n"
+        "- Absolute makespan (seconds) and total energy (joules)\n"
+        "- Lower-bound bottleneck diagnostics by resource family\n\n"
+        "## ONT Bottleneck Interpretation\n"
+        f"{_ont_bottleneck_narrative(metrics_df)}\n\n"
         "## Plot Artifacts\n"
         "- plot_makespan_grouped_PROFILE_ONT_100Gbases.png\n"
         "- plot_makespan_grouped_PROFILE_ILLUMINA_NA12878.png\n"
@@ -126,6 +222,8 @@ def main() -> None:
         "- plot_energy_grouped_PROFILE_ILLUMINA_NA12878.png\n\n"
         "## Results Table\n"
         f"{_build_markdown_table(summary_df)}\n\n"
+        "## Bottleneck Diagnostics\n"
+        f"{chr(10).join(diagnostic_tables)}\n\n"
         "## Citations\n"
         + "\n".join(
             f"- `{name}`: {entry['url']}\n  Quote: \"{entry['quote']}\"\n  Used as: {entry['how_used']}"

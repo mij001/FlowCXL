@@ -13,10 +13,11 @@ The model enforces fixed compute units per stage, tiles large boundaries, and sc
 - Stage-limited compute pools (CPU or PIM)
 - Tile-by-tile pipeline overlap
 - Inter-stage transfer behavior:
-  - host bounce (`D2H -> H2D`)
+  - true host bounce (`D2H -> HOST_TOUCH -> H2D`)
   - direct CXL (`PIM -> PIM`)
 - Absolute makespan (seconds)
 - Absolute total energy (joules)
+- Bottleneck lower-bound diagnostics (`compute`, `host_link`, `host_touch`, `cxl_direct`)
 
 ## What is not modeled
 
@@ -66,6 +67,11 @@ Artifacts:
 - `artifacts/report/report.md`
 
 Note: `trace_max_tiles` in `configs/runs.yaml` limits trace artifact size only. Metrics still use all simulated tiles.
+
+FlowCXL gains depend on the dominant bottleneck:
+
+- if `compute_stage_max` or shared ingress/egress dominates, bounce-removal gains can be small,
+- if bounce-specific `host_touch`/host-link costs dominate, FlowCXL direct gains become large.
 
 ## Tests
 

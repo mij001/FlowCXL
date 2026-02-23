@@ -18,6 +18,8 @@ class StageConfig:
     pim_units: int
     pim_unit_compute_Bps: float
     pim_unit_power_W: float
+    host_touch_Bps: float
+    host_touch_fixed_s: float
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,14 @@ def compute_duration_s(bytes_moved: int, compute_rate_Bps: float) -> float:
     return bytes_moved / compute_rate_Bps
 
 
+def host_touch_duration_s(bytes_moved: int, touch_Bps: float, touch_fixed_s: float) -> float:
+    if touch_Bps <= 0:
+        raise ValueError("host touch bandwidth must be > 0")
+    if touch_fixed_s < 0:
+        raise ValueError("host touch fixed overhead must be >= 0")
+    return touch_fixed_s + (bytes_moved / touch_Bps)
+
+
 def _build_tile_operations(num_stages: int, scenario: str) -> List[TileOperation]:
     operations: List[TileOperation] = []
 
@@ -132,6 +142,14 @@ def _build_tile_operations(num_stages: int, scenario: str) -> List[TileOperation
                         stage_id=stage_id,
                         boundary_index=stage_id,
                         transfer_path="host_d2h",
+                    )
+                )
+                operations.append(
+                    TileOperation(
+                        op_type="HOST_TOUCH",
+                        stage_id=stage_id,
+                        boundary_index=stage_id,
+                        transfer_path="host_touch",
                     )
                 )
                 operations.append(
@@ -184,6 +202,8 @@ def _build_stage_configs(
         "pim_units",
         "pim_unit_compute_Bps",
         "pim_unit_power_W",
+        "host_touch_Bps",
+        "host_touch_fixed_s",
     ]
     missing = [key for key in required_keys if key not in stage_defaults]
     if missing:
@@ -205,6 +225,8 @@ def _build_stage_configs(
                 pim_units=int(merged["pim_units"]),
                 pim_unit_compute_Bps=float(merged["pim_unit_compute_Bps"]),
                 pim_unit_power_W=float(merged["pim_unit_power_W"]),
+                host_touch_Bps=float(merged["host_touch_Bps"]),
+                host_touch_fixed_s=float(merged["host_touch_fixed_s"]),
             )
         )
     return stage_configs
@@ -230,18 +252,27 @@ def _validate_config(config: Dict[str, object]) -> None:
         raise KeyError("link_profile must include host_link and cxl_direct_link")
 
     resource_capacity = config["resource_capacity"]
-    for key in ["host_h2d_channels", "host_d2h_channels", "cxl_direct_channels"]:
+    for key in ["host_h2d_channels", "host_d2h_channels", "cxl_direct_channels", "host_touch_channels"]:
         if key not in resource_capacity:
             raise KeyError(f"resource_capacity missing key: {key}")
         if int(resource_capacity[key]) <= 0:
             raise ValueError(f"{key} must be > 0")
 
     transfer_power_W = config["transfer_power_W"]
-    for key in ["host_h2d_channel", "host_d2h_channel", "cxl_direct_channel"]:
+    for key in ["host_h2d_channel", "host_d2h_channel", "cxl_direct_channel", "host_touch_channel"]:
         if key not in transfer_power_W:
             raise KeyError(f"transfer_power_W missing key: {key}")
         if float(transfer_power_W[key]) < 0.0:
             raise ValueError(f"{key} must be >= 0")
+
+    stage_defaults = config["stage_defaults"]
+    for key in ["host_touch_Bps", "host_touch_fixed_s"]:
+        if key not in stage_defaults:
+            raise KeyError(f"stage_defaults missing key: {key}")
+    if float(stage_defaults["host_touch_Bps"]) <= 0:
+        raise ValueError("host_touch_Bps must be > 0")
+    if float(stage_defaults["host_touch_fixed_s"]) < 0:
+        raise ValueError("host_touch_fixed_s must be >= 0")
 
     for scenario in config["scenarios"]:
         if scenario not in sources.SCENARIOS:
@@ -253,6 +284,26 @@ def _validate_config(config: Dict[str, object]) -> None:
 
     if int(config["tile_size_bytes"]) <= 0:
         raise ValueError("tile_size_bytes must be > 0")
+
+
+def _pool_lower_bound_s(resource: ResourcePool) -> float:
+    return resource.busy_time_s / float(resource.capacity)
+
+
+def _dominant_lb_component(
+    lb_compute_stage_max_s: float,
+    lb_host_link_s: float,
+    lb_host_touch_s: float,
+    lb_cxl_direct_s: float,
+) -> str:
+    components = [
+        ("compute_stage_max", lb_compute_stage_max_s),
+        ("host_link", lb_host_link_s),
+        ("host_touch", lb_host_touch_s),
+        ("cxl_direct", lb_cxl_direct_s),
+    ]
+    components.sort(key=lambda item: item[1], reverse=True)
+    return components[0][0]
 
 
 def simulate_configuration(
@@ -306,6 +357,11 @@ def simulate_configuration(
         capacity=int(resource_capacity["cxl_direct_channels"]),
         power_W=float(transfer_power_W["cxl_direct_channel"]),
     )
+    host_touch_pool = ResourcePool(
+        name="host_touch",
+        capacity=int(resource_capacity["host_touch_channels"]),
+        power_W=float(transfer_power_W["host_touch_channel"]),
+    )
 
     compute_pools: List[ResourcePool] = []
     for stage_id in range(1, num_stages + 1):
@@ -337,6 +393,7 @@ def simulate_configuration(
 
     total_bytes_host_link = 0
     total_bytes_cxl_direct = 0
+    total_bytes_host_touch = 0
 
     while request_heap:
         t_req, tile_id = heapq.heappop(request_heap)
@@ -345,10 +402,10 @@ def simulate_configuration(
             continue
 
         operation = operations[op_index]
+        stage_cfg = stage_configs[operation.stage_id - 1]
         bytes_moved = int(tiled_boundaries[operation.boundary_index][tile_id])
 
         if operation.op_type == "COMPUTE":
-            stage_cfg = stage_configs[operation.stage_id - 1]
             if scenario == sources.SCENARIO_CPU_ONLY:
                 compute_rate = stage_cfg.cpu_unit_compute_Bps
             else:
@@ -357,6 +414,16 @@ def simulate_configuration(
             pool = compute_pools[operation.stage_id - 1]
             link_used = ""
             transfer_path = ""
+        elif operation.op_type == "HOST_TOUCH":
+            duration_s = host_touch_duration_s(
+                bytes_moved=bytes_moved,
+                touch_Bps=stage_cfg.host_touch_Bps,
+                touch_fixed_s=stage_cfg.host_touch_fixed_s,
+            )
+            pool = host_touch_pool
+            link_used = ""
+            transfer_path = operation.transfer_path
+            total_bytes_host_touch += bytes_moved
         else:
             if operation.transfer_path == "host_h2d":
                 pool = host_h2d_pool
@@ -408,10 +475,22 @@ def simulate_configuration(
     makespan_s = max(completion_times) if completion_times else 0.0
 
     compute_energy_J = sum(pool.busy_time_s * pool.power_W for pool in compute_pools)
+    host_touch_energy_J = host_touch_pool.busy_time_s * host_touch_pool.power_W
     transfer_energy_J = sum(
         pool.busy_time_s * pool.power_W for pool in [host_h2d_pool, host_d2h_pool, cxl_direct_pool]
-    )
+    ) + host_touch_energy_J
     total_energy_J = compute_energy_J + transfer_energy_J
+
+    lb_compute_stage_max_s = max(_pool_lower_bound_s(pool) for pool in compute_pools) if compute_pools else 0.0
+    lb_host_link_s = max(_pool_lower_bound_s(host_h2d_pool), _pool_lower_bound_s(host_d2h_pool))
+    lb_host_touch_s = _pool_lower_bound_s(host_touch_pool)
+    lb_cxl_direct_s = _pool_lower_bound_s(cxl_direct_pool)
+    dominant_lb_component = _dominant_lb_component(
+        lb_compute_stage_max_s=lb_compute_stage_max_s,
+        lb_host_link_s=lb_host_link_s,
+        lb_host_touch_s=lb_host_touch_s,
+        lb_cxl_direct_s=lb_cxl_direct_s,
+    )
 
     metrics_row: Dict[str, object] = {
         "run_id": run_id,
@@ -424,9 +503,16 @@ def simulate_configuration(
         "total_energy_J": total_energy_J,
         "compute_energy_J": compute_energy_J,
         "transfer_energy_J": transfer_energy_J,
+        "host_touch_energy_J": host_touch_energy_J,
         "total_bytes_host_link": total_bytes_host_link,
         "total_bytes_cxl_direct": total_bytes_cxl_direct,
+        "total_bytes_host_touch": total_bytes_host_touch,
         "total_bytes_moved": total_bytes_host_link + total_bytes_cxl_direct,
+        "lb_compute_stage_max_s": lb_compute_stage_max_s,
+        "lb_host_link_s": lb_host_link_s,
+        "lb_host_touch_s": lb_host_touch_s,
+        "lb_cxl_direct_s": lb_cxl_direct_s,
+        "dominant_lb_component": dominant_lb_component,
     }
     return metrics_row, traces
 

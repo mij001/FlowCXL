@@ -36,6 +36,7 @@ The following are model defaults in `configs/runs.yaml` and can be changed:
 - Stage compute-unit counts/rates/power for CPU and PIM
 - Transfer-channel counts
 - Transfer power per channel
+- Host-touch throughput and fixed overhead used by true-bounce modeling
 - Tile size
 
 These defaults are simulation knobs, not measured constants from literature.
