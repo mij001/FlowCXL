@@ -99,6 +99,7 @@ def _dataset_diagnostic_table(metrics_df: pd.DataFrame, dataset_profile: str) ->
     subset["stage_size_multiplier"] = subset["stage_size_multiplier"].map(_format_multiplier)
     cols = [
         "dataset_profile",
+        "pipeline_template",
         "stage_size_multiplier",
         "scenario",
         "makespan_s",
@@ -116,11 +117,13 @@ def _dataset_diagnostic_table(metrics_df: pd.DataFrame, dataset_profile: str) ->
     return _format_metric_fields(subset)
 
 
-def _deepvariant_directional_narrative(metrics_df: pd.DataFrame) -> str:
+def _directional_narrative(metrics_df: pd.DataFrame) -> str:
     lines: List[str] = []
-    for dataset_profile in sorted(metrics_df["dataset_profile"].dropna().unique()):
+    profiles = sorted(metrics_df["dataset_profile"].dropna().unique())
+    for dataset_profile in profiles:
         subset = metrics_df[metrics_df["dataset_profile"] == dataset_profile]
-        ratios: List[tuple[float, float]] = []
+        template = str(subset.iloc[0]["pipeline_template"]) if not subset.empty else "unknown"
+        ratios: List[tuple[float, float, str, str]] = []
         for multiplier in sorted(subset["stage_size_multiplier"].unique()):
             bounce = subset[
                 (subset["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE)
@@ -132,41 +135,61 @@ def _deepvariant_directional_narrative(metrics_df: pd.DataFrame) -> str:
             ]
             if bounce.empty or direct.empty:
                 continue
-            ratio = float(bounce.iloc[0]["makespan_s"]) / float(direct.iloc[0]["makespan_s"])
-            ratios.append((float(multiplier), ratio))
+            b = bounce.iloc[0]
+            d = direct.iloc[0]
+            ratio = float(b["makespan_s"]) / float(d["makespan_s"])
+            ratios.append((float(multiplier), ratio, str(b["dominant_lb_component"]), str(d["dominant_lb_component"])))
 
         if not ratios:
             lines.append(f"- {dataset_profile}: insufficient bounce/direct rows.")
             continue
 
-        directional_ok = all(ratio >= 1.0 - 1e-12 for _, ratio in ratios)
-        strict_points = sum(1 for _, ratio in ratios if ratio > 1.0 + 1e-9)
-        min_ratio = min(ratio for _, ratio in ratios)
-        max_ratio = max(ratio for _, ratio in ratios)
-        sensitivity_delta = max_ratio - min_ratio
-        ratio_1x = next((ratio for mult, ratio in ratios if abs(mult - 1.0) < 1e-12), None)
+        directional_ok = all(ratio >= 1.0 - 1e-12 for _, ratio, _, _ in ratios)
+        strict_points = sum(1 for _, ratio, _, _ in ratios if ratio > 1.0 + 1e-9)
+        min_ratio = min(ratio for _, ratio, _, _ in ratios)
+        max_ratio = max(ratio for _, ratio, _, _ in ratios)
+        ratio_1x_info = next((info for info in ratios if abs(info[0] - 1.0) < 1e-12), None)
 
-        if ratio_1x is None:
+        if ratio_1x_info is None:
             ratio_1x_text = "n/a"
+            dom_text = "n/a"
         else:
-            ratio_1x_text = f"{ratio_1x:.6f}"
+            ratio_1x_text = f"{ratio_1x_info[1]:.6f}"
+            dom_text = f"bounce `{ratio_1x_info[2]}`, direct `{ratio_1x_info[3]}`"
 
         lines.append(
-            f"- {dataset_profile}: directional `{str(directional_ok).lower()}`, "
+            f"- {dataset_profile} (`{template}`): directional `{str(directional_ok).lower()}`, "
             f"strictly-better points `{strict_points}`, "
             f"1x bounce/direct ratio `{ratio_1x_text}`, "
-            f"sensitivity delta (max-min ratio) `{sensitivity_delta:.6f}`."
+            f"ratio range `{min_ratio:.6f}` to `{max_ratio:.6f}`, 1x dominants {dom_text}."
         )
 
     lines.append(
-        "- Directional condition checks `direct <= bounce`; sensitivity delta reports how ratio changes "
-        "across stage-size multipliers."
-    )
-    lines.append(
-        "- Streaming admission (`max_inflight_tiles`) and split H2D pools separate ingress pressure "
-        "from inter-stage staging, while only PIM->PIM transitions differ between bounce and direct."
+        "- Directional condition checks `direct <= bounce`; ratio range captures sensitivity across stage-size multipliers."
     )
     return "\n".join(lines)
+
+
+def _tpch_target_narrative(metrics_df: pd.DataFrame) -> str:
+    subset = metrics_df[
+        (metrics_df["dataset_profile"] == sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE)
+        & (metrics_df["stage_size_multiplier"] == 1.0)
+    ]
+    if subset.empty:
+        return "- TPC-H high profile 1x target unavailable."
+
+    bounce = subset[subset["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE]
+    direct = subset[subset["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+    if bounce.empty or direct.empty:
+        return "- TPC-H high profile 1x target unavailable (missing bounce/direct rows)."
+
+    ratio = float(bounce.iloc[0]["makespan_s"]) / float(direct.iloc[0]["makespan_s"])
+    gain_pct = (ratio - 1.0) * 100.0
+    status = "PASS" if ratio >= 2.0 else "FAIL"
+    return (
+        f"- `{sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE}` at `1x`: "
+        f"bounce/direct ratio `{ratio:.6f}` ({gain_pct:.3f}% gain) -> `{status}` (target `>=2.0`)."
+    )
 
 
 def main() -> None:
@@ -178,8 +201,9 @@ def main() -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
 
     metrics_df = pd.read_csv(metrics_path)
+    profiles = list(metrics_df["dataset_profile"].dropna().unique())
 
-    for dataset_profile in metrics_df["dataset_profile"].dropna().unique():
+    for dataset_profile in profiles:
         _plot_grouped_metric(
             metrics_df=metrics_df,
             dataset_profile=dataset_profile,
@@ -200,6 +224,7 @@ def main() -> None:
     summary_df = metrics_df[
         [
             "dataset_profile",
+            "pipeline_template",
             "stage_size_multiplier",
             "scenario",
             "makespan_s",
@@ -214,30 +239,36 @@ def main() -> None:
     summary_df = _format_metric_fields(summary_df)
 
     diagnostic_tables = []
-    for dataset_profile in metrics_df["dataset_profile"].dropna().unique():
+    for dataset_profile in profiles:
         diag_df = _dataset_diagnostic_table(metrics_df=metrics_df, dataset_profile=dataset_profile)
         diagnostic_tables.append(f"### {dataset_profile}\n\n{_build_markdown_table(diag_df)}")
 
+    plot_lines: List[str] = []
+    for dataset_profile in profiles:
+        plot_lines.append(f"- plot_makespan_grouped_{dataset_profile}.png")
+        plot_lines.append(f"- plot_energy_grouped_{dataset_profile}.png")
+
     report_text = (
-        "# DeepVariant Tiled Stage-Capacity Report\n\n"
+        "# FlowCXL Tiled Stage-Capacity Report\n\n"
         "## Single Claim\n"
-        "With bounded streaming admission and split host H2D topology, FlowCXL direct transfer isolates "
-        "DeepVariant inter-stage staging costs from ingress contention and exposes overlap-dependent gains.\n\n"
+        "Template-aware stage modeling with true host bounce and direct CXL movement shows where "
+        "intermediate-staging penalties dominate multi-stage pipelines.\n\n"
         "## Modeled\n"
-        "- Fixed DeepVariant three-stage pipeline: make_examples, call_variants, postprocess_variants\n"
-        "- Stage-limited compute capacity with scenario stage-device mapping (CPU or PIM)\n"
+        "- Dual templates: DeepVariant (`deepvariant_3stage`) and OLAP (`tpch_3op`)\n"
+        "- Stage-limited compute capacity with per-template stage-device maps\n"
         "- Tile-by-tile pipelined execution with bounded in-flight admission\n"
-        "- True host bounce for intermediates: D2H -> HOST_TOUCH -> H2D(stage)\n"
+        "- True host bounce for inter-PIM transfer: D2H -> HOST_TOUCH -> H2D(stage)\n"
         "- Split host H2D resources: ingress vs inter-stage staging\n"
         "- Absolute makespan (seconds) and total energy (joules)\n"
         "- Lower-bound bottleneck diagnostics by resource family\n\n"
         "## Directional Check\n"
-        f"{_deepvariant_directional_narrative(metrics_df)}\n\n"
+        f"{_directional_narrative(metrics_df)}\n\n"
+        "## TPC-H Target Check\n"
+        "- In `tpch_3op`, large S1->S2 and S2->S3 intermediates make host-bounce pay double link traversal + touch, "
+        "while FlowCXL direct pays a single inter-device transfer.\n"
+        f"{_tpch_target_narrative(metrics_df)}\n\n"
         "## Plot Artifacts\n"
-        "- plot_makespan_grouped_PROFILE_DV_ILLUMINA_WGS_30X.png\n"
-        "- plot_makespan_grouped_PROFILE_DV_ILLUMINA_WES_100X.png\n"
-        "- plot_energy_grouped_PROFILE_DV_ILLUMINA_WGS_30X.png\n"
-        "- plot_energy_grouped_PROFILE_DV_ILLUMINA_WES_100X.png\n\n"
+        f"{chr(10).join(plot_lines)}\n\n"
         "## Results Table\n"
         f"{_build_markdown_table(summary_df)}\n\n"
         "## Bottleneck Diagnostics\n"

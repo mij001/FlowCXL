@@ -1,56 +1,41 @@
 # Sources and Cited Constants
 
-All cited numeric constants live in `sources.py` with URL, quote, and how-used metadata.
+All cited constants and references are recorded in `sources.py`.
 
-## Host link (PCIe defaults)
+## Transfer/link constants
 
-- `PCIE4_X16_BW_Bps = 32e9`
-  - URL: https://ww1.microchip.com/downloads/en/DeviceDoc/00003818.pdf
-  - Quote: "Per-Link (16-Lane) Maximum One-Way Data Rate ... ~32"
-- `PCIE_WIRE_LATENCY_s = 900e-9`
-  - URL: https://web.stanford.edu/class/cs244/papers/neugebauer-sigcomm18.pdf
-  - Quote: "PCIe contributing around 900 ns."
-- `PCIE_ENQUEUE_OVERHEAD_s = 1.2e-6`
-- `PCIE_DRIVER_OVERHEAD_s = 7.0e-6`
-  - URL: https://mrmgroup.cs.princeton.edu/papers/dlustigHPCA13.pdf
-  - Quote: "1.2 us to enqueue" and "7 us to process"
+- PCIe Gen4 x16 host bandwidth and fixed latency components
+- CXL local/remote representative latency and bandwidth points
 
-## CXL direct points
+These constants are used directly in transfer duration equations.
 
-- `CXL_LOCAL_LAT_s = 214e-9`, `CXL_LOCAL_BW_Bps = 52e9`
-- `CXL_REMOTE_LAT_s = 621e-9`, `CXL_REMOTE_BW_Bps = 13e9`
-  - URL: https://huaicheng.github.io/p/asplos25-melody.pdf
-  - URL: https://huaicheng.github.io/s/asplos25-melody-slides.pdf
+## DeepVariant anchors
 
-## DeepVariant pipeline anchors
-
-- DeepVariant stage vocabulary:
+- Stage names:
   - `make_examples`, `call_variants`, `postprocess_variants`
-  - URL: https://github.com/google/deepvariant
-- Example tensor shape anchor (`example_info`):
-  - representative shape: `[100, 147, 10]`
-  - URL: https://github.com/google/deepvariant/releases
-- Runtime breakdown context used for CPU calibration seeds:
-  - URL: https://developer.nvidia.com/blog/accelerating-deepvariant/
-- Hardware acceleration context for DeepVariant deployments:
-  - URL: https://developer.nvidia.com/blog/accelerate-genomic-analysis-for-any-sequencer-with-parabricks-v4-2/
+- Example tensor shape anchor (`example_info` style): `[100, 147, 10]`
+- Runtime-share context used for CPU calibration defaults
 
-## Configurable baseline defaults (not cited hardware claims)
+## TPC-H / OLAP anchors
 
-The following are model defaults in `configs/runs.yaml` and can be changed:
+- TPC-H benchmark context for scan/join/aggregation pipeline modeling
+- Host-bounce vs direct-copy context from direct-data-path literature/blogs
+- PIM-operator context references for scan, join, and analytics aggregation
 
-- DeepVariant profile parameters:
-  - coverage/candidate density
-  - aligned bytes per covered base
-  - per-example call/postprocess output bytes
-  - CPU stage-share timing splits
-- Stage compute-unit counts/rates/power for CPU and PIM
-- PIM speedup factors by stage (`pim_speedup_vs_cpu_by_stage`)
-- Scenario stage-device maps (`scenario_stage_device_map`)
-- Transfer-channel counts (including split host H2D ingress vs stage channels)
-- Transfer power per channel (including split host H2D ingress vs stage power)
-- Host-touch throughput and fixed overhead used by true-bounce modeling
-- Tile size
-- Max in-flight tile admission window
+## Configurable modeling assumptions (not fixed hardware truth)
 
-These defaults are simulation knobs, not measured constants from literature.
+These are explicit knobs in `sources.py`/`configs/runs.yaml`:
+
+- TPC-H profile parameters:
+  - selectivity, join fanout, aggregation reduction ratio
+  - row-byte widths per stage boundary
+- Stage compute rates/speedups:
+  - `cpu_stage_unit_compute_Bps_by_template`
+  - `pim_speedup_vs_cpu_by_stage_by_template`
+- Scenario stage maps:
+  - `scenario_stage_device_map_by_template`
+- Transfer-channel counts and per-channel power
+- Host-touch throughput/fixed overhead
+- Tile size and in-flight window
+
+These knobs are intended for controlled sensitivity studies, not as universal measured constants.

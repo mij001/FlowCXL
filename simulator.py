@@ -1,4 +1,4 @@
-"""Tiled stage-capacity simulator for DeepVariant pipeline scenarios."""
+"""Tiled stage-capacity simulator for mixed pipeline templates."""
 
 from __future__ import annotations
 
@@ -124,6 +124,23 @@ def _stage_overrides_for_dataset(
     return stage_overrides.get(dataset_profile, {})
 
 
+def _profile_stage_names(profile: Mapping[str, object]) -> List[str]:
+    stage_names = profile.get("stage_names")
+    if not isinstance(stage_names, Sequence):
+        raise ValueError("profile is missing stage_names sequence")
+    normalized = [str(name) for name in stage_names]
+    if not normalized:
+        raise ValueError("profile stage_names cannot be empty")
+    return normalized
+
+
+def _profile_template(profile: Mapping[str, object]) -> str:
+    template = profile.get("pipeline_template")
+    if not isinstance(template, str) or not template:
+        raise ValueError("profile is missing pipeline_template")
+    return template
+
+
 def _stage_device_map_for_scenario(
     scenario_stage_device_map: Mapping[str, Sequence[str]],
     scenario: str,
@@ -147,59 +164,79 @@ def _derive_compute_rates_for_stages(
     dataset_profile: str,
     boundaries_bytes: Sequence[int],
     stage_names: Sequence[str],
+    pipeline_template: str,
     stage_defaults: Mapping[str, object],
     dataset_stage_overrides: Mapping[object, Mapping[str, object]],
     pim_speedup_vs_cpu_by_stage: Mapping[str, object],
+    cpu_stage_unit_compute_Bps: Mapping[str, object],
 ) -> List[Tuple[float, float]]:
     profile = sources.DATASET_PROFILES[dataset_profile]
-    params = profile.get("parameters")
-    if not isinstance(params, Mapping):
-        cpu_default = float(stage_defaults["cpu_unit_compute_Bps"])
-        pim_default = float(stage_defaults["pim_unit_compute_Bps"])
-        return [(cpu_default, pim_default) for _ in stage_names]
-
-    runtime_total_s = float(params["cpu_reference_total_runtime_s_1x"])
-    stage_shares = params["cpu_stage_time_share_1x"]
-    if runtime_total_s <= 0:
-        raise ValueError("cpu_reference_total_runtime_s_1x must be > 0")
-
     rates: List[Tuple[float, float]] = []
-    for stage_id, stage_name in enumerate(stage_names, start=1):
-        if stage_name not in stage_shares:
-            raise KeyError(f"cpu_stage_time_share_1x missing stage {stage_name}")
-        if stage_name not in pim_speedup_vs_cpu_by_stage:
-            raise KeyError(f"pim_speedup_vs_cpu_by_stage missing stage {stage_name}")
 
-        stage_share = float(stage_shares[stage_name])
-        stage_runtime_s = runtime_total_s * stage_share
-        if stage_runtime_s <= 0:
-            raise ValueError(f"stage runtime must be > 0 for {stage_name}")
+    if pipeline_template == sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE:
+        params = profile.get("parameters")
+        if not isinstance(params, Mapping):
+            raise ValueError("deepvariant profile missing parameters")
+        runtime_total_s = float(params["cpu_reference_total_runtime_s_1x"])
+        stage_shares = params["cpu_stage_time_share_1x"]
+        if runtime_total_s <= 0:
+            raise ValueError("cpu_reference_total_runtime_s_1x must be > 0")
 
-        stage_override = dataset_stage_overrides.get(stage_id, dataset_stage_overrides.get(str(stage_id), {}))
-        cpu_units = int(stage_override.get("cpu_units", stage_defaults["cpu_units"]))
-        if cpu_units <= 0:
-            raise ValueError(f"cpu_units must be > 0 for stage {stage_name}")
+        for stage_id, stage_name in enumerate(stage_names, start=1):
+            if stage_name not in stage_shares:
+                raise KeyError(f"cpu_stage_time_share_1x missing stage {stage_name}")
+            if stage_name not in pim_speedup_vs_cpu_by_stage:
+                raise KeyError(f"pim speedup map missing stage {stage_name}")
 
-        stage_input_bytes = float(boundaries_bytes[stage_id - 1])
-        if stage_input_bytes <= 0:
-            cpu_rate = float(stage_defaults["cpu_unit_compute_Bps"])
-        else:
-            cpu_rate = stage_input_bytes / (float(cpu_units) * stage_runtime_s)
-        pim_speedup = float(pim_speedup_vs_cpu_by_stage[stage_name])
-        if pim_speedup <= 0:
-            raise ValueError(f"pim_speedup_vs_cpu_by_stage[{stage_name}] must be > 0")
-        pim_rate = cpu_rate * pim_speedup
-        rates.append((cpu_rate, pim_rate))
-    return rates
+            stage_share = float(stage_shares[stage_name])
+            stage_runtime_s = runtime_total_s * stage_share
+            if stage_runtime_s <= 0:
+                raise ValueError(f"stage runtime must be > 0 for {stage_name}")
+
+            stage_override = dataset_stage_overrides.get(stage_id, dataset_stage_overrides.get(str(stage_id), {}))
+            cpu_units = int(stage_override.get("cpu_units", stage_defaults["cpu_units"]))
+            if cpu_units <= 0:
+                raise ValueError(f"cpu_units must be > 0 for stage {stage_name}")
+
+            stage_input_bytes = float(boundaries_bytes[stage_id - 1])
+            if stage_input_bytes <= 0:
+                cpu_rate = float(cpu_stage_unit_compute_Bps.get(stage_name, stage_defaults["cpu_unit_compute_Bps"]))
+            else:
+                cpu_rate = stage_input_bytes / (float(cpu_units) * stage_runtime_s)
+            pim_speedup = float(pim_speedup_vs_cpu_by_stage[stage_name])
+            if pim_speedup <= 0:
+                raise ValueError(f"pim speedup for {stage_name} must be > 0")
+            pim_rate = cpu_rate * pim_speedup
+            rates.append((cpu_rate, pim_rate))
+        return rates
+
+    if pipeline_template == sources.PIPELINE_TEMPLATE_TPCH_3OP:
+        for stage_name in stage_names:
+            if stage_name not in cpu_stage_unit_compute_Bps:
+                raise KeyError(f"cpu_stage_unit_compute_Bps missing stage {stage_name} for template {pipeline_template}")
+            if stage_name not in pim_speedup_vs_cpu_by_stage:
+                raise KeyError(f"pim speedup map missing stage {stage_name} for template {pipeline_template}")
+            cpu_rate = float(cpu_stage_unit_compute_Bps[stage_name])
+            if cpu_rate <= 0:
+                raise ValueError(f"cpu stage rate must be > 0 for {stage_name}")
+            pim_speedup = float(pim_speedup_vs_cpu_by_stage[stage_name])
+            if pim_speedup <= 0:
+                raise ValueError(f"pim speedup must be > 0 for {stage_name}")
+            rates.append((cpu_rate, cpu_rate * pim_speedup))
+        return rates
+
+    raise ValueError(f"unsupported pipeline_template: {pipeline_template}")
 
 
 def _build_stage_configs(
     dataset_profile: str,
     boundaries_bytes: Sequence[int],
     stage_names: Sequence[str],
+    pipeline_template: str,
     stage_defaults: Dict[str, object],
     stage_overrides: Dict[str, Dict[object, Dict[str, object]]],
     pim_speedup_vs_cpu_by_stage: Mapping[str, object],
+    cpu_stage_unit_compute_Bps: Mapping[str, object],
 ) -> List[StageConfig]:
     required_keys = [
         "cpu_units",
@@ -224,9 +261,11 @@ def _build_stage_configs(
         dataset_profile=dataset_profile,
         boundaries_bytes=boundaries_bytes,
         stage_names=stage_names,
+        pipeline_template=pipeline_template,
         stage_defaults=stage_defaults,
         dataset_stage_overrides=dataset_overrides,
         pim_speedup_vs_cpu_by_stage=pim_speedup_vs_cpu_by_stage,
+        cpu_stage_unit_compute_Bps=cpu_stage_unit_compute_Bps,
     )
 
     stage_configs: List[StageConfig] = []
@@ -243,22 +282,21 @@ def _build_stage_configs(
         if "pim_unit_compute_Bps" not in stage_override:
             merged["pim_unit_compute_Bps"] = derived_pim_rate
 
-        stage_configs.append(
-            StageConfig(
-                cpu_units=int(merged["cpu_units"]),
-                cpu_unit_compute_Bps=float(merged["cpu_unit_compute_Bps"]),
-                cpu_unit_power_W=float(merged["cpu_unit_power_W"]),
-                pim_units=int(merged["pim_units"]),
-                pim_unit_compute_Bps=float(merged["pim_unit_compute_Bps"]),
-                pim_unit_power_W=float(merged["pim_unit_power_W"]),
-                host_touch_Bps=float(merged["host_touch_Bps"]),
-                host_touch_fixed_s=float(merged["host_touch_fixed_s"]),
-            )
+        cfg = StageConfig(
+            cpu_units=int(merged["cpu_units"]),
+            cpu_unit_compute_Bps=float(merged["cpu_unit_compute_Bps"]),
+            cpu_unit_power_W=float(merged["cpu_unit_power_W"]),
+            pim_units=int(merged["pim_units"]),
+            pim_unit_compute_Bps=float(merged["pim_unit_compute_Bps"]),
+            pim_unit_power_W=float(merged["pim_unit_power_W"]),
+            host_touch_Bps=float(merged["host_touch_Bps"]),
+            host_touch_fixed_s=float(merged["host_touch_fixed_s"]),
         )
-        if stage_configs[-1].cpu_units <= 0:
+        if cfg.cpu_units <= 0:
             raise ValueError(f"cpu_units must be > 0 at stage {stage_id} ({stage_name})")
-        if stage_configs[-1].pim_units <= 0:
+        if cfg.pim_units <= 0:
             raise ValueError(f"pim_units must be > 0 at stage {stage_id} ({stage_name})")
+        stage_configs.append(cfg)
     return stage_configs
 
 
@@ -371,12 +409,22 @@ def _validate_config(config: Dict[str, object]) -> None:
         "resource_capacity",
         "stage_defaults",
         "transfer_power_W",
-        "scenario_stage_device_map",
-        "pim_speedup_vs_cpu_by_stage",
+        "scenario_stage_device_map_by_template",
+        "pim_speedup_vs_cpu_by_stage_by_template",
+        "cpu_stage_unit_compute_Bps_by_template",
     ]
     missing = [key for key in required_top_level if key not in config]
     if missing:
         raise KeyError(f"missing config keys: {missing}")
+
+    legacy_flat_keys = [
+        "scenario_stage_device_map",
+        "pim_speedup_vs_cpu_by_stage",
+        "cpu_stage_unit_compute_Bps",
+    ]
+    legacy_present = [key for key in legacy_flat_keys if key in config]
+    if legacy_present:
+        raise ValueError(f"legacy flat template keys are not allowed: {legacy_present}")
 
     link_profile = config["link_profile"]
     if "host_link" not in link_profile or "cxl_direct_link" not in link_profile:
@@ -430,35 +478,78 @@ def _validate_config(config: Dict[str, object]) -> None:
     if float(stage_defaults["host_touch_fixed_s"]) < 0:
         raise ValueError("host_touch_fixed_s must be >= 0")
 
-    scenario_stage_device_map = config["scenario_stage_device_map"]
-    if not isinstance(scenario_stage_device_map, Mapping):
-        raise ValueError("scenario_stage_device_map must be a map")
     for scenario in config["scenarios"]:
         if scenario not in sources.SCENARIOS:
             raise ValueError(f"unknown scenario in config: {scenario}")
-        if scenario not in scenario_stage_device_map:
-            raise KeyError(f"scenario_stage_device_map missing scenario {scenario}")
-        devices = scenario_stage_device_map[scenario]
-        if len(devices) != len(sources.DEEPVARIANT_STAGE_NAMES):
-            raise ValueError(
-                f"scenario_stage_device_map[{scenario}] must have {len(sources.DEEPVARIANT_STAGE_NAMES)} entries"
-            )
-        for device in devices:
-            if str(device).lower() not in {sources.DEVICE_CPU, sources.DEVICE_PIM}:
-                raise ValueError(f"invalid device {device} in scenario_stage_device_map[{scenario}]")
 
-    pim_speedup_vs_cpu_by_stage = config["pim_speedup_vs_cpu_by_stage"]
-    if not isinstance(pim_speedup_vs_cpu_by_stage, Mapping):
-        raise ValueError("pim_speedup_vs_cpu_by_stage must be a map")
-    for stage_name in sources.DEEPVARIANT_STAGE_NAMES:
-        if stage_name not in pim_speedup_vs_cpu_by_stage:
-            raise KeyError(f"pim_speedup_vs_cpu_by_stage missing {stage_name}")
-        if float(pim_speedup_vs_cpu_by_stage[stage_name]) <= 0:
-            raise ValueError(f"pim_speedup_vs_cpu_by_stage[{stage_name}] must be > 0")
-
-    for dataset_profile in config["dataset_profiles"]:
+    dataset_profiles = config["dataset_profiles"]
+    template_to_stage_names: Dict[str, List[str]] = {}
+    for dataset_profile in dataset_profiles:
         if dataset_profile not in sources.DATASET_PROFILES:
             raise ValueError(f"unknown dataset profile: {dataset_profile}")
+        profile = sources.DATASET_PROFILES[dataset_profile]
+        stage_names = _profile_stage_names(profile)
+        boundaries = profile.get("boundaries_bytes")
+        if not isinstance(boundaries, Sequence):
+            raise ValueError(f"profile {dataset_profile} missing boundaries_bytes")
+        if len(stage_names) != len(boundaries) - 1:
+            raise ValueError(
+                f"profile {dataset_profile} stage_names length {len(stage_names)} does not match boundaries"
+            )
+        template = _profile_template(profile)
+        if template in template_to_stage_names and template_to_stage_names[template] != stage_names:
+            raise ValueError(f"inconsistent stage_names for template {template}")
+        template_to_stage_names[template] = stage_names
+
+    scenario_stage_device_map_by_template = config["scenario_stage_device_map_by_template"]
+    pim_speedup_by_template = config["pim_speedup_vs_cpu_by_stage_by_template"]
+    cpu_stage_rates_by_template = config["cpu_stage_unit_compute_Bps_by_template"]
+    for mapping_name, mapping in [
+        ("scenario_stage_device_map_by_template", scenario_stage_device_map_by_template),
+        ("pim_speedup_vs_cpu_by_stage_by_template", pim_speedup_by_template),
+        ("cpu_stage_unit_compute_Bps_by_template", cpu_stage_rates_by_template),
+    ]:
+        if not isinstance(mapping, Mapping):
+            raise ValueError(f"{mapping_name} must be a map")
+
+    for template, stage_names in template_to_stage_names.items():
+        if template not in scenario_stage_device_map_by_template:
+            raise KeyError(f"scenario_stage_device_map_by_template missing template {template}")
+        if template not in pim_speedup_by_template:
+            raise KeyError(f"pim_speedup_vs_cpu_by_stage_by_template missing template {template}")
+        if template not in cpu_stage_rates_by_template:
+            raise KeyError(f"cpu_stage_unit_compute_Bps_by_template missing template {template}")
+
+        scenario_map = scenario_stage_device_map_by_template[template]
+        if not isinstance(scenario_map, Mapping):
+            raise ValueError(f"scenario_stage_device_map_by_template[{template}] must be a map")
+        for scenario in config["scenarios"]:
+            if scenario not in scenario_map:
+                raise KeyError(f"scenario map for template {template} missing scenario {scenario}")
+            devices = [str(device).lower() for device in scenario_map[scenario]]
+            if len(devices) != len(stage_names):
+                raise ValueError(
+                    f"template {template} scenario {scenario} has {len(devices)} devices, expected {len(stage_names)}"
+                )
+            for device in devices:
+                if device not in {sources.DEVICE_CPU, sources.DEVICE_PIM}:
+                    raise ValueError(f"invalid device {device} in template {template} scenario {scenario}")
+
+        speedup_map = pim_speedup_by_template[template]
+        rate_map = cpu_stage_rates_by_template[template]
+        if not isinstance(speedup_map, Mapping):
+            raise ValueError(f"pim speedup map for template {template} must be a map")
+        if not isinstance(rate_map, Mapping):
+            raise ValueError(f"cpu stage rate map for template {template} must be a map")
+        for stage_name in stage_names:
+            if stage_name not in speedup_map:
+                raise KeyError(f"template {template} speedup map missing stage {stage_name}")
+            if float(speedup_map[stage_name]) <= 0:
+                raise ValueError(f"template {template} speedup for {stage_name} must be > 0")
+            if stage_name not in rate_map:
+                raise KeyError(f"template {template} cpu stage rate map missing stage {stage_name}")
+            if float(rate_map[stage_name]) <= 0:
+                raise ValueError(f"template {template} cpu stage rate for {stage_name} must be > 0")
 
     if int(config["tile_size_bytes"]) <= 0:
         raise ValueError("tile_size_bytes must be > 0")
@@ -491,6 +582,7 @@ def simulate_configuration(
     dataset_profile: str,
     boundaries_bytes: Sequence[int],
     stage_names: Sequence[str],
+    pipeline_template: str,
     size_multiplier: float,
     scenario: str,
     tile_size_bytes: int,
@@ -501,8 +593,9 @@ def simulate_configuration(
     stage_defaults: Dict[str, object],
     transfer_power_W: Dict[str, object],
     stage_overrides: Dict[str, Dict[object, Dict[str, object]]],
-    scenario_stage_device_map: Mapping[str, Sequence[str]],
-    pim_speedup_vs_cpu_by_stage: Mapping[str, object],
+    scenario_stage_device_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
+    pim_speedup_vs_cpu_by_stage_by_template: Mapping[str, Mapping[str, object]],
+    cpu_stage_unit_compute_Bps_by_template: Mapping[str, Mapping[str, object]],
     trace_max_tiles: int | None = None,
 ) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
     if scenario not in sources.SCENARIOS:
@@ -517,8 +610,15 @@ def simulate_configuration(
         raise ValueError(
             f"stage_names length {len(stage_names)} does not match boundaries-derived stages {num_stages}"
         )
+    if pipeline_template not in scenario_stage_device_map_by_template:
+        raise KeyError(f"missing scenario stage map for template {pipeline_template}")
+    if pipeline_template not in pim_speedup_vs_cpu_by_stage_by_template:
+        raise KeyError(f"missing pim speedup map for template {pipeline_template}")
+    if pipeline_template not in cpu_stage_unit_compute_Bps_by_template:
+        raise KeyError(f"missing cpu stage rate map for template {pipeline_template}")
+
     stage_devices = _stage_device_map_for_scenario(
-        scenario_stage_device_map=scenario_stage_device_map,
+        scenario_stage_device_map=scenario_stage_device_map_by_template[pipeline_template],
         scenario=scenario,
         num_stages=num_stages,
     )
@@ -533,9 +633,11 @@ def simulate_configuration(
         dataset_profile=dataset_profile,
         boundaries_bytes=boundaries_bytes,
         stage_names=stage_names,
+        pipeline_template=pipeline_template,
         stage_defaults=stage_defaults,
         stage_overrides=stage_overrides,
-        pim_speedup_vs_cpu_by_stage=pim_speedup_vs_cpu_by_stage,
+        pim_speedup_vs_cpu_by_stage=pim_speedup_vs_cpu_by_stage_by_template[pipeline_template],
+        cpu_stage_unit_compute_Bps=cpu_stage_unit_compute_Bps_by_template[pipeline_template],
     )
 
     host_h2d_ingress_pool = ResourcePool(
@@ -666,6 +768,7 @@ def simulate_configuration(
                     "dataset_profile": dataset_profile,
                     "stage_size_multiplier": size_multiplier,
                     "scenario": scenario,
+                    "pipeline_template": pipeline_template,
                     "tile_id": tile_id,
                     "op_index": op_index + 1,
                     "stage_id": operation.stage_id,
@@ -749,7 +852,7 @@ def simulate_configuration(
         "lb_host_touch_s": lb_host_touch_s,
         "lb_cxl_direct_s": lb_cxl_direct_s,
         "dominant_lb_component": dominant_lb_component,
-        "pipeline_template": sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE,
+        "pipeline_template": pipeline_template,
     }
     return metrics_row, traces
 
@@ -770,8 +873,9 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
     resource_capacity = config["resource_capacity"]
     stage_defaults = config["stage_defaults"]
     transfer_power_W = config["transfer_power_W"]
-    scenario_stage_device_map = config["scenario_stage_device_map"]
-    pim_speedup_vs_cpu_by_stage = config["pim_speedup_vs_cpu_by_stage"]
+    scenario_stage_device_map_by_template = config["scenario_stage_device_map_by_template"]
+    pim_speedup_vs_cpu_by_stage_by_template = config["pim_speedup_vs_cpu_by_stage_by_template"]
+    cpu_stage_unit_compute_Bps_by_template = config["cpu_stage_unit_compute_Bps_by_template"]
     stage_overrides = config.get("stage_overrides", {})
     trace_max_tiles_raw = config.get("trace_max_tiles", 512)
     trace_max_tiles: int | None
@@ -786,11 +890,9 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
     for dataset_profile in dataset_profiles:
         profile = sources.DATASET_PROFILES[dataset_profile]
         boundaries = profile["boundaries_bytes"]
-        stage_names = profile.get("stage_names", list(sources.DEEPVARIANT_STAGE_NAMES))
-        if len(stage_names) != len(boundaries) - 1:
-            raise ValueError(
-                f"dataset {dataset_profile} has {len(stage_names)} stage names for {len(boundaries)-1} stages"
-            )
+        stage_names = _profile_stage_names(profile)
+        pipeline_template = _profile_template(profile)
+
         for size_multiplier in size_multipliers:
             for scenario in scenarios:
                 multiplier_token = str(size_multiplier).replace(".", "p")
@@ -806,6 +908,7 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                     dataset_profile=dataset_profile,
                     boundaries_bytes=boundaries,
                     stage_names=stage_names,
+                    pipeline_template=pipeline_template,
                     size_multiplier=float(size_multiplier),
                     scenario=scenario,
                     tile_size_bytes=tile_size_bytes,
@@ -816,8 +919,9 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                     stage_defaults=stage_defaults,
                     transfer_power_W=transfer_power_W,
                     stage_overrides=stage_overrides,
-                    scenario_stage_device_map=scenario_stage_device_map,
-                    pim_speedup_vs_cpu_by_stage=pim_speedup_vs_cpu_by_stage,
+                    scenario_stage_device_map_by_template=scenario_stage_device_map_by_template,
+                    pim_speedup_vs_cpu_by_stage_by_template=pim_speedup_vs_cpu_by_stage_by_template,
+                    cpu_stage_unit_compute_Bps_by_template=cpu_stage_unit_compute_Bps_by_template,
                     trace_max_tiles=trace_max_tiles,
                 )
                 metrics.append(row)

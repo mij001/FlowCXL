@@ -3,91 +3,84 @@
 ## Scope
 
 - Model includes stage-limited compute, transfer costs, contention, and energy.
-- Pipeline template is fixed to DeepVariant inference stages:
-  - `make_examples`
-  - `call_variants`
-  - `postprocess_variants`
-- Large stage boundaries are tiled and processed chunk-by-chunk.
-- Pipeline overlap is enabled across tiles and stages.
-- Tile admission is bounded by `max_inflight_tiles` to avoid all-at-once ingress flooding.
+- Supports two templates selected per profile:
+  - `deepvariant_3stage`
+  - `tpch_3op`
+- Large boundaries are tiled and processed chunk-by-chunk.
+- Tile admission is bounded by `max_inflight_tiles`.
+- Overlap is enabled across tiles and stages.
 
-## Stage Compute Capacity
+## Template behavior
 
-Each stage has a fixed number of compute units with a fixed per-unit throughput and power:
+### DeepVariant (`deepvariant_3stage`)
 
-- CPU baseline uses `cpu_units`, `cpu_unit_compute_Bps`, `cpu_unit_power_W`.
-- PIM scenarios use `pim_units`, `pim_unit_compute_Bps`, `pim_unit_power_W`.
+- Stages: `make_examples -> call_variants -> postprocess_variants`
+- Boundaries are derived from coverage, candidate density, and tensor shape.
+- CPU stage rates are calibrated from profile runtime shares.
 
-CPU/PIM per-stage rates are calibrated from profile timing shares at `1x`, then scaled by input bytes.
-Optional `stage_overrides` let any stage deviate from calibrated defaults.
+### TPC-H (`tpch_3op`)
 
-## DeepVariant Boundary Derivation
+- Stages: `scan_filter_project -> join -> groupby_agg`
+- Boundaries are derived from rows/selectivity/fanout/reduction parameters.
+- CPU stage rates come from template stage-rate defaults.
 
-Profile boundaries are not hand-entered sizes. They are derived from:
+## Stage-device mapping
 
-- covered bases and coverage (`aligned` input bytes)
-- candidate density (`num_examples`)
-- tensor shape (`example_info`) and element width (`make_examples` output bytes)
-- per-example call/postprocess output widths
+Scenario maps are template-specific:
 
-Boundaries are emitted as:
+- DeepVariant defaults:
+  - `cpu_only`: `cpu/cpu/cpu`
+  - `pim_host_bounce`: `pim/pim/cpu`
+  - `pim_flowcxl_direct`: `pim/pim/cpu`
+- TPC-H defaults:
+  - `cpu_only`: `cpu/cpu/cpu`
+  - `pim_host_bounce`: `pim/pim/pim`
+  - `pim_flowcxl_direct`: `pim/pim/pim`
 
-- `X0`: aligned input bytes
-- `X1`: example tensor bytes
-- `X2`: call output bytes
-- `X3`: postprocess output bytes
+`pim/pim/pim` in TPC-H creates two inter-PIM boundaries (`S1->S2`, `S2->S3`), where FlowCXL direct can significantly reduce host-bounce overhead.
 
-## Transfer Paths
+## Transfer paths
 
-Stage-device mapping is explicit per scenario:
-
-- `cpu_only`: `cpu/cpu/cpu`
-- `pim_host_bounce`: `pim/pim/cpu`
-- `pim_flowcxl_direct`: `pim/pim/cpu`
-
-Transfer ops are generated from adjacent stage-device transitions:
+Per adjacent stage transition:
 
 - `cpu->cpu`: no transfer
-- `cpu->pim`: host `H2D(stage)`
-- `pim->cpu`: host `D2H`
+- `cpu->pim`: `host_h2d_stage`
+- `pim->cpu`: `host_d2h`
 - `pim->pim`:
-  - bounce: `D2H -> HOST_TOUCH -> H2D(stage)`
-  - direct: `CXL direct`
+  - bounce: `host_d2h -> HOST_TOUCH -> host_h2d_stage`
+  - direct: `cxl_direct`
 
-Under the default map, only the `make_examples -> call_variants` (`pim->pim`) transition differs between bounce and direct. This isolates FlowCXL benefit to inter-PIM movement.
+Ingress/egress rules:
 
-## Links and Channels
+- `host_h2d_ingress` only if stage 1 is PIM
+- final `host_d2h` only if final stage is PIM
 
-- Host transfers use `link_profile.host_link` parameters from `sources.LINKS`.
-- Direct transfers use `link_profile.cxl_direct_link`.
-- Channel counts are limited (`host_h2d_ingress_channels`, `host_h2d_stage_channels`, `host_d2h_channels`, `cxl_direct_channels`, `host_touch_channels`), which introduces queueing at transfer resources.
-- Host ingress and inter-stage staging use separate H2D pools to decouple their contention effects.
-- Host-touch uses shared host resource contention and a configurable per-touch model (`host_touch_fixed_s + bytes / host_touch_Bps`).
+## Why FlowCXL gain can exceed 2x in TPC-H high profile
 
-## Stage-size Sweep
+When scan selectivity and join fanout produce very large intermediates:
 
-Default x-axis categories for grouped bars are:
+- bounce repeatedly pays `D2H + host_touch + H2D` on each inter-PIM boundary,
+- direct pays one CXL inter-device transfer,
+- host staging channels become shared bottlenecks.
 
-- `0.5x`
-- `1x`
-- `2x`
-- `4x`
+This tends to push bounce toward `host_link`/`host_touch` LB dominance, while direct shifts bottlenecks toward `cxl_direct` or compute.
 
-All boundaries in a dataset profile are scaled together to preserve relative pipeline shape.
-Default overlap-focused settings use `pim_units=32` and `max_inflight_tiles=128`.
+## Channels and contention
 
-## Trace Sampling
-
-`trace_max_tiles` controls how many tile IDs are written to `traces.csv`/`traces.yaml`.
-Run metrics always use all tiles; only trace artifact size is bounded.
+- Host H2D split pools:
+  - ingress (`host_h2d_ingress_channels`)
+  - stage staging (`host_h2d_stage_channels`)
+- Other shared pools:
+  - `host_d2h_channels`
+  - `host_touch_channels`
+  - `cxl_direct_channels`
 
 ## Metrics
 
 Per run:
 
-- Absolute makespan (`makespan_s`)
-- Absolute total energy (`total_energy_J`)
-- Compute and transfer energy split (including `host_touch_energy_J`)
-- Host-link bytes, direct-CXL bytes, host-touch bytes, and total bytes moved
-- Lower-bound bottleneck attribution (`lb_*` fields + `dominant_lb_component`)
-- `pipeline_template` metadata (`deepvariant_3stage`)
+- `makespan_s`, `total_energy_J`
+- compute/transfer split including `host_touch_energy_J`
+- transfer bytes (`host_link`, `cxl_direct`, `host_touch`, path-specific bytes)
+- LB diagnostics (`lb_*`) and `dominant_lb_component`
+- `pipeline_template`
