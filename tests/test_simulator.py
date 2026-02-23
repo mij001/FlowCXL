@@ -1,9 +1,10 @@
-"""Checks for overlap-first pipeline modeling."""
+"""Checks for DeepVariant-realistic overlap-first pipeline modeling."""
 
 from __future__ import annotations
 
 import copy
 import unittest
+from math import prod
 
 import yaml
 
@@ -29,39 +30,138 @@ class SimulatorChecks(unittest.TestCase):
                 return row
         raise KeyError((dataset_profile, scenario, multiplier))
 
-    def _ont_ratio(self, metrics: list[dict], multiplier: float = 1.0) -> float:
+    def _ratio(self, metrics: list[dict], dataset_profile: str, multiplier: float = 1.0) -> float:
         bounce = self._find_row(
-            dataset_profile=sources.PROFILE_ONT_100Gbases,
+            dataset_profile=dataset_profile,
             scenario=sources.SCENARIO_PIM_HOST_BOUNCE,
             multiplier=multiplier,
             metrics=metrics,
         )
         direct = self._find_row(
-            dataset_profile=sources.PROFILE_ONT_100Gbases,
+            dataset_profile=dataset_profile,
             scenario=sources.SCENARIO_PIM_FLOWCXL_DIRECT,
             multiplier=multiplier,
             metrics=metrics,
         )
         return float(bounce["makespan_s"]) / float(direct["makespan_s"])
 
-    def test_overlap_direct_stage_pipeline(self) -> None:
-        direct_row = self._find_row(
-            dataset_profile=sources.PROFILE_ONT_100Gbases,
-            scenario=sources.SCENARIO_PIM_FLOWCXL_DIRECT,
-            multiplier=1.0,
-        )
-        run_id = direct_row["run_id"]
-        compute_rows = [row for row in self.traces if row["run_id"] == run_id and row["op_type"] == "COMPUTE"]
-        stage1 = [row for row in compute_rows if int(row["stage_id"]) == 1]
-        stage2 = [row for row in compute_rows if int(row["stage_id"]) == 2]
-        self.assertTrue(stage1 and stage2)
-        min_stage2_start = min(float(row["t_start"]) for row in stage2)
-        max_stage1_end = max(float(row["t_end"]) for row in stage1)
-        self.assertLess(min_stage2_start, max_stage1_end)
+    def test_deepvariant_profiles_are_three_stage(self) -> None:
+        expected_profiles = {
+            sources.PROFILE_DV_ILLUMINA_WGS_30X,
+            sources.PROFILE_DV_ILLUMINA_WES_100X,
+        }
+        self.assertEqual(set(self.config["dataset_profiles"]), expected_profiles)
+        for profile_id in expected_profiles:
+            profile = sources.DATASET_PROFILES[profile_id]
+            self.assertEqual(tuple(profile["stage_names"]), sources.DEEPVARIANT_STAGE_NAMES)
+            self.assertEqual(len(profile["boundaries_bytes"]), 4)
 
-    def test_streaming_window_limits_admission(self) -> None:
+    def test_tensor_materialization_boundary_uses_example_shape(self) -> None:
+        for profile_id in self.config["dataset_profiles"]:
+            profile = sources.DATASET_PROFILES[profile_id]
+            params = profile["parameters"]
+            num_examples = int(profile["num_examples_1x"])
+            expected_x1 = (
+                num_examples
+                * prod(int(dim) for dim in params["example_shape"])
+                * int(params["example_element_bytes"])
+            )
+            self.assertEqual(int(profile["boundaries_bytes"][1]), int(expected_x1))
+
+    def test_stage_device_map_applies_per_scenario(self) -> None:
+        stage_map = self.config["scenario_stage_device_map"]
+        self.assertEqual(stage_map[sources.SCENARIO_CPU_ONLY], ["cpu", "cpu", "cpu"])
+        self.assertEqual(stage_map[sources.SCENARIO_PIM_HOST_BOUNCE], ["pim", "pim", "cpu"])
+        self.assertEqual(stage_map[sources.SCENARIO_PIM_FLOWCXL_DIRECT], ["pim", "pim", "cpu"])
+
+        profile_id = self.config["dataset_profiles"][0]
+        for scenario, expected_devices in stage_map.items():
+            row = self._find_row(profile_id, scenario, 1.0)
+            run_id = row["run_id"]
+            compute_rows = [r for r in self.traces if r["run_id"] == run_id and r["op_type"] == "COMPUTE"]
+            by_stage = {int(r["stage_id"]): str(r["stage_device"]) for r in compute_rows}
+            self.assertEqual(by_stage[1], expected_devices[0])
+            self.assertEqual(by_stage[2], expected_devices[1])
+            self.assertEqual(by_stage[3], expected_devices[2])
+
+    def test_transfer_path_matrix_cpu_pim_transitions(self) -> None:
+        for profile_id in self.config["dataset_profiles"]:
+            bounce = self._find_row(profile_id, sources.SCENARIO_PIM_HOST_BOUNCE, 1.0)
+            direct = self._find_row(profile_id, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0)
+            cpu = self._find_row(profile_id, sources.SCENARIO_CPU_ONLY, 1.0)
+
+            self.assertGreater(int(bounce["total_bytes_host_h2d_ingress"]), 0)
+            self.assertGreater(int(bounce["total_bytes_host_h2d_stage"]), 0)
+            self.assertGreater(int(bounce["total_bytes_host_d2h"]), 0)
+            self.assertEqual(int(direct["total_bytes_host_h2d_stage"]), 0)
+            self.assertGreater(int(direct["total_bytes_host_h2d_ingress"]), 0)
+            self.assertGreater(int(direct["total_bytes_host_d2h"]), 0)
+            self.assertEqual(int(cpu["total_bytes_host_link"]), 0)
+            self.assertEqual(int(cpu["total_bytes_cxl_direct"]), 0)
+
+    def test_host_touch_only_on_pim_to_pim_bounce_transition(self) -> None:
+        for profile_id in self.config["dataset_profiles"]:
+            boundaries = sources.DATASET_PROFILES[profile_id]["boundaries_bytes"]
+            for multiplier in self.config["size_multipliers"]:
+                bounce = self._find_row(
+                    dataset_profile=profile_id,
+                    scenario=sources.SCENARIO_PIM_HOST_BOUNCE,
+                    multiplier=float(multiplier),
+                )
+                direct = self._find_row(
+                    dataset_profile=profile_id,
+                    scenario=sources.SCENARIO_PIM_FLOWCXL_DIRECT,
+                    multiplier=float(multiplier),
+                )
+                cpu = self._find_row(
+                    dataset_profile=profile_id,
+                    scenario=sources.SCENARIO_CPU_ONLY,
+                    multiplier=float(multiplier),
+                )
+                scaled = scale_boundaries_exact(boundaries, float(multiplier))
+                expected_touch_bytes = int(scaled[1])
+                self.assertEqual(int(bounce["total_bytes_host_touch"]), expected_touch_bytes)
+                self.assertEqual(int(direct["total_bytes_host_touch"]), 0)
+                self.assertEqual(int(cpu["total_bytes_host_touch"]), 0)
+
+    def test_cpu_only_has_no_transfer_bytes(self) -> None:
+        for profile_id in self.config["dataset_profiles"]:
+            for multiplier in self.config["size_multipliers"]:
+                cpu = self._find_row(profile_id, sources.SCENARIO_CPU_ONLY, float(multiplier))
+                self.assertEqual(int(cpu["total_bytes_host_link"]), 0)
+                self.assertEqual(int(cpu["total_bytes_cxl_direct"]), 0)
+                self.assertEqual(int(cpu["total_bytes_host_touch"]), 0)
+                self.assertEqual(int(cpu["total_bytes_moved"]), 0)
+
+    def test_direct_not_slower_than_bounce_all_profiles_all_multipliers(self) -> None:
+        for profile_id in self.config["dataset_profiles"]:
+            for multiplier in self.config["size_multipliers"]:
+                ratio = self._ratio(self.metrics, dataset_profile=profile_id, multiplier=float(multiplier))
+                self.assertGreaterEqual(ratio, 1.0)
+
+    def test_direct_strictly_better_at_least_one_point(self) -> None:
+        strict = []
+        for profile_id in self.config["dataset_profiles"]:
+            for multiplier in self.config["size_multipliers"]:
+                ratio = self._ratio(self.metrics, dataset_profile=profile_id, multiplier=float(multiplier))
+                strict.append(ratio > 1.0 + 1e-9)
+        self.assertTrue(any(strict))
+
+    def test_overlap_make_examples_call_variants_direct(self) -> None:
+        for profile_id in self.config["dataset_profiles"]:
+            direct_row = self._find_row(profile_id, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0)
+            run_id = direct_row["run_id"]
+            compute_rows = [row for row in self.traces if row["run_id"] == run_id and row["op_type"] == "COMPUTE"]
+            stage1 = [row for row in compute_rows if int(row["stage_id"]) == 1]
+            stage2 = [row for row in compute_rows if int(row["stage_id"]) == 2]
+            self.assertTrue(stage1 and stage2)
+            min_stage2_start = min(float(row["t_start"]) for row in stage2)
+            max_stage1_end = max(float(row["t_end"]) for row in stage1)
+            self.assertLess(min_stage2_start, max_stage1_end)
+
+    def test_streaming_window_limits_initial_admission(self) -> None:
         cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_ONT_100Gbases]
+        cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
         cfg["size_multipliers"] = [1.0]
         cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
         cfg["max_inflight_tiles"] = 4
@@ -76,73 +176,29 @@ class SimulatorChecks(unittest.TestCase):
         self.assertEqual(len(tile_ids_at_zero), 4)
         self.assertGreater(len(later_tiles), 0)
 
-    def test_host_touch_applies_only_interstage_bounce(self) -> None:
-        for dataset_profile in self.config["dataset_profiles"]:
-            boundaries = sources.DATASET_PROFILES[dataset_profile]["boundaries_bytes"]
-            for multiplier in self.config["size_multipliers"]:
-                bounce = self._find_row(
-                    dataset_profile=dataset_profile,
-                    scenario=sources.SCENARIO_PIM_HOST_BOUNCE,
-                    multiplier=float(multiplier),
-                )
-                scaled = scale_boundaries_exact(boundaries, float(multiplier))
-                expected_touch_bytes = sum(scaled[1:-1])
-                self.assertEqual(int(bounce["total_bytes_host_touch"]), int(expected_touch_bytes))
-                self.assertGreater(int(bounce["total_bytes_host_touch"]), 0)
-
-            direct = self._find_row(
-                dataset_profile=dataset_profile,
-                scenario=sources.SCENARIO_PIM_FLOWCXL_DIRECT,
-                multiplier=1.0,
-            )
-            cpu = self._find_row(
-                dataset_profile=dataset_profile,
-                scenario=sources.SCENARIO_CPU_ONLY,
-                multiplier=1.0,
-            )
-            self.assertEqual(int(direct["total_bytes_host_touch"]), 0)
-            self.assertEqual(int(cpu["total_bytes_host_touch"]), 0)
-
-    def test_split_h2d_paths_accounting(self) -> None:
-        for dataset_profile in self.config["dataset_profiles"]:
-            for multiplier in self.config["size_multipliers"]:
-                bounce = self._find_row(
-                    dataset_profile=dataset_profile,
-                    scenario=sources.SCENARIO_PIM_HOST_BOUNCE,
-                    multiplier=float(multiplier),
-                )
-                direct = self._find_row(
-                    dataset_profile=dataset_profile,
-                    scenario=sources.SCENARIO_PIM_FLOWCXL_DIRECT,
-                    multiplier=float(multiplier),
-                )
-                self.assertGreater(int(bounce["total_bytes_host_h2d_ingress"]), 0)
-                self.assertGreater(int(bounce["total_bytes_host_h2d_stage"]), 0)
-                self.assertGreater(int(direct["total_bytes_host_h2d_ingress"]), 0)
-                self.assertEqual(int(direct["total_bytes_host_h2d_stage"]), 0)
-
-    def test_ont_gain_target_default(self) -> None:
-        ratio = self._ont_ratio(self.metrics, multiplier=1.0)
-        self.assertGreaterEqual(ratio, 1.05)
-
-    def test_checkA_compute_sensitivity(self) -> None:
-        baseline_ratio = self._ont_ratio(self.metrics, multiplier=1.0)
+    def test_compute_sensitivity_increases_bounce_direct_gap(self) -> None:
+        profile_id = self.config["dataset_profiles"][0]
+        baseline_ratio = self._ratio(self.metrics, dataset_profile=profile_id, multiplier=1.0)
 
         cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_ONT_100Gbases]
+        cfg["dataset_profiles"] = [profile_id]
         cfg["size_multipliers"] = [1.0]
         cfg["scenarios"] = [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        cfg["stage_defaults"]["pim_unit_compute_Bps"] = float(cfg["stage_defaults"]["pim_unit_compute_Bps"]) * 10.0
+        for stage_name in sources.DEEPVARIANT_STAGE_NAMES:
+            cfg["pim_speedup_vs_cpu_by_stage"][stage_name] = float(
+                cfg["pim_speedup_vs_cpu_by_stage"][stage_name]
+            ) * 10.0
 
         metrics_fast, _ = generate_runs_from_config(cfg)
-        fast_ratio = self._ont_ratio(metrics_fast, multiplier=1.0)
+        fast_ratio = self._ratio(metrics_fast, dataset_profile=profile_id, multiplier=1.0)
         self.assertGreater(fast_ratio, baseline_ratio)
 
-    def test_checkA_link_sensitivity(self) -> None:
-        baseline_ratio = self._ont_ratio(self.metrics, multiplier=1.0)
+    def test_host_link_sensitivity_increases_bounce_direct_gap(self) -> None:
+        profile_id = self.config["dataset_profiles"][0]
+        baseline_ratio = self._ratio(self.metrics, dataset_profile=profile_id, multiplier=1.0)
 
         cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_ONT_100Gbases]
+        cfg["dataset_profiles"] = [profile_id]
         cfg["size_multipliers"] = [1.0]
         cfg["scenarios"] = [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
         host_link = cfg["link_profile"]["host_link"]
@@ -152,10 +208,10 @@ class SimulatorChecks(unittest.TestCase):
             metrics_slow, _ = generate_runs_from_config(cfg)
         finally:
             sources.LINKS[host_link]["bandwidth_Bps"] = old_bw
-        slow_ratio = self._ont_ratio(metrics_slow, multiplier=1.0)
+        slow_ratio = self._ratio(metrics_slow, dataset_profile=profile_id, multiplier=1.0)
         self.assertGreater(slow_ratio, baseline_ratio)
 
-    def test_metrics_schema_includes_new_lb_subfields(self) -> None:
+    def test_metrics_schema_stable_with_pipeline_template(self) -> None:
         expected = {
             "run_id",
             "dataset_profile",
@@ -183,6 +239,7 @@ class SimulatorChecks(unittest.TestCase):
             "lb_host_touch_s",
             "lb_cxl_direct_s",
             "dominant_lb_component",
+            "pipeline_template",
         }
         legacy_forbidden = {
             "speedup_vs_chain",
@@ -193,13 +250,18 @@ class SimulatorChecks(unittest.TestCase):
             "bytes_cxl_h2d",
             "bytes_cxl_d2h",
         }
-
         for row in self.metrics:
             row_keys = set(row.keys())
             self.assertTrue(expected.issubset(row_keys))
+            self.assertEqual(row["pipeline_template"], sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE)
             self.assertTrue(legacy_forbidden.isdisjoint(row_keys))
             self.assertFalse(any(key.startswith("util_") for key in row_keys))
             self.assertFalse(any(key.startswith("queue_") for key in row_keys))
+
+    def test_legacy_profile_ids_absent_from_default_config(self) -> None:
+        profile_ids = set(self.config["dataset_profiles"])
+        self.assertNotIn("PROFILE_ONT_100Gbases", profile_ids)
+        self.assertNotIn("PROFILE_ILLUMINA_NA12878", profile_ids)
 
 
 if __name__ == "__main__":

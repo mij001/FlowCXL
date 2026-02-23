@@ -1,6 +1,6 @@
 dataset_profiles:
-  - PROFILE_ONT_100Gbases
-  - PROFILE_ILLUMINA_NA12878
+  - PROFILE_DV_ILLUMINA_WGS_30X
+  - PROFILE_DV_ILLUMINA_WES_100X
 
 size_multipliers:
   - 0.5
@@ -22,7 +22,7 @@ link_profile:
   cxl_direct_link: CXL_LOCAL
 
 resource_capacity:
-  host_h2d_ingress_channels: 16
+  host_h2d_ingress_channels: 1
   host_h2d_stage_channels: 1
   host_d2h_channels: 1
   cxl_direct_channels: 1
@@ -30,13 +30,23 @@ resource_capacity:
 
 stage_defaults:
   cpu_units: 32
-  cpu_unit_compute_Bps: 800000000.0
+  cpu_unit_compute_Bps: 1000000000.0
   cpu_unit_power_W: 15.0
   pim_units: 32
-  pim_unit_compute_Bps: 7500000000.0
+  pim_unit_compute_Bps: 1000000000.0
   pim_unit_power_W: 7.5
   host_touch_Bps: 25000000000.0
   host_touch_fixed_s: 0.000002
+
+scenario_stage_device_map:
+  cpu_only: [cpu, cpu, cpu]
+  pim_host_bounce: [pim, pim, cpu]
+  pim_flowcxl_direct: [pim, pim, cpu]
+
+pim_speedup_vs_cpu_by_stage:
+  make_examples: 1.5
+  call_variants: 2.0
+  postprocess_variants: 1.0
 
 transfer_power_W:
   host_h2d_ingress_channel: 20.0

@@ -1,6 +1,9 @@
-"""Cited constants, dataset profiles, and run vocabulary for pipeline experiments."""
+"""Cited constants, DeepVariant profile defaults, and run vocabulary."""
 
 from __future__ import annotations
+
+from math import prod
+from typing import Dict, Mapping
 
 MB = 10**6
 GB = 10**9
@@ -15,6 +18,15 @@ SCENARIOS = (
     SCENARIO_PIM_HOST_BOUNCE,
     SCENARIO_PIM_FLOWCXL_DIRECT,
 )
+
+DEVICE_CPU = "cpu"
+DEVICE_PIM = "pim"
+
+PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE = "deepvariant_3stage"
+DEEPVARIANT_STAGE_NAMES = ("make_examples", "call_variants", "postprocess_variants")
+
+PROFILE_DV_ILLUMINA_WGS_30X = "PROFILE_DV_ILLUMINA_WGS_30X"
+PROFILE_DV_ILLUMINA_WES_100X = "PROFILE_DV_ILLUMINA_WES_100X"
 
 LINK_PCIE_GEN4_X16 = "PCIe Gen4 x16"
 LINK_CXL_LOCAL = "CXL_LOCAL"
@@ -32,30 +44,123 @@ CXL_LOCAL_BW_Bps = 52e9
 CXL_REMOTE_LAT_s = 621e-9
 CXL_REMOTE_BW_Bps = 13e9
 
-TARGETCALL_KEEP_FRACTION = 0.0529
+_REQUIRED_PROFILE_KEYS = (
+    "covered_bases",
+    "coverage_x",
+    "candidate_density_per_base_at_ref_coverage",
+    "candidate_density_ref_coverage_x",
+    "aligned_bytes_per_covered_base",
+    "example_shape",
+    "example_element_bytes",
+    "call_output_bytes_per_example",
+    "postprocess_output_bytes_per_example",
+    "cpu_reference_total_runtime_s_1x",
+    "cpu_stage_time_share_1x",
+)
 
-PROFILE_ONT_100Gbases = "PROFILE_ONT_100Gbases"
-PROFILE_ILLUMINA_NA12878 = "PROFILE_ILLUMINA_NA12878"
 
-ONT_X0 = 2 * TB
-ONT_X1 = 112 * GB
-ONT_X2 = int(round(ONT_X1 * TARGETCALL_KEEP_FRACTION))
-ONT_X3 = 147 * GB
-ONT_X4 = 128 * MB
+def _validate_stage_shares(stage_shares: Mapping[str, float]) -> None:
+    missing = [stage for stage in DEEPVARIANT_STAGE_NAMES if stage not in stage_shares]
+    if missing:
+        raise ValueError(f"missing stage share keys: {missing}")
+    share_sum = sum(float(stage_shares[stage]) for stage in DEEPVARIANT_STAGE_NAMES)
+    if abs(share_sum - 1.0) > 1e-3:
+        raise ValueError(f"cpu_stage_time_share_1x must sum to 1.0, got {share_sum}")
+    for stage in DEEPVARIANT_STAGE_NAMES:
+        if float(stage_shares[stage]) <= 0.0:
+            raise ValueError(f"cpu_stage_time_share_1x[{stage}] must be > 0")
 
-ILLUMINA_X0 = 28 * GB
-ILLUMINA_X1 = 147 * GB
-ILLUMINA_X2 = 128 * MB
+
+def _derive_num_examples(params: Mapping[str, float]) -> int:
+    covered_bases = float(params["covered_bases"])
+    coverage_x = float(params["coverage_x"])
+    density = float(params["candidate_density_per_base_at_ref_coverage"])
+    ref_coverage_x = float(params["candidate_density_ref_coverage_x"])
+    if ref_coverage_x <= 0:
+        raise ValueError("candidate_density_ref_coverage_x must be > 0")
+    num_examples = int(round(covered_bases * density * (coverage_x / ref_coverage_x)))
+    return max(1, num_examples)
+
+
+def _derive_boundaries_bytes(params: Mapping[str, float]) -> list[int]:
+    num_examples = _derive_num_examples(params)
+    x0 = int(
+        round(
+            float(params["covered_bases"])
+            * float(params["coverage_x"])
+            * float(params["aligned_bytes_per_covered_base"])
+        )
+    )
+    x1 = int(num_examples * prod(int(dim) for dim in params["example_shape"]) * int(params["example_element_bytes"]))
+    x2 = int(num_examples * int(params["call_output_bytes_per_example"]))
+    x3 = int(num_examples * int(params["postprocess_output_bytes_per_example"]))
+    return [x0, x1, x2, x3]
+
+
+def _build_deepvariant_profile(profile_id: str, params: Dict[str, object], description: str) -> Dict[str, object]:
+    missing = [key for key in _REQUIRED_PROFILE_KEYS if key not in params]
+    if missing:
+        raise ValueError(f"profile {profile_id} missing required keys: {missing}")
+
+    _validate_stage_shares(params["cpu_stage_time_share_1x"])
+    boundaries = _derive_boundaries_bytes(params)
+    return {
+        "boundaries_bytes": boundaries,
+        "description": description,
+        "stage_names": list(DEEPVARIANT_STAGE_NAMES),
+        "parameters": dict(params),
+        "num_examples_1x": _derive_num_examples(params),
+    }
+
+
+DEEPVARIANT_PROFILE_PARAMETERS: Dict[str, Dict[str, object]] = {
+    PROFILE_DV_ILLUMINA_WGS_30X: {
+        "covered_bases": 3_100_000_000,
+        "coverage_x": 30,
+        "candidate_density_per_base_at_ref_coverage": 0.0020,
+        "candidate_density_ref_coverage_x": 30,
+        "aligned_bytes_per_covered_base": 1.2,
+        "example_shape": [100, 147, 10],
+        "example_element_bytes": 1,
+        "call_output_bytes_per_example": 12,
+        "postprocess_output_bytes_per_example": 40,
+        "cpu_reference_total_runtime_s_1x": 36792.0,
+        "cpu_stage_time_share_1x": {
+            "make_examples": 0.3082,
+            "call_variants": 0.6389,
+            "postprocess_variants": 0.0529,
+        },
+    },
+    PROFILE_DV_ILLUMINA_WES_100X: {
+        "covered_bases": 50_000_000,
+        "coverage_x": 100,
+        "candidate_density_per_base_at_ref_coverage": 0.0020,
+        "candidate_density_ref_coverage_x": 30,
+        "aligned_bytes_per_covered_base": 1.2,
+        "example_shape": [100, 147, 10],
+        "example_element_bytes": 1,
+        "call_output_bytes_per_example": 12,
+        "postprocess_output_bytes_per_example": 40,
+        "cpu_reference_total_runtime_s_1x": 558.0,
+        "cpu_stage_time_share_1x": {
+            "make_examples": 0.8136,
+            "call_variants": 0.1057,
+            "postprocess_variants": 0.0806,
+        },
+    },
+}
 
 DATASET_PROFILES = {
-    PROFILE_ONT_100Gbases: {
-        "boundaries_bytes": [ONT_X0, ONT_X1, ONT_X2, ONT_X3, ONT_X4],
-        "description": "ONT profile with basecall/filter/align/variant boundaries",
-    },
-    PROFILE_ILLUMINA_NA12878: {
-        "boundaries_bytes": [ILLUMINA_X0, ILLUMINA_X1, ILLUMINA_X2],
-        "description": "Illumina NA12878 profile with align/variant boundaries",
-    },
+    PROFILE_DV_ILLUMINA_WGS_30X: _build_deepvariant_profile(
+        profile_id=PROFILE_DV_ILLUMINA_WGS_30X,
+        params=DEEPVARIANT_PROFILE_PARAMETERS[PROFILE_DV_ILLUMINA_WGS_30X],
+        description="DeepVariant WGS (Illumina 30x) with derived make_examples/call/postprocess boundaries.",
+    ),
+    PROFILE_DV_ILLUMINA_WES_100X: _build_deepvariant_profile(
+        profile_id=PROFILE_DV_ILLUMINA_WES_100X,
+        params=DEEPVARIANT_PROFILE_PARAMETERS[PROFILE_DV_ILLUMINA_WES_100X],
+        description="DeepVariant WES (Illumina 100x) with derived make_examples/call/postprocess boundaries.",
+    ),
 }
 
 LINKS = {
@@ -125,41 +230,36 @@ CITED_VALUES = {
         "quote": "remote entries show higher latency and reduced bandwidth (~13-14GB/s)",
         "how_used": "Representative remote bandwidth point for CXL direct transfers.",
     },
-    "ONT_FAST5_X0": {
-        "value": ONT_X0,
-        "url": "https://media.tghn.org/medialibrary/2020/09/Introduction_to_Nanopore_Data_analysis_-_Alp_Aydin.pdf",
-        "quote": "fast5 = 2 terrabytes",
-        "how_used": "ONT boundary X0.",
+    "DEEPVARIANT_STAGE_NAMES": {
+        "value": list(DEEPVARIANT_STAGE_NAMES),
+        "url": "https://github.com/google/deepvariant",
+        "quote": "make_examples, call_variants, postprocess_variants",
+        "how_used": "Defines fixed 3-stage DeepVariant pipeline in simulator.",
     },
-    "ONT_FASTQ_GZ_X1": {
-        "value": ONT_X1,
-        "url": "https://media.tghn.org/medialibrary/2020/09/Introduction_to_Nanopore_Data_analysis_-_Alp_Aydin.pdf",
-        "quote": "fastq gzipped = 112 gigabytes",
-        "how_used": "ONT boundary X1.",
+    "DEEPVARIANT_EXAMPLE_SHAPE": {
+        "value": [100, 147, 10],
+        "url": "https://github.com/google/deepvariant/releases",
+        "quote": "example shape [100, 147, 10]",
+        "how_used": "Tensor materialization size seed for stage-1 output bytes.",
     },
-    "TARGETCALL_KEEP_FRACTION": {
-        "value": TARGETCALL_KEEP_FRACTION,
-        "url": "https://www.frontiersin.org/journals/genetics/articles/10.3389/fgene.2024.1429306/full",
-        "quote": "filters out 94.71% of the off-target reads",
-        "how_used": "Derived keep fraction for ONT boundary X2.",
+    "DEEPVARIANT_TIMING_BREAKDOWN_CONTEXT": {
+        "value": {
+            "wgs_runtime_s": DEEPVARIANT_PROFILE_PARAMETERS[PROFILE_DV_ILLUMINA_WGS_30X][
+                "cpu_reference_total_runtime_s_1x"
+            ],
+            "wes_runtime_s": DEEPVARIANT_PROFILE_PARAMETERS[PROFILE_DV_ILLUMINA_WES_100X][
+                "cpu_reference_total_runtime_s_1x"
+            ],
+        },
+        "url": "https://developer.nvidia.com/blog/accelerating-deepvariant/",
+        "quote": "make_examples and call_variants dominate runtime depending on hardware path.",
+        "how_used": "Calibration context for stage runtime shares at 1x.",
     },
-    "GIAB_BAM_X": {
-        "value": 147 * GB,
-        "url": "https://digital.library.adelaide.edu.au/dspace/bitstream/2440/136736/1/Lan2022_PhD.pdf",
-        "quote": ".bam ... 147 GB",
-        "how_used": "Boundary proxy for aligned BAM size.",
-    },
-    "GIAB_VCF_X": {
-        "value": 128 * MB,
-        "url": "https://digital.library.adelaide.edu.au/dspace/bitstream/2440/136736/1/Lan2022_PhD.pdf",
-        "quote": ".vcf.gz ... 128 MB",
-        "how_used": "Boundary proxy for final VCF size.",
-    },
-    "ILLUMINA_X0": {
-        "value": ILLUMINA_X0,
-        "url": "https://oak.chosun.ac.kr/bitstream/2020.oak/18470/2/Constructing%20an%20ethnic-specific%20variant%20calling%20workflow%20based%20on%20a%20systematic%20comparison%20of%20multipl.pdf",
-        "quote": "Since the NA12878 data was 28GB",
-        "how_used": "Illumina boundary X0.",
+    "PARABRICKS_DV_CONTEXT": {
+        "value": "qualitative",
+        "url": "https://developer.nvidia.com/blog/accelerate-genomic-analysis-for-any-sequencer-with-parabricks-v4-2/",
+        "quote": "accelerates DeepVariant and end-to-end variant calling runtime.",
+        "how_used": "Context that hardware acceleration materially shifts call_variants throughput.",
     },
 }
 

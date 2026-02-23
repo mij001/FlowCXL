@@ -1,91 +1,90 @@
-# FlowCXL Tiled Stage-Capacity Report
+# DeepVariant Tiled Stage-Capacity Report
 
 ## Single Claim
-With bounded streaming admission and split host H2D topology, FlowCXL direct transfer isolates inter-stage staging costs from ingress contention and exposes overlap-dependent gains.
+With bounded streaming admission and split host H2D topology, FlowCXL direct transfer isolates DeepVariant inter-stage staging costs from ingress contention and exposes overlap-dependent gains.
 
 ## Modeled
-- Stage-limited compute capacity (CPU or PIM units)
+- Fixed DeepVariant three-stage pipeline: make_examples, call_variants, postprocess_variants
+- Stage-limited compute capacity with scenario stage-device mapping (CPU or PIM)
 - Tile-by-tile pipelined execution with bounded in-flight admission
 - True host bounce for intermediates: D2H -> HOST_TOUCH -> H2D(stage)
 - Split host H2D resources: ingress vs inter-stage staging
 - Absolute makespan (seconds) and total energy (joules)
 - Lower-bound bottleneck diagnostics by resource family
 
-## ONT Gain Check
-- 0.5x: bounce/direct ratio `1.276091` (27.609% gain), bounce dominant `host_touch`, direct dominant `compute_stage_max`.
-- 1x: bounce/direct ratio `1.277401` (27.740% gain), bounce dominant `host_touch`, direct dominant `compute_stage_max`.
-- 2x: bounce/direct ratio `1.277006` (27.701% gain), bounce dominant `host_touch`, direct dominant `compute_stage_max`.
-- 4x: bounce/direct ratio `1.276832` (27.683% gain), bounce dominant `host_touch`, direct dominant `compute_stage_max`.
-- ONT 1x target (`>=5%`): ratio `1.277401` (27.740% gain) -> `PASS`.
-- Streaming admission (`max_inflight_tiles`) and split H2D pools separate ingress pressure from inter-stage staging, making overlap/transfer effects easier to attribute.
+## Directional Check
+- PROFILE_DV_ILLUMINA_WES_100X: directional `true`, strictly-better points `4`, 1x bounce/direct ratio `1.000438`, sensitivity delta (max-min ratio) `0.000868`.
+- PROFILE_DV_ILLUMINA_WGS_30X: directional `true`, strictly-better points `4`, 1x bounce/direct ratio `1.000003`, sensitivity delta (max-min ratio) `0.000003`.
+- Directional condition checks `direct <= bounce`; sensitivity delta reports how ratio changes across stage-size multipliers.
+- Streaming admission (`max_inflight_tiles`) and split H2D pools separate ingress pressure from inter-stage staging, while only PIM->PIM transitions differ between bounce and direct.
 
 ## Plot Artifacts
-- plot_makespan_grouped_PROFILE_ONT_100Gbases.png
-- plot_makespan_grouped_PROFILE_ILLUMINA_NA12878.png
-- plot_energy_grouped_PROFILE_ONT_100Gbases.png
-- plot_energy_grouped_PROFILE_ILLUMINA_NA12878.png
+- plot_makespan_grouped_PROFILE_DV_ILLUMINA_WGS_30X.png
+- plot_makespan_grouped_PROFILE_DV_ILLUMINA_WES_100X.png
+- plot_energy_grouped_PROFILE_DV_ILLUMINA_WGS_30X.png
+- plot_energy_grouped_PROFILE_DV_ILLUMINA_WES_100X.png
 
 ## Results Table
 | dataset_profile | stage_size_multiplier | scenario | makespan_s | total_energy_J | host_touch_energy_J | total_bytes_host_touch | dominant_lb_component |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| PROFILE_ONT_100Gbases | 0.5x | CPU only | 39.295646 | 21233.670000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ONT_100Gbases | 0.5x | PIM host bounce | 5.369075 | 2088.131016 | 159.625560 | 132462400000 | host_touch |
-| PROFILE_ONT_100Gbases | 0.5x | PIM FlowCXL direct | 4.207438 | 1799.654599 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ONT_100Gbases | 1x | CPU only | 78.221870 | 42467.340000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ONT_100Gbases | 1x | PIM host bounce | 10.689927 | 4176.260396 | 319.250940 | 264924800000 | host_touch |
-| PROFILE_ONT_100Gbases | 1x | PIM FlowCXL direct | 8.368499 | 3599.308824 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ONT_100Gbases | 2x | CPU only | 156.399296 | 84934.680000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ONT_100Gbases | 2x | PIM host bounce | 21.331625 | 8352.520792 | 638.501880 | 529849600000 | host_touch |
-| PROFILE_ONT_100Gbases | 2x | PIM FlowCXL direct | 16.704408 | 7198.617647 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ONT_100Gbases | 4x | CPU only | 312.764642 | 169869.360000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ONT_100Gbases | 4x | PIM host bounce | 42.615017 | 16705.039948 | 1277.003580 | 1059699200000 | host_touch |
-| PROFILE_ONT_100Gbases | 4x | PIM FlowCXL direct | 33.375581 | 14397.234921 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ILLUMINA_NA12878 | 0.5x | CPU only | 3.081661 | 1640.625000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ILLUMINA_NA12878 | 0.5x | PIM host bounce | 3.001533 | 276.580912 | 88.216440 | 73500000000 | host_touch |
-| PROFILE_ILLUMINA_NA12878 | 0.5x | PIM FlowCXL direct | 1.457721 | 119.006059 | 0.000000 | 0 | cxl_direct |
-| PROFILE_ILLUMINA_NA12878 | 1x | CPU only | 6.099453 | 3281.250000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ILLUMINA_NA12878 | 1x | PIM host bounce | 5.942081 | 553.161824 | 176.432880 | 147000000000 | host_touch |
-| PROFILE_ILLUMINA_NA12878 | 1x | PIM FlowCXL direct | 2.871242 | 238.012118 | 0.000000 | 0 | cxl_direct |
-| PROFILE_ILLUMINA_NA12878 | 2x | CPU only | 11.799726 | 6562.500000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ILLUMINA_NA12878 | 2x | PIM host bounce | 11.823177 | 1106.323648 | 352.865760 | 294000000000 | host_touch |
-| PROFILE_ILLUMINA_NA12878 | 2x | PIM FlowCXL direct | 5.698282 | 476.024235 | 0.000000 | 0 | cxl_direct |
-| PROFILE_ILLUMINA_NA12878 | 4x | CPU only | 23.210863 | 13125.000000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_ILLUMINA_NA12878 | 4x | PIM host bounce | 23.585395 | 2212.646508 | 705.731460 | 588000000000 | host_touch |
-| PROFILE_ILLUMINA_NA12878 | 4x | PIM FlowCXL direct | 11.352383 | 952.048103 | 0.000000 | 0 | cxl_direct |
+| PROFILE_DV_ILLUMINA_WGS_30X | 0.5x | CPU only | 12086.046220 | 8830080.000000 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 0.5x | PIM host bounce | 6070.040280 | 2785792.013274 | 546.941880 | 455700000000 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 0.5x | PIM FlowCXL direct | 6070.012337 | 2784815.049521 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 1x | CPU only | 23825.407034 | 17660160.000001 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 1x | PIM host bounce | 11939.742161 | 5571584.026548 | 1093.883760 | 911400000000 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 1x | PIM FlowCXL direct | 11939.703066 | 5569630.099041 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 2x | CPU only | 47311.094182 | 35320319.999999 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 2x | PIM host bounce | 23682.621837 | 11143168.052308 | 2187.767460 | 1822800000000 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 2x | PIM FlowCXL direct | 23682.566007 | 11139260.197715 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 4x | CPU only | 94282.393300 | 70640640.000002 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 4x | PIM host bounce | 47168.337568 | 22286336.103827 | 4375.534860 | 3645600000000 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WGS_30X | 4x | PIM FlowCXL direct | 47168.248273 | 22278520.395061 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 0.5x | CPU only | 254.942883 | 133906.608000 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 0.5x | PIM host bounce | 171.175578 | 50713.865686 | 29.405491 | 24499975500 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 0.5x | PIM FlowCXL direct | 171.003999 | 50661.340507 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 1x | CPU only | 494.494146 | 267813.216000 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 1x | PIM host bounce | 330.829156 | 101427.730584 | 58.810921 | 48999951000 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 1x | PIM FlowCXL direct | 330.684455 | 101322.680647 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 2x | CPU only | 970.809905 | 535626.432000 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 2x | PIM host bounce | 648.276823 | 202855.461168 | 117.621842 | 97999902000 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 2x | PIM FlowCXL direct | 648.182188 | 202645.361293 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 4x | CPU only | 1846.578806 | 1071252.864000 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 4x | PIM host bounce | 1232.263684 | 405710.921548 | 235.243625 | 195999804000 | compute_stage_max |
+| PROFILE_DV_ILLUMINA_WES_100X | 4x | PIM FlowCXL direct | 1232.096503 | 405290.722219 | 0.000000 | 0 | compute_stage_max |
 
 ## Bottleneck Diagnostics
-### PROFILE_ONT_100Gbases
+### PROFILE_DV_ILLUMINA_WGS_30X
 
 | dataset_profile | stage_size_multiplier | scenario | makespan_s | total_energy_J | dominant_lb_component | lb_compute_stage_max_s | lb_host_h2d_ingress_s | lb_host_h2d_stage_s | lb_host_d2h_s | lb_host_link_s | lb_host_touch_s | lb_cxl_direct_s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| PROFILE_ONT_100Gbases | 0.5x | CPU only | 39.295646 | 21233.670000 | compute_stage_max | 39.062500 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_ONT_100Gbases | 0.5x | PIM FlowCXL direct | 4.207438 | 1799.654599 | compute_stage_max | 4.166667 | 1.955244 | 0.000000 | 0.035907 | 1.955244 | 0.000000 | 2.549746 |
-| PROFILE_ONT_100Gbases | 0.5x | PIM host bounce | 5.369075 | 2088.131016 | host_touch | 4.166667 | 1.955244 | 4.241170 | 4.277076 | 4.277076 | 5.320852 | 0.000000 |
-| PROFILE_ONT_100Gbases | 1x | CPU only | 78.221870 | 42467.340000 | compute_stage_max | 78.125000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_ONT_100Gbases | 1x | PIM FlowCXL direct | 8.368499 | 3599.308824 | compute_stage_max | 8.333333 | 3.910488 | 0.000000 | 0.071804 | 3.910488 | 0.000000 | 5.099491 |
-| PROFILE_ONT_100Gbases | 1x | PIM host bounce | 10.689927 | 4176.260396 | host_touch | 8.333333 | 3.910488 | 8.482312 | 8.554116 | 8.554116 | 10.641698 | 0.000000 |
-| PROFILE_ONT_100Gbases | 2x | CPU only | 156.399296 | 84934.680000 | compute_stage_max | 156.250000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_ONT_100Gbases | 2x | PIM FlowCXL direct | 16.704408 | 7198.617647 | compute_stage_max | 16.666667 | 7.820976 | 0.000000 | 0.143608 | 7.820976 | 0.000000 | 10.198982 |
-| PROFILE_ONT_100Gbases | 2x | PIM host bounce | 21.331625 | 8352.520792 | host_touch | 16.666667 | 7.820976 | 16.964625 | 17.108233 | 17.108233 | 21.283396 | 0.000000 |
-| PROFILE_ONT_100Gbases | 4x | CPU only | 312.764642 | 169869.360000 | compute_stage_max | 312.500000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_ONT_100Gbases | 4x | PIM FlowCXL direct | 33.375581 | 14397.234921 | compute_stage_max | 33.333333 | 15.641950 | 0.000000 | 0.287207 | 15.641950 | 0.000000 | 20.397964 |
-| PROFILE_ONT_100Gbases | 4x | PIM host bounce | 42.615017 | 16705.039948 | host_touch | 33.333333 | 15.641950 | 33.929222 | 34.216429 | 34.216429 | 42.566786 | 0.000000 |
-### PROFILE_ILLUMINA_NA12878
+| PROFILE_DV_ILLUMINA_WGS_30X | 0.5x | CPU only | 12086.046220 | 8830080.000000 | compute_stage_max | 11753.204400 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 0.5x | PIM FlowCXL direct | 6070.012337 | 2784815.049521 | compute_stage_max | 5876.602200 | 1.759202 | 0.000000 | 0.016614 | 1.759202 | 0.000000 | 8.763825 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 0.5x | PIM host bounce | 6070.040280 | 2785792.013274 | compute_stage_max | 5876.602200 | 1.759202 | 14.256077 | 14.272691 | 14.272691 | 18.231396 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 1x | CPU only | 23825.407034 | 17660160.000001 | compute_stage_max | 23506.408800 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 1x | PIM FlowCXL direct | 11939.703066 | 5569630.099041 | compute_stage_max | 11753.204400 | 3.518404 | 0.000000 | 0.033229 | 3.518404 | 0.000000 | 17.527650 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 1x | PIM host bounce | 11939.742161 | 5571584.026548 | compute_stage_max | 11753.204400 | 3.518404 | 28.512154 | 28.545382 | 28.545382 | 36.462792 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 2x | CPU only | 47311.094182 | 35320319.999999 | compute_stage_max | 47012.817600 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 2x | PIM FlowCXL direct | 23682.566007 | 11139260.197715 | compute_stage_max | 23506.408800 | 7.036798 | 0.000000 | 0.066448 | 7.036798 | 0.000000 | 35.055299 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 2x | PIM host bounce | 23682.621837 | 11143168.052308 | compute_stage_max | 23506.408800 | 7.036798 | 57.024298 | 57.090746 | 57.090746 | 72.925582 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 4x | CPU only | 94282.393300 | 70640640.000002 | compute_stage_max | 94025.635200 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 4x | PIM FlowCXL direct | 47168.248273 | 22278520.395061 | compute_stage_max | 47012.817600 | 14.073587 | 0.000000 | 0.132887 | 14.073587 | 0.000000 | 70.110599 |
+| PROFILE_DV_ILLUMINA_WGS_30X | 4x | PIM host bounce | 47168.337568 | 22286336.103827 | compute_stage_max | 47012.817600 | 14.073587 | 114.048587 | 114.181474 | 114.181474 | 145.851162 | 0.000000 |
+### PROFILE_DV_ILLUMINA_WES_100X
 
 | dataset_profile | stage_size_multiplier | scenario | makespan_s | total_energy_J | dominant_lb_component | lb_compute_stage_max_s | lb_host_h2d_ingress_s | lb_host_h2d_stage_s | lb_host_d2h_s | lb_host_link_s | lb_host_touch_s | lb_cxl_direct_s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| PROFILE_ILLUMINA_NA12878 | 0.5x | CPU only | 3.081661 | 1640.625000 | compute_stage_max | 2.871094 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_ILLUMINA_NA12878 | 0.5x | PIM FlowCXL direct | 1.457721 | 119.006059 | cxl_direct | 0.306250 | 0.027500 | 0.000000 | 0.004493 | 0.027500 | 0.000000 | 1.413520 |
-| PROFILE_ILLUMINA_NA12878 | 0.5x | PIM host bounce | 3.001533 | 276.580912 | host_touch | 0.306250 | 0.027500 | 2.299368 | 2.303862 | 2.303862 | 2.940548 | 0.000000 |
-| PROFILE_ILLUMINA_NA12878 | 1x | CPU only | 6.099453 | 3281.250000 | compute_stage_max | 5.742188 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_ILLUMINA_NA12878 | 1x | PIM FlowCXL direct | 2.871242 | 238.012118 | cxl_direct | 0.612500 | 0.054999 | 0.000000 | 0.008987 | 0.054999 | 0.000000 | 2.827040 |
-| PROFILE_ILLUMINA_NA12878 | 1x | PIM host bounce | 5.942081 | 553.161824 | host_touch | 0.612500 | 0.054999 | 4.598737 | 4.607724 | 4.607724 | 5.881096 | 0.000000 |
-| PROFILE_ILLUMINA_NA12878 | 2x | CPU only | 11.799726 | 6562.500000 | compute_stage_max | 11.484375 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_ILLUMINA_NA12878 | 2x | PIM FlowCXL direct | 5.698282 | 476.024235 | cxl_direct | 1.225000 | 0.109998 | 0.000000 | 0.017974 | 0.109998 | 0.000000 | 5.654081 |
-| PROFILE_ILLUMINA_NA12878 | 2x | PIM host bounce | 11.823177 | 1106.323648 | host_touch | 1.225000 | 0.109998 | 9.197474 | 9.215447 | 9.215447 | 11.762192 | 0.000000 |
-| PROFILE_ILLUMINA_NA12878 | 4x | CPU only | 23.210863 | 13125.000000 | compute_stage_max | 22.968750 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_ILLUMINA_NA12878 | 4x | PIM FlowCXL direct | 11.352383 | 952.048103 | cxl_direct | 2.450000 | 0.219996 | 0.000000 | 0.035938 | 0.219996 | 0.000000 | 11.308161 |
-| PROFILE_ILLUMINA_NA12878 | 4x | PIM host bounce | 23.585395 | 2212.646508 | host_touch | 2.450000 | 0.219996 | 18.394938 | 18.430876 | 18.430876 | 23.524382 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WES_100X | 0.5x | CPU only | 254.942883 | 133906.608000 | compute_stage_max | 226.994400 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WES_100X | 0.5x | PIM FlowCXL direct | 171.003999 | 50661.340507 | compute_stage_max | 151.329600 | 0.094587 | 0.000000 | 0.000900 | 0.094587 | 0.000000 | 0.471173 |
+| PROFILE_DV_ILLUMINA_WES_100X | 0.5x | PIM host bounce | 171.175578 | 50713.865686 | compute_stage_max | 151.329600 | 0.094587 | 0.766461 | 0.767361 | 0.767361 | 0.980183 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WES_100X | 1x | CPU only | 494.494146 | 267813.216000 | compute_stage_max | 453.988800 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WES_100X | 1x | PIM FlowCXL direct | 330.684455 | 101322.680647 | compute_stage_max | 302.659200 | 0.189165 | 0.000000 | 0.001790 | 0.189165 | 0.000000 | 0.942346 |
+| PROFILE_DV_ILLUMINA_WES_100X | 1x | PIM host bounce | 330.829156 | 101427.730584 | compute_stage_max | 302.659200 | 0.189165 | 1.532914 | 1.534704 | 1.534704 | 1.960364 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WES_100X | 2x | CPU only | 970.809905 | 535626.432000 | compute_stage_max | 907.977600 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WES_100X | 2x | PIM FlowCXL direct | 648.182188 | 202645.361293 | compute_stage_max | 605.318400 | 0.378331 | 0.000000 | 0.003581 | 0.378331 | 0.000000 | 1.884692 |
+| PROFILE_DV_ILLUMINA_WES_100X | 2x | PIM host bounce | 648.276823 | 202855.461168 | compute_stage_max | 605.318400 | 0.378331 | 3.065828 | 3.069408 | 3.069408 | 3.920728 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WES_100X | 4x | CPU only | 1846.578806 | 1071252.864000 | compute_stage_max | 1815.955200 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_DV_ILLUMINA_WES_100X | 4x | PIM FlowCXL direct | 1232.096503 | 405290.722219 | compute_stage_max | 1210.636800 | 0.756652 | 0.000000 | 0.007152 | 0.756652 | 0.000000 | 3.769383 |
+| PROFILE_DV_ILLUMINA_WES_100X | 4x | PIM host bounce | 1232.263684 | 405710.921548 | compute_stage_max | 1210.636800 | 0.756652 | 6.131646 | 6.138798 | 6.138798 | 7.841454 | 0.000000 |
 
 ## Citations
 - `PCIE4_X16_BW_Bps`: https://ww1.microchip.com/downloads/en/DeviceDoc/00003818.pdf
@@ -112,21 +111,15 @@ With bounded streaming admission and split host H2D topology, FlowCXL direct tra
 - `CXL_REMOTE_BW_Bps`: https://huaicheng.github.io/p/asplos25-melody.pdf
   Quote: "remote entries show higher latency and reduced bandwidth (~13-14GB/s)"
   Used as: Representative remote bandwidth point for CXL direct transfers.
-- `ONT_FAST5_X0`: https://media.tghn.org/medialibrary/2020/09/Introduction_to_Nanopore_Data_analysis_-_Alp_Aydin.pdf
-  Quote: "fast5 = 2 terrabytes"
-  Used as: ONT boundary X0.
-- `ONT_FASTQ_GZ_X1`: https://media.tghn.org/medialibrary/2020/09/Introduction_to_Nanopore_Data_analysis_-_Alp_Aydin.pdf
-  Quote: "fastq gzipped = 112 gigabytes"
-  Used as: ONT boundary X1.
-- `TARGETCALL_KEEP_FRACTION`: https://www.frontiersin.org/journals/genetics/articles/10.3389/fgene.2024.1429306/full
-  Quote: "filters out 94.71% of the off-target reads"
-  Used as: Derived keep fraction for ONT boundary X2.
-- `GIAB_BAM_X`: https://digital.library.adelaide.edu.au/dspace/bitstream/2440/136736/1/Lan2022_PhD.pdf
-  Quote: ".bam ... 147 GB"
-  Used as: Boundary proxy for aligned BAM size.
-- `GIAB_VCF_X`: https://digital.library.adelaide.edu.au/dspace/bitstream/2440/136736/1/Lan2022_PhD.pdf
-  Quote: ".vcf.gz ... 128 MB"
-  Used as: Boundary proxy for final VCF size.
-- `ILLUMINA_X0`: https://oak.chosun.ac.kr/bitstream/2020.oak/18470/2/Constructing%20an%20ethnic-specific%20variant%20calling%20workflow%20based%20on%20a%20systematic%20comparison%20of%20multipl.pdf
-  Quote: "Since the NA12878 data was 28GB"
-  Used as: Illumina boundary X0.
+- `DEEPVARIANT_STAGE_NAMES`: https://github.com/google/deepvariant
+  Quote: "make_examples, call_variants, postprocess_variants"
+  Used as: Defines fixed 3-stage DeepVariant pipeline in simulator.
+- `DEEPVARIANT_EXAMPLE_SHAPE`: https://github.com/google/deepvariant/releases
+  Quote: "example shape [100, 147, 10]"
+  Used as: Tensor materialization size seed for stage-1 output bytes.
+- `DEEPVARIANT_TIMING_BREAKDOWN_CONTEXT`: https://developer.nvidia.com/blog/accelerating-deepvariant/
+  Quote: "make_examples and call_variants dominate runtime depending on hardware path."
+  Used as: Calibration context for stage runtime shares at 1x.
+- `PARABRICKS_DV_CONTEXT`: https://developer.nvidia.com/blog/accelerate-genomic-analysis-for-any-sequencer-with-parabricks-v4-2/
+  Quote: "accelerates DeepVariant and end-to-end variant calling runtime."
+  Used as: Context that hardware acceleration materially shifts call_variants throughput.

@@ -22,18 +22,31 @@ All cited numeric constants live in `sources.py` with URL, quote, and how-used m
   - URL: https://huaicheng.github.io/p/asplos25-melody.pdf
   - URL: https://huaicheng.github.io/s/asplos25-melody-slides.pdf
 
-## Dataset boundaries
+## DeepVariant pipeline anchors
 
-- ONT boundaries: `[2TB, 112GB, 112GB*0.0529, 147GB, 128MB]`
-  - Sources: Nanopore deck, TargetCall, GIAB/NA12878 size table
-- Illumina boundaries: `[28GB, 147GB, 128MB]`
-  - Sources: NA12878 workflow doc + GIAB/NA12878 size table
+- DeepVariant stage vocabulary:
+  - `make_examples`, `call_variants`, `postprocess_variants`
+  - URL: https://github.com/google/deepvariant
+- Example tensor shape anchor (`example_info`):
+  - representative shape: `[100, 147, 10]`
+  - URL: https://github.com/google/deepvariant/releases
+- Runtime breakdown context used for CPU calibration seeds:
+  - URL: https://developer.nvidia.com/blog/accelerating-deepvariant/
+- Hardware acceleration context for DeepVariant deployments:
+  - URL: https://developer.nvidia.com/blog/accelerate-genomic-analysis-for-any-sequencer-with-parabricks-v4-2/
 
 ## Configurable baseline defaults (not cited hardware claims)
 
 The following are model defaults in `configs/runs.yaml` and can be changed:
 
+- DeepVariant profile parameters:
+  - coverage/candidate density
+  - aligned bytes per covered base
+  - per-example call/postprocess output bytes
+  - CPU stage-share timing splits
 - Stage compute-unit counts/rates/power for CPU and PIM
+- PIM speedup factors by stage (`pim_speedup_vs_cpu_by_stage`)
+- Scenario stage-device maps (`scenario_stage_device_map`)
 - Transfer-channel counts (including split host H2D ingress vs stage channels)
 - Transfer power per channel (including split host H2D ingress vs stage power)
 - Host-touch throughput and fixed overhead used by true-bounce modeling

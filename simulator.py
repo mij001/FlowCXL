@@ -1,11 +1,11 @@
-"""Tiled stage-capacity simulator for CPU-only and PIM pipeline scenarios."""
+"""Tiled stage-capacity simulator for DeepVariant pipeline scenarios."""
 
 from __future__ import annotations
 
 import heapq
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Mapping, Sequence, Tuple
 
 import sources
 
@@ -118,82 +118,88 @@ def host_touch_duration_s(bytes_moved: int, touch_Bps: float, touch_fixed_s: flo
     return touch_fixed_s + (bytes_moved / touch_Bps)
 
 
-def _build_tile_operations(num_stages: int, scenario: str) -> List[TileOperation]:
-    operations: List[TileOperation] = []
-
-    if scenario == sources.SCENARIO_CPU_ONLY:
-        for stage_id in range(1, num_stages + 1):
-            operations.append(
-                TileOperation(op_type="COMPUTE", stage_id=stage_id, boundary_index=stage_id - 1)
-            )
-        return operations
-
-    operations.append(
-        TileOperation(op_type="TRANSFER", stage_id=1, boundary_index=0, transfer_path="host_h2d_ingress")
-    )
-
-    for stage_id in range(1, num_stages + 1):
-        operations.append(TileOperation(op_type="COMPUTE", stage_id=stage_id, boundary_index=stage_id - 1))
-        if stage_id < num_stages:
-            if scenario == sources.SCENARIO_PIM_HOST_BOUNCE:
-                operations.append(
-                    TileOperation(
-                        op_type="TRANSFER",
-                        stage_id=stage_id,
-                        boundary_index=stage_id,
-                        transfer_path="host_d2h",
-                    )
-                )
-                operations.append(
-                    TileOperation(
-                        op_type="HOST_TOUCH",
-                        stage_id=stage_id,
-                        boundary_index=stage_id,
-                        transfer_path="host_touch",
-                    )
-                )
-                operations.append(
-                    TileOperation(
-                        op_type="TRANSFER",
-                        stage_id=stage_id + 1,
-                        boundary_index=stage_id,
-                        transfer_path="host_h2d_stage",
-                    )
-                )
-            elif scenario == sources.SCENARIO_PIM_FLOWCXL_DIRECT:
-                operations.append(
-                    TileOperation(
-                        op_type="TRANSFER",
-                        stage_id=stage_id,
-                        boundary_index=stage_id,
-                        transfer_path="cxl_direct",
-                    )
-                )
-            else:
-                raise ValueError(f"unknown scenario: {scenario}")
-        else:
-            operations.append(
-                TileOperation(
-                    op_type="TRANSFER",
-                    stage_id=stage_id,
-                    boundary_index=num_stages,
-                    transfer_path="host_d2h",
-                )
-            )
-    return operations
-
-
 def _stage_overrides_for_dataset(
     stage_overrides: Dict[str, Dict[object, Dict[str, object]]], dataset_profile: str
 ) -> Dict[object, Dict[str, object]]:
     return stage_overrides.get(dataset_profile, {})
 
 
+def _stage_device_map_for_scenario(
+    scenario_stage_device_map: Mapping[str, Sequence[str]],
+    scenario: str,
+    num_stages: int,
+) -> List[str]:
+    if scenario not in scenario_stage_device_map:
+        raise KeyError(f"scenario_stage_device_map missing scenario: {scenario}")
+    stage_devices = [str(device).strip().lower() for device in scenario_stage_device_map[scenario]]
+    if len(stage_devices) != num_stages:
+        raise ValueError(
+            f"scenario {scenario} has {len(stage_devices)} stage devices, expected {num_stages}"
+        )
+    allowed = {sources.DEVICE_CPU, sources.DEVICE_PIM}
+    invalid = [device for device in stage_devices if device not in allowed]
+    if invalid:
+        raise ValueError(f"invalid stage devices for scenario {scenario}: {invalid}")
+    return stage_devices
+
+
+def _derive_compute_rates_for_stages(
+    dataset_profile: str,
+    boundaries_bytes: Sequence[int],
+    stage_names: Sequence[str],
+    stage_defaults: Mapping[str, object],
+    dataset_stage_overrides: Mapping[object, Mapping[str, object]],
+    pim_speedup_vs_cpu_by_stage: Mapping[str, object],
+) -> List[Tuple[float, float]]:
+    profile = sources.DATASET_PROFILES[dataset_profile]
+    params = profile.get("parameters")
+    if not isinstance(params, Mapping):
+        cpu_default = float(stage_defaults["cpu_unit_compute_Bps"])
+        pim_default = float(stage_defaults["pim_unit_compute_Bps"])
+        return [(cpu_default, pim_default) for _ in stage_names]
+
+    runtime_total_s = float(params["cpu_reference_total_runtime_s_1x"])
+    stage_shares = params["cpu_stage_time_share_1x"]
+    if runtime_total_s <= 0:
+        raise ValueError("cpu_reference_total_runtime_s_1x must be > 0")
+
+    rates: List[Tuple[float, float]] = []
+    for stage_id, stage_name in enumerate(stage_names, start=1):
+        if stage_name not in stage_shares:
+            raise KeyError(f"cpu_stage_time_share_1x missing stage {stage_name}")
+        if stage_name not in pim_speedup_vs_cpu_by_stage:
+            raise KeyError(f"pim_speedup_vs_cpu_by_stage missing stage {stage_name}")
+
+        stage_share = float(stage_shares[stage_name])
+        stage_runtime_s = runtime_total_s * stage_share
+        if stage_runtime_s <= 0:
+            raise ValueError(f"stage runtime must be > 0 for {stage_name}")
+
+        stage_override = dataset_stage_overrides.get(stage_id, dataset_stage_overrides.get(str(stage_id), {}))
+        cpu_units = int(stage_override.get("cpu_units", stage_defaults["cpu_units"]))
+        if cpu_units <= 0:
+            raise ValueError(f"cpu_units must be > 0 for stage {stage_name}")
+
+        stage_input_bytes = float(boundaries_bytes[stage_id - 1])
+        if stage_input_bytes <= 0:
+            cpu_rate = float(stage_defaults["cpu_unit_compute_Bps"])
+        else:
+            cpu_rate = stage_input_bytes / (float(cpu_units) * stage_runtime_s)
+        pim_speedup = float(pim_speedup_vs_cpu_by_stage[stage_name])
+        if pim_speedup <= 0:
+            raise ValueError(f"pim_speedup_vs_cpu_by_stage[{stage_name}] must be > 0")
+        pim_rate = cpu_rate * pim_speedup
+        rates.append((cpu_rate, pim_rate))
+    return rates
+
+
 def _build_stage_configs(
     dataset_profile: str,
-    num_stages: int,
+    boundaries_bytes: Sequence[int],
+    stage_names: Sequence[str],
     stage_defaults: Dict[str, object],
     stage_overrides: Dict[str, Dict[object, Dict[str, object]]],
+    pim_speedup_vs_cpu_by_stage: Mapping[str, object],
 ) -> List[StageConfig]:
     required_keys = [
         "cpu_units",
@@ -209,14 +215,34 @@ def _build_stage_configs(
     if missing:
         raise KeyError(f"missing stage defaults: {missing}")
 
+    num_stages = len(stage_names)
+    if len(boundaries_bytes) != num_stages + 1:
+        raise ValueError("boundaries size must be num_stages + 1")
+
     dataset_overrides = _stage_overrides_for_dataset(stage_overrides=stage_overrides, dataset_profile=dataset_profile)
+    derived_rates = _derive_compute_rates_for_stages(
+        dataset_profile=dataset_profile,
+        boundaries_bytes=boundaries_bytes,
+        stage_names=stage_names,
+        stage_defaults=stage_defaults,
+        dataset_stage_overrides=dataset_overrides,
+        pim_speedup_vs_cpu_by_stage=pim_speedup_vs_cpu_by_stage,
+    )
 
     stage_configs: List[StageConfig] = []
     for stage_id in range(1, num_stages + 1):
+        stage_name = stage_names[stage_id - 1]
         merged = dict(stage_defaults)
         stage_override = dataset_overrides.get(stage_id, dataset_overrides.get(str(stage_id), {}))
         if stage_override:
             merged.update(stage_override)
+
+        derived_cpu_rate, derived_pim_rate = derived_rates[stage_id - 1]
+        if "cpu_unit_compute_Bps" not in stage_override:
+            merged["cpu_unit_compute_Bps"] = derived_cpu_rate
+        if "pim_unit_compute_Bps" not in stage_override:
+            merged["pim_unit_compute_Bps"] = derived_pim_rate
+
         stage_configs.append(
             StageConfig(
                 cpu_units=int(merged["cpu_units"]),
@@ -229,7 +255,109 @@ def _build_stage_configs(
                 host_touch_fixed_s=float(merged["host_touch_fixed_s"]),
             )
         )
+        if stage_configs[-1].cpu_units <= 0:
+            raise ValueError(f"cpu_units must be > 0 at stage {stage_id} ({stage_name})")
+        if stage_configs[-1].pim_units <= 0:
+            raise ValueError(f"pim_units must be > 0 at stage {stage_id} ({stage_name})")
     return stage_configs
+
+
+def _build_tile_operations(
+    scenario: str,
+    stage_devices: Sequence[str],
+) -> List[TileOperation]:
+    num_stages = len(stage_devices)
+    operations: List[TileOperation] = []
+
+    if stage_devices[0] == sources.DEVICE_PIM:
+        operations.append(
+            TileOperation(op_type="TRANSFER", stage_id=1, boundary_index=0, transfer_path="host_h2d_ingress")
+        )
+
+    for stage_id in range(1, num_stages + 1):
+        operations.append(TileOperation(op_type="COMPUTE", stage_id=stage_id, boundary_index=stage_id - 1))
+        if stage_id >= num_stages:
+            continue
+
+        src = stage_devices[stage_id - 1]
+        dst = stage_devices[stage_id]
+        boundary_index = stage_id
+
+        if src == sources.DEVICE_CPU and dst == sources.DEVICE_CPU:
+            continue
+        if src == sources.DEVICE_CPU and dst == sources.DEVICE_PIM:
+            operations.append(
+                TileOperation(
+                    op_type="TRANSFER",
+                    stage_id=stage_id + 1,
+                    boundary_index=boundary_index,
+                    transfer_path="host_h2d_stage",
+                )
+            )
+            continue
+        if src == sources.DEVICE_PIM and dst == sources.DEVICE_CPU:
+            operations.append(
+                TileOperation(
+                    op_type="TRANSFER",
+                    stage_id=stage_id,
+                    boundary_index=boundary_index,
+                    transfer_path="host_d2h",
+                )
+            )
+            continue
+        if src == sources.DEVICE_PIM and dst == sources.DEVICE_PIM:
+            if scenario == sources.SCENARIO_PIM_HOST_BOUNCE:
+                operations.append(
+                    TileOperation(
+                        op_type="TRANSFER",
+                        stage_id=stage_id,
+                        boundary_index=boundary_index,
+                        transfer_path="host_d2h",
+                    )
+                )
+                operations.append(
+                    TileOperation(
+                        op_type="HOST_TOUCH",
+                        stage_id=stage_id,
+                        boundary_index=boundary_index,
+                        transfer_path="host_touch",
+                    )
+                )
+                operations.append(
+                    TileOperation(
+                        op_type="TRANSFER",
+                        stage_id=stage_id + 1,
+                        boundary_index=boundary_index,
+                        transfer_path="host_h2d_stage",
+                    )
+                )
+            elif scenario == sources.SCENARIO_PIM_FLOWCXL_DIRECT:
+                operations.append(
+                    TileOperation(
+                        op_type="TRANSFER",
+                        stage_id=stage_id,
+                        boundary_index=boundary_index,
+                        transfer_path="cxl_direct",
+                    )
+                )
+            else:
+                raise ValueError(
+                    f"scenario {scenario} cannot route PIM->PIM transition at stage {stage_id}->{stage_id + 1}"
+                )
+            continue
+        raise ValueError(f"unknown stage-device transition: {src}->{dst}")
+
+    if stage_devices[-1] == sources.DEVICE_PIM:
+        operations.append(
+            TileOperation(
+                op_type="TRANSFER",
+                stage_id=num_stages,
+                boundary_index=num_stages,
+                transfer_path="host_d2h",
+            )
+        )
+
+    return operations
 
 
 def _validate_config(config: Dict[str, object]) -> None:
@@ -243,6 +371,8 @@ def _validate_config(config: Dict[str, object]) -> None:
         "resource_capacity",
         "stage_defaults",
         "transfer_power_W",
+        "scenario_stage_device_map",
+        "pim_speedup_vs_cpu_by_stage",
     ]
     missing = [key for key in required_top_level if key not in config]
     if missing:
@@ -279,17 +409,52 @@ def _validate_config(config: Dict[str, object]) -> None:
             raise ValueError(f"{key} must be >= 0")
 
     stage_defaults = config["stage_defaults"]
-    for key in ["host_touch_Bps", "host_touch_fixed_s"]:
+    for key in [
+        "cpu_units",
+        "cpu_unit_compute_Bps",
+        "cpu_unit_power_W",
+        "pim_units",
+        "pim_unit_compute_Bps",
+        "pim_unit_power_W",
+        "host_touch_Bps",
+        "host_touch_fixed_s",
+    ]:
         if key not in stage_defaults:
             raise KeyError(f"stage_defaults missing key: {key}")
+    if int(stage_defaults["cpu_units"]) <= 0:
+        raise ValueError("cpu_units must be > 0")
+    if int(stage_defaults["pim_units"]) <= 0:
+        raise ValueError("pim_units must be > 0")
     if float(stage_defaults["host_touch_Bps"]) <= 0:
         raise ValueError("host_touch_Bps must be > 0")
     if float(stage_defaults["host_touch_fixed_s"]) < 0:
         raise ValueError("host_touch_fixed_s must be >= 0")
 
+    scenario_stage_device_map = config["scenario_stage_device_map"]
+    if not isinstance(scenario_stage_device_map, Mapping):
+        raise ValueError("scenario_stage_device_map must be a map")
     for scenario in config["scenarios"]:
         if scenario not in sources.SCENARIOS:
             raise ValueError(f"unknown scenario in config: {scenario}")
+        if scenario not in scenario_stage_device_map:
+            raise KeyError(f"scenario_stage_device_map missing scenario {scenario}")
+        devices = scenario_stage_device_map[scenario]
+        if len(devices) != len(sources.DEEPVARIANT_STAGE_NAMES):
+            raise ValueError(
+                f"scenario_stage_device_map[{scenario}] must have {len(sources.DEEPVARIANT_STAGE_NAMES)} entries"
+            )
+        for device in devices:
+            if str(device).lower() not in {sources.DEVICE_CPU, sources.DEVICE_PIM}:
+                raise ValueError(f"invalid device {device} in scenario_stage_device_map[{scenario}]")
+
+    pim_speedup_vs_cpu_by_stage = config["pim_speedup_vs_cpu_by_stage"]
+    if not isinstance(pim_speedup_vs_cpu_by_stage, Mapping):
+        raise ValueError("pim_speedup_vs_cpu_by_stage must be a map")
+    for stage_name in sources.DEEPVARIANT_STAGE_NAMES:
+        if stage_name not in pim_speedup_vs_cpu_by_stage:
+            raise KeyError(f"pim_speedup_vs_cpu_by_stage missing {stage_name}")
+        if float(pim_speedup_vs_cpu_by_stage[stage_name]) <= 0:
+            raise ValueError(f"pim_speedup_vs_cpu_by_stage[{stage_name}] must be > 0")
 
     for dataset_profile in config["dataset_profiles"]:
         if dataset_profile not in sources.DATASET_PROFILES:
@@ -325,6 +490,7 @@ def simulate_configuration(
     run_id: str,
     dataset_profile: str,
     boundaries_bytes: Sequence[int],
+    stage_names: Sequence[str],
     size_multiplier: float,
     scenario: str,
     tile_size_bytes: int,
@@ -335,6 +501,8 @@ def simulate_configuration(
     stage_defaults: Dict[str, object],
     transfer_power_W: Dict[str, object],
     stage_overrides: Dict[str, Dict[object, Dict[str, object]]],
+    scenario_stage_device_map: Mapping[str, Sequence[str]],
+    pim_speedup_vs_cpu_by_stage: Mapping[str, object],
     trace_max_tiles: int | None = None,
 ) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
     if scenario not in sources.SCENARIOS:
@@ -344,8 +512,18 @@ def simulate_configuration(
     if cxl_direct_link not in sources.LINKS:
         raise ValueError(f"unknown cxl direct link: {cxl_direct_link}")
 
+    num_stages = len(boundaries_bytes) - 1
+    if len(stage_names) != num_stages:
+        raise ValueError(
+            f"stage_names length {len(stage_names)} does not match boundaries-derived stages {num_stages}"
+        )
+    stage_devices = _stage_device_map_for_scenario(
+        scenario_stage_device_map=scenario_stage_device_map,
+        scenario=scenario,
+        num_stages=num_stages,
+    )
+
     scaled_boundaries = scale_boundaries_exact(boundaries_bytes=boundaries_bytes, multiplier=size_multiplier)
-    num_stages = len(scaled_boundaries) - 1
     if num_stages <= 0:
         raise ValueError("dataset profile must contain at least two boundaries")
     num_tiles = compute_num_tiles(boundaries_bytes=scaled_boundaries, tile_size_bytes=tile_size_bytes)
@@ -353,9 +531,11 @@ def simulate_configuration(
 
     stage_configs = _build_stage_configs(
         dataset_profile=dataset_profile,
-        num_stages=num_stages,
+        boundaries_bytes=boundaries_bytes,
+        stage_names=stage_names,
         stage_defaults=stage_defaults,
         stage_overrides=stage_overrides,
+        pim_speedup_vs_cpu_by_stage=pim_speedup_vs_cpu_by_stage,
     )
 
     host_h2d_ingress_pool = ResourcePool(
@@ -387,7 +567,8 @@ def simulate_configuration(
     compute_pools: List[ResourcePool] = []
     for stage_id in range(1, num_stages + 1):
         stage_cfg = stage_configs[stage_id - 1]
-        if scenario == sources.SCENARIO_CPU_ONLY:
+        stage_device = stage_devices[stage_id - 1]
+        if stage_device == sources.DEVICE_CPU:
             compute_pools.append(
                 ResourcePool(
                     name=f"cpu_stage_{stage_id}",
@@ -404,7 +585,7 @@ def simulate_configuration(
                 )
             )
 
-    operations = _build_tile_operations(num_stages=num_stages, scenario=scenario)
+    operations = _build_tile_operations(scenario=scenario, stage_devices=stage_devices)
 
     traces: List[Dict[str, object]] = []
     completion_times = [0.0 for _ in range(num_tiles)]
@@ -430,10 +611,11 @@ def simulate_configuration(
 
         operation = operations[op_index]
         stage_cfg = stage_configs[operation.stage_id - 1]
+        stage_device = stage_devices[operation.stage_id - 1]
         bytes_moved = int(tiled_boundaries[operation.boundary_index][tile_id])
 
         if operation.op_type == "COMPUTE":
-            if scenario == sources.SCENARIO_CPU_ONLY:
+            if stage_device == sources.DEVICE_CPU:
                 compute_rate = stage_cfg.cpu_unit_compute_Bps
             else:
                 compute_rate = stage_cfg.pim_unit_compute_Bps
@@ -487,6 +669,8 @@ def simulate_configuration(
                     "tile_id": tile_id,
                     "op_index": op_index + 1,
                     "stage_id": operation.stage_id,
+                    "stage_name": stage_names[operation.stage_id - 1],
+                    "stage_device": stage_device,
                     "op_type": operation.op_type,
                     "transfer_path": transfer_path,
                     "resource": pool.name,
@@ -565,6 +749,7 @@ def simulate_configuration(
         "lb_host_touch_s": lb_host_touch_s,
         "lb_cxl_direct_s": lb_cxl_direct_s,
         "dominant_lb_component": dominant_lb_component,
+        "pipeline_template": sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE,
     }
     return metrics_row, traces
 
@@ -585,6 +770,8 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
     resource_capacity = config["resource_capacity"]
     stage_defaults = config["stage_defaults"]
     transfer_power_W = config["transfer_power_W"]
+    scenario_stage_device_map = config["scenario_stage_device_map"]
+    pim_speedup_vs_cpu_by_stage = config["pim_speedup_vs_cpu_by_stage"]
     stage_overrides = config.get("stage_overrides", {})
     trace_max_tiles_raw = config.get("trace_max_tiles", 512)
     trace_max_tiles: int | None
@@ -597,7 +784,13 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
 
     run_counter = 1
     for dataset_profile in dataset_profiles:
-        boundaries = sources.DATASET_PROFILES[dataset_profile]["boundaries_bytes"]
+        profile = sources.DATASET_PROFILES[dataset_profile]
+        boundaries = profile["boundaries_bytes"]
+        stage_names = profile.get("stage_names", list(sources.DEEPVARIANT_STAGE_NAMES))
+        if len(stage_names) != len(boundaries) - 1:
+            raise ValueError(
+                f"dataset {dataset_profile} has {len(stage_names)} stage names for {len(boundaries)-1} stages"
+            )
         for size_multiplier in size_multipliers:
             for scenario in scenarios:
                 multiplier_token = str(size_multiplier).replace(".", "p")
@@ -612,6 +805,7 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                     run_id=run_id,
                     dataset_profile=dataset_profile,
                     boundaries_bytes=boundaries,
+                    stage_names=stage_names,
                     size_multiplier=float(size_multiplier),
                     scenario=scenario,
                     tile_size_bytes=tile_size_bytes,
@@ -622,6 +816,8 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                     stage_defaults=stage_defaults,
                     transfer_power_W=transfer_power_W,
                     stage_overrides=stage_overrides,
+                    scenario_stage_device_map=scenario_stage_device_map,
+                    pim_speedup_vs_cpu_by_stage=pim_speedup_vs_cpu_by_stage,
                     trace_max_tiles=trace_max_tiles,
                 )
                 metrics.append(row)

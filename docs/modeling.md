@@ -3,6 +3,10 @@
 ## Scope
 
 - Model includes stage-limited compute, transfer costs, contention, and energy.
+- Pipeline template is fixed to DeepVariant inference stages:
+  - `make_examples`
+  - `call_variants`
+  - `postprocess_variants`
 - Large stage boundaries are tiled and processed chunk-by-chunk.
 - Pipeline overlap is enabled across tiles and stages.
 - Tile admission is bounded by `max_inflight_tiles` to avoid all-at-once ingress flooding.
@@ -14,16 +18,43 @@ Each stage has a fixed number of compute units with a fixed per-unit throughput 
 - CPU baseline uses `cpu_units`, `cpu_unit_compute_Bps`, `cpu_unit_power_W`.
 - PIM scenarios use `pim_units`, `pim_unit_compute_Bps`, `pim_unit_power_W`.
 
-Optional `stage_overrides` let any stage deviate from defaults.
+CPU/PIM per-stage rates are calibrated from profile timing shares at `1x`, then scaled by input bytes.
+Optional `stage_overrides` let any stage deviate from calibrated defaults.
+
+## DeepVariant Boundary Derivation
+
+Profile boundaries are not hand-entered sizes. They are derived from:
+
+- covered bases and coverage (`aligned` input bytes)
+- candidate density (`num_examples`)
+- tensor shape (`example_info`) and element width (`make_examples` output bytes)
+- per-example call/postprocess output widths
+
+Boundaries are emitted as:
+
+- `X0`: aligned input bytes
+- `X1`: example tensor bytes
+- `X2`: call output bytes
+- `X3`: postprocess output bytes
 
 ## Transfer Paths
 
-- `cpu_only`: no inter-stage transfer modeling.
-- `pim_host_bounce`: data between PIM stages goes through host memory (`D2H -> HOST_TOUCH -> H2D`).
-- `pim_flowcxl_direct`: data between PIM stages uses direct CXL device-to-device transfer.
+Stage-device mapping is explicit per scenario:
 
-Both PIM scenarios include host ingress (to stage 1) and host egress (from final stage).
-Host-touch is applied only for inter-stage bounce operations, not ingress/egress.
+- `cpu_only`: `cpu/cpu/cpu`
+- `pim_host_bounce`: `pim/pim/cpu`
+- `pim_flowcxl_direct`: `pim/pim/cpu`
+
+Transfer ops are generated from adjacent stage-device transitions:
+
+- `cpu->cpu`: no transfer
+- `cpu->pim`: host `H2D(stage)`
+- `pim->cpu`: host `D2H`
+- `pim->pim`:
+  - bounce: `D2H -> HOST_TOUCH -> H2D(stage)`
+  - direct: `CXL direct`
+
+Under the default map, only the `make_examples -> call_variants` (`pim->pim`) transition differs between bounce and direct. This isolates FlowCXL benefit to inter-PIM movement.
 
 ## Links and Channels
 
@@ -59,3 +90,4 @@ Per run:
 - Compute and transfer energy split (including `host_touch_energy_J`)
 - Host-link bytes, direct-CXL bytes, host-touch bytes, and total bytes moved
 - Lower-bound bottleneck attribution (`lb_*` fields + `dominant_lb_component`)
+- `pipeline_template` metadata (`deepvariant_3stage`)

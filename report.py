@@ -116,47 +116,55 @@ def _dataset_diagnostic_table(metrics_df: pd.DataFrame, dataset_profile: str) ->
     return _format_metric_fields(subset)
 
 
-def _ont_gain_narrative(metrics_df: pd.DataFrame) -> str:
-    ont = metrics_df[metrics_df["dataset_profile"] == sources.PROFILE_ONT_100Gbases].copy()
-    if ont.empty:
-        return "No ONT rows found."
-
+def _deepvariant_directional_narrative(metrics_df: pd.DataFrame) -> str:
     lines: List[str] = []
-    ratio_1x = None
-    for multiplier in sorted(ont["stage_size_multiplier"].unique()):
-        bounce = ont[
-            (ont["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE)
-            & (ont["stage_size_multiplier"] == multiplier)
-        ]
-        direct = ont[
-            (ont["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT)
-            & (ont["stage_size_multiplier"] == multiplier)
-        ]
-        if bounce.empty or direct.empty:
+    for dataset_profile in sorted(metrics_df["dataset_profile"].dropna().unique()):
+        subset = metrics_df[metrics_df["dataset_profile"] == dataset_profile]
+        ratios: List[tuple[float, float]] = []
+        for multiplier in sorted(subset["stage_size_multiplier"].unique()):
+            bounce = subset[
+                (subset["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE)
+                & (subset["stage_size_multiplier"] == multiplier)
+            ]
+            direct = subset[
+                (subset["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT)
+                & (subset["stage_size_multiplier"] == multiplier)
+            ]
+            if bounce.empty or direct.empty:
+                continue
+            ratio = float(bounce.iloc[0]["makespan_s"]) / float(direct.iloc[0]["makespan_s"])
+            ratios.append((float(multiplier), ratio))
+
+        if not ratios:
+            lines.append(f"- {dataset_profile}: insufficient bounce/direct rows.")
             continue
-        b = bounce.iloc[0]
-        d = direct.iloc[0]
-        ratio = float(b["makespan_s"]) / float(d["makespan_s"])
-        if abs(float(multiplier) - 1.0) < 1e-12:
-            ratio_1x = ratio
-        gain_pct = (ratio - 1.0) * 100.0
+
+        directional_ok = all(ratio >= 1.0 - 1e-12 for _, ratio in ratios)
+        strict_points = sum(1 for _, ratio in ratios if ratio > 1.0 + 1e-9)
+        min_ratio = min(ratio for _, ratio in ratios)
+        max_ratio = max(ratio for _, ratio in ratios)
+        sensitivity_delta = max_ratio - min_ratio
+        ratio_1x = next((ratio for mult, ratio in ratios if abs(mult - 1.0) < 1e-12), None)
+
+        if ratio_1x is None:
+            ratio_1x_text = "n/a"
+        else:
+            ratio_1x_text = f"{ratio_1x:.6f}"
+
         lines.append(
-            f"- {_format_multiplier(multiplier)}: bounce/direct ratio `{ratio:.6f}` "
-            f"({gain_pct:.3f}% gain), bounce dominant `{b['dominant_lb_component']}`, "
-            f"direct dominant `{d['dominant_lb_component']}`."
+            f"- {dataset_profile}: directional `{str(directional_ok).lower()}`, "
+            f"strictly-better points `{strict_points}`, "
+            f"1x bounce/direct ratio `{ratio_1x_text}`, "
+            f"sensitivity delta (max-min ratio) `{sensitivity_delta:.6f}`."
         )
 
-    if ratio_1x is None:
-        lines.append("- ONT 1x ratio unavailable.")
-    else:
-        gain_1x = (ratio_1x - 1.0) * 100.0
-        status = "PASS" if ratio_1x >= 1.05 else "FAIL"
-        lines.append(
-            f"- ONT 1x target (`>=5%`): ratio `{ratio_1x:.6f}` ({gain_1x:.3f}% gain) -> `{status}`."
-        )
+    lines.append(
+        "- Directional condition checks `direct <= bounce`; sensitivity delta reports how ratio changes "
+        "across stage-size multipliers."
+    )
     lines.append(
         "- Streaming admission (`max_inflight_tiles`) and split H2D pools separate ingress pressure "
-        "from inter-stage staging, making overlap/transfer effects easier to attribute."
+        "from inter-stage staging, while only PIM->PIM transitions differ between bounce and direct."
     )
     return "\n".join(lines)
 
@@ -211,24 +219,25 @@ def main() -> None:
         diagnostic_tables.append(f"### {dataset_profile}\n\n{_build_markdown_table(diag_df)}")
 
     report_text = (
-        "# FlowCXL Tiled Stage-Capacity Report\n\n"
+        "# DeepVariant Tiled Stage-Capacity Report\n\n"
         "## Single Claim\n"
         "With bounded streaming admission and split host H2D topology, FlowCXL direct transfer isolates "
-        "inter-stage staging costs from ingress contention and exposes overlap-dependent gains.\n\n"
+        "DeepVariant inter-stage staging costs from ingress contention and exposes overlap-dependent gains.\n\n"
         "## Modeled\n"
-        "- Stage-limited compute capacity (CPU or PIM units)\n"
+        "- Fixed DeepVariant three-stage pipeline: make_examples, call_variants, postprocess_variants\n"
+        "- Stage-limited compute capacity with scenario stage-device mapping (CPU or PIM)\n"
         "- Tile-by-tile pipelined execution with bounded in-flight admission\n"
         "- True host bounce for intermediates: D2H -> HOST_TOUCH -> H2D(stage)\n"
         "- Split host H2D resources: ingress vs inter-stage staging\n"
         "- Absolute makespan (seconds) and total energy (joules)\n"
         "- Lower-bound bottleneck diagnostics by resource family\n\n"
-        "## ONT Gain Check\n"
-        f"{_ont_gain_narrative(metrics_df)}\n\n"
+        "## Directional Check\n"
+        f"{_deepvariant_directional_narrative(metrics_df)}\n\n"
         "## Plot Artifacts\n"
-        "- plot_makespan_grouped_PROFILE_ONT_100Gbases.png\n"
-        "- plot_makespan_grouped_PROFILE_ILLUMINA_NA12878.png\n"
-        "- plot_energy_grouped_PROFILE_ONT_100Gbases.png\n"
-        "- plot_energy_grouped_PROFILE_ILLUMINA_NA12878.png\n\n"
+        "- plot_makespan_grouped_PROFILE_DV_ILLUMINA_WGS_30X.png\n"
+        "- plot_makespan_grouped_PROFILE_DV_ILLUMINA_WES_100X.png\n"
+        "- plot_energy_grouped_PROFILE_DV_ILLUMINA_WGS_30X.png\n"
+        "- plot_energy_grouped_PROFILE_DV_ILLUMINA_WES_100X.png\n\n"
         "## Results Table\n"
         f"{_build_markdown_table(summary_df)}\n\n"
         "## Bottleneck Diagnostics\n"

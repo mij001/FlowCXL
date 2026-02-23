@@ -1,6 +1,47 @@
 # Equations
 
-This model includes stage compute, inter-stage transfers, tile-level resource contention, makespan, and energy.
+This model includes DeepVariant stage-size derivation, stage compute calibration, transition-aware transfers, tile-level resource contention, makespan, and energy.
+
+## DeepVariant boundary derivation
+
+Pipeline stages are fixed:
+
+\[
+S = [make\_examples, call\_variants, postprocess\_variants]
+\]
+
+Given profile parameters:
+
+- covered bases \(B_{cov}\)
+- coverage \(C\)
+- candidate density at reference coverage \(d_{ref}\)
+- reference coverage \(C_{ref}\)
+- aligned bytes per covered base \(b_{aln}\)
+- example shape \([h,w,c]\)
+- element bytes \(b_{elem}\)
+- call output bytes per example \(b_{call}\)
+- postprocess output bytes per example \(b_{post}\)
+
+Number of examples:
+
+\[
+N_{ex} = round\left(B_{cov} \cdot d_{ref} \cdot \frac{C}{C_{ref}}\right)
+\]
+
+Boundary bytes at \(1x\):
+
+\[
+X_0 = round(B_{cov} \cdot C \cdot b_{aln})
+\]
+\[
+X_1 = N_{ex} \cdot h \cdot w \cdot c \cdot b_{elem}
+\]
+\[
+X_2 = N_{ex} \cdot b_{call}
+\]
+\[
+X_3 = N_{ex} \cdot b_{post}
+\]
 
 ## Stage-size scaling
 
@@ -52,7 +93,27 @@ For stage \(s\), tile \(k\), compute rate \(R_s\) (bytes/s):
 T_{compute}(s,k) = \frac{X_{s-1,k}}{R_s}
 \]
 
-CPU scenario uses CPU stage rates. PIM scenarios use PIM stage rates.
+### CPU calibration from runtime shares
+
+Given CPU reference runtime \(T_{cpu,ref}\) and stage share \(q_s\):
+
+\[
+T_{cpu,stage}(s) = T_{cpu,ref} \cdot q_s
+\]
+
+With \(U_{cpu}\) CPU units per stage and stage input bytes \(X_{s-1}\), per-unit CPU rate:
+
+\[
+R_{cpu}(s) = \frac{X_{s-1}}{U_{cpu} \cdot T_{cpu,stage}(s)}
+\]
+
+Given configured PIM speedup \(a_s\) for stage \(s\):
+
+\[
+R_{pim}(s) = R_{cpu}(s) \cdot a_s
+\]
+
+`stage_overrides` can explicitly replace any per-stage unit/rate/power value and takes precedence.
 
 ## Transfer duration
 
@@ -93,15 +154,18 @@ t_{free,slot} \leftarrow t_{end}
 
 ## Scenario transfer paths
 
-- `cpu_only`: compute only, no transfers.
-- `pim_host_bounce`:
-  - ingress: host \(H2D\_ingress\) to stage 1
-  - between stages: \(D2H\) then \(HOST\_TOUCH\) then \(H2D\)
-  - egress: host \(D2H\) from final stage
-- `pim_flowcxl_direct`:
-  - ingress: host \(H2D\_ingress\) to stage 1
-  - between stages: direct CXL transfer
-  - egress: host \(D2H\) from final stage
+Transitions are selected from scenario stage-device maps.
+
+For adjacent stages \(s \to s+1\):
+
+- `cpu -> cpu`: no transfer op
+- `cpu -> pim`: \(H2D\_stage\)
+- `pim -> cpu`: \(D2H\)
+- `pim -> pim` in `pim_host_bounce`: \(D2H \to HOST\_TOUCH \to H2D\_stage\)
+- `pim -> pim` in `pim_flowcxl_direct`: \(CXL\_direct\)
+
+Ingress \(H2D\_ingress\) appears only when stage 1 device is `pim`.
+Final egress \(D2H\) appears only when last stage device is `pim`.
 
 ## Completion time
 

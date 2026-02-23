@@ -37,6 +37,7 @@ BASE_METRICS_COLUMNS = [
     "lb_host_touch_s",
     "lb_cxl_direct_s",
     "dominant_lb_component",
+    "pipeline_template",
 ]
 TRACE_YAML_MAX_EVENTS = 2000
 
