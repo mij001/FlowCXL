@@ -42,6 +42,9 @@ BASE_METRICS_COLUMNS = [
     "total_cpu_mem_time_component_s",
     "total_pim_mem_time_component_s",
     "total_compute_time_component_s",
+    "total_cpu_materialize_bytes",
+    "total_cpu_materialize_time_component_s",
+    "cpu_materialize_energy_J",
 ]
 TRACE_YAML_MAX_EVENTS = 2000
 

@@ -34,6 +34,8 @@ PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE = "PROFILE_TPCH_SF100_MODERATE_INTERMED
 PROFILE_TPCH_SF100_HIGH_INTERMEDIATE = "PROFILE_TPCH_SF100_HIGH_INTERMEDIATE"
 
 LINK_PCIE_GEN4_X16 = "PCIe Gen4 x16"
+LINK_UPMEM_HOST_H2D_MEASURED = "UPMEM_HOST_H2D_MEASURED"
+LINK_UPMEM_HOST_D2H_MEASURED = "UPMEM_HOST_D2H_MEASURED"
 LINK_CXL_LOCAL = "CXL_LOCAL"
 LINK_CXL_REMOTE = "CXL_REMOTE"
 
@@ -48,6 +50,9 @@ CXL_LOCAL_BW_Bps = 52e9
 
 CXL_REMOTE_LAT_s = 621e-9
 CXL_REMOTE_BW_Bps = 13e9
+
+UPMEM_HOST_H2D_MEASURED_BW_Bps = 6.68e9
+UPMEM_HOST_D2H_MEASURED_BW_Bps = 4.74e9
 
 _REQUIRED_DEEPVARIANT_PROFILE_KEYS = (
     "covered_bases",
@@ -262,6 +267,16 @@ LINKS = {
         "latency_s": PCIE_FIXED_OVERHEAD_s,
         "how_used": "Used by host-link transfer equation.",
     },
+    LINK_UPMEM_HOST_H2D_MEASURED: {
+        "bandwidth_Bps": UPMEM_HOST_H2D_MEASURED_BW_Bps,
+        "latency_s": PCIE_FIXED_OVERHEAD_s,
+        "how_used": "Used by host H2D transfer equation with measured host-to-PIM order of magnitude.",
+    },
+    LINK_UPMEM_HOST_D2H_MEASURED: {
+        "bandwidth_Bps": UPMEM_HOST_D2H_MEASURED_BW_Bps,
+        "latency_s": PCIE_FIXED_OVERHEAD_s,
+        "how_used": "Used by host D2H transfer equation with measured PIM-to-host order of magnitude.",
+    },
     LINK_CXL_LOCAL: {
         "bandwidth_Bps": CXL_LOCAL_BW_Bps,
         "latency_s": CXL_LOCAL_LAT_s,
@@ -322,6 +337,18 @@ CITED_VALUES = {
         "url": "https://huaicheng.github.io/p/asplos25-melody.pdf",
         "quote": "remote entries show higher latency and reduced bandwidth (~13-14GB/s)",
         "how_used": "Representative remote bandwidth point for CXL direct transfers.",
+    },
+    "UPMEM_HOST_H2D_MEASURED_BW_Bps": {
+        "value": UPMEM_HOST_H2D_MEASURED_BW_Bps,
+        "url": "https://www.researchgate.net/publication/351475771_Benchmarking_a_New_Paradigm_An_Experimental_Analysis_of_a_Real_Processing-in-Memory_Architecture",
+        "quote": "measured host-to-DPU transfer peaks are in the single-digit GB/s range.",
+        "how_used": "Directional host H2D bandwidth default for OLAP host-staging realism.",
+    },
+    "UPMEM_HOST_D2H_MEASURED_BW_Bps": {
+        "value": UPMEM_HOST_D2H_MEASURED_BW_Bps,
+        "url": "https://www.researchgate.net/publication/351475771_Benchmarking_a_New_Paradigm_An_Experimental_Analysis_of_a_Real_Processing-in-Memory_Architecture",
+        "quote": "measured DPU-to-host transfer peaks are lower than H2D and single-digit GB/s.",
+        "how_used": "Directional host D2H bandwidth default for OLAP host-staging realism.",
     },
     "DEEPVARIANT_STAGE_NAMES": {
         "value": list(DEEPVARIANT_STAGE_NAMES),

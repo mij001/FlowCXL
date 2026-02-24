@@ -28,6 +28,8 @@
 - Stage duration uses `max(compute_component, memory_component)`.
 - Bytes touched are derived per stage via input/output/amplification factors.
 - CPU and PIM memory ceilings are per-stage budgets shared across stage units.
+- CPU random-access penalties are applied for join/group-by memory components.
+- CPU-only pipeline breakers can inject explicit `MATERIALIZE` operations (default boundaries: `S1->S2`, `S2->S3`).
 
 ## Stage-device mapping
 
@@ -54,11 +56,16 @@ Per adjacent stage transition:
 - `pim->pim`:
   - bounce: `host_d2h -> HOST_TOUCH -> host_h2d_stage`
   - direct: `cxl_direct`
+- `cpu_only` (`tpch_3op`) breaker boundaries:
+  - `MATERIALIZE` on CPU materialization pool
 
 Ingress/egress rules:
 
 - `host_h2d_ingress` only if stage 1 is PIM
 - final `host_d2h` only if final stage is PIM
+- Host staging uses directional links:
+  - `host_h2d_link` for H2D paths
+  - `host_d2h_link` for D2H paths
 
 ## Why FlowCXL gain can exceed 2x in TPC-H high profile
 
@@ -79,6 +86,7 @@ This tends to push bounce toward `host_link`/`host_touch` LB dominance, while di
   - `host_d2h_channels`
   - `host_touch_channels`
   - `cxl_direct_channels`
+  - `cpu_materialize_channels`
 
 ## Metrics
 
@@ -94,3 +102,7 @@ Per run:
   - `total_compute_time_component_s`
   - `total_cpu_mem_time_component_s`
   - `total_pim_mem_time_component_s`
+- CPU materialization diagnostics:
+  - `total_cpu_materialize_bytes`
+  - `total_cpu_materialize_time_component_s`
+  - `cpu_materialize_energy_J`

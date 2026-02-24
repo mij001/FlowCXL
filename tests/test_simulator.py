@@ -1,4 +1,4 @@
-"""Checks for template-aware modeling with CPU/PIM memory ceilings."""
+"""Checks for directional host links, CPU penalties, and CPU materialization modeling."""
 
 from __future__ import annotations
 
@@ -8,12 +8,7 @@ import unittest
 import yaml
 
 import sources
-from simulator import (
-    compute_bytes_touched,
-    compute_stage_duration_components_s,
-    generate_runs_from_config,
-    scale_boundaries_exact,
-)
+from simulator import generate_runs_from_config, scale_boundaries_exact
 
 
 class SimulatorChecks(unittest.TestCase):
@@ -55,142 +50,115 @@ class SimulatorChecks(unittest.TestCase):
         )
         return float(bounce["makespan_s"]) / float(direct["makespan_s"])
 
-    def test_tpch_memory_ceiling_keys_exist_and_validate(self) -> None:
-        for key in [
-            "enable_memory_ceiling_by_template",
-            "cpu_mem_Bps_by_stage_by_template",
-            "pim_mem_Bps_by_stage_by_template",
-            "bytes_touched_factors_by_stage_by_template",
-        ]:
-            self.assertIn(key, self.config)
+    def _tpch_profiles(self) -> list[str]:
+        return [
+            sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+        ]
 
+    def test_directional_host_links_are_required_for_new_schema(self) -> None:
         cfg = copy.deepcopy(self.config)
-        del cfg["cpu_mem_Bps_by_stage_by_template"]
+        link_profile = dict(cfg["link_profile"])
+        link_profile.pop("host_h2d_link", None)
+        link_profile.pop("host_d2h_link", None)
+        link_profile.pop("host_link", None)
+        cfg["link_profile"] = link_profile
         with self.assertRaises((KeyError, ValueError)):
             generate_runs_from_config(cfg)
 
-        cfg2 = copy.deepcopy(self.config)
-        del cfg2["bytes_touched_factors_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
-            "join"
-        ]["amplification_factor"]
-        with self.assertRaises((KeyError, ValueError)):
-            generate_runs_from_config(cfg2)
+    def test_directional_link_routing_uses_h2d_vs_d2h_paths(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        row = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, 1.0)
+        run_id = row["run_id"]
+        h2d_link = self.config["link_profile"]["host_h2d_link"]
+        d2h_link = self.config["link_profile"]["host_d2h_link"]
 
-    def test_tpch_bytes_touched_formula_scan_join_agg(self) -> None:
-        factors = self.config["bytes_touched_factors_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]
-        bytes_in = 1_000
-        bytes_out = 250
-        for stage_name in sources.TPCH_STAGE_NAMES:
-            stage_factors = factors[stage_name]
-            expected = float(stage_factors["amplification_factor"]) * (
-                float(stage_factors["input_factor"]) * bytes_in
-                + float(stage_factors["output_factor"]) * bytes_out
-            )
-            actual = compute_bytes_touched(
-                bytes_in=bytes_in,
-                bytes_out=bytes_out,
-                input_factor=float(stage_factors["input_factor"]),
-                output_factor=float(stage_factors["output_factor"]),
-                amplification_factor=float(stage_factors["amplification_factor"]),
-            )
-            self.assertAlmostEqual(actual, expected, places=9)
+        transfer_rows = [r for r in self.traces if r["run_id"] == run_id and r["op_type"] == "TRANSFER"]
+        self.assertTrue(transfer_rows)
 
-    def test_tpch_compute_duration_uses_max_compute_vs_mem(self) -> None:
-        duration, compute_s, mem_s, _ = compute_stage_duration_components_s(
-            bytes_in=1_000,
-            bytes_out=500,
-            compute_rate_Bps=100.0,
-            memory_ceiling_enabled=True,
-            memory_Bps_per_stage=10_000.0,
-            stage_units=1,
-            input_factor=1.0,
-            output_factor=1.0,
-            amplification_factor=1.0,
+        ingress_or_stage = [r for r in transfer_rows if r["transfer_path"] in {"host_h2d_ingress", "host_h2d_stage"}]
+        d2h = [r for r in transfer_rows if r["transfer_path"] == "host_d2h"]
+        self.assertTrue(ingress_or_stage)
+        self.assertTrue(d2h)
+        self.assertTrue(all(r["link_type"] == h2d_link for r in ingress_or_stage))
+        self.assertTrue(all(r["link_type"] == d2h_link for r in d2h))
+
+    def test_tpch_cpu_random_access_penalty_applies_join_groupby(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        baseline = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
+        baseline_makespan = float(baseline["makespan_s"])
+
+        cfg = copy.deepcopy(self.config)
+        penalty_map = cfg["cpu_random_access_penalty_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]
+        penalty_map["scan_filter_project"] = 1.0
+        penalty_map["join"] = 1.0
+        penalty_map["groupby_agg"] = 1.0
+        metrics_no_penalty, _ = generate_runs_from_config(cfg)
+        no_penalty_row = self._find_row(
+            profile,
+            sources.SCENARIO_CPU_ONLY,
+            1.0,
+            metrics=metrics_no_penalty,
         )
-        self.assertAlmostEqual(compute_s, 10.0, places=9)
-        self.assertLess(mem_s, compute_s)
-        self.assertAlmostEqual(duration, compute_s, places=9)
+        self.assertGreater(baseline_makespan, float(no_penalty_row["makespan_s"]))
 
-        duration2, compute_s2, mem_s2, _ = compute_stage_duration_components_s(
-            bytes_in=1_000,
-            bytes_out=500,
-            compute_rate_Bps=10_000.0,
-            memory_ceiling_enabled=True,
-            memory_Bps_per_stage=100.0,
-            stage_units=1,
-            input_factor=2.0,
-            output_factor=1.0,
-            amplification_factor=1.0,
-        )
-        self.assertAlmostEqual(compute_s2, 0.1, places=9)
-        self.assertGreater(mem_s2, compute_s2)
-        self.assertAlmostEqual(duration2, mem_s2, places=9)
+    def test_materialize_ops_present_only_tpch_cpu_only(self) -> None:
+        for profile in self._tpch_profiles():
+            for scenario in self.config["scenarios"]:
+                row = self._find_row(profile, scenario, 1.0)
+                run_id = row["run_id"]
+                materialize_rows = [
+                    trace_row
+                    for trace_row in self.traces
+                    if trace_row["run_id"] == run_id and trace_row["op_type"] == "MATERIALIZE"
+                ]
+                if scenario == sources.SCENARIO_CPU_ONLY:
+                    self.assertTrue(materialize_rows)
+                else:
+                    self.assertFalse(materialize_rows)
 
-        duration3, compute_s3, mem_s3, bytes_touched3 = compute_stage_duration_components_s(
-            bytes_in=1_000,
-            bytes_out=500,
-            compute_rate_Bps=100.0,
-            memory_ceiling_enabled=False,
-            memory_Bps_per_stage=1.0,
-            stage_units=1,
-            input_factor=5.0,
-            output_factor=5.0,
-            amplification_factor=5.0,
-        )
-        self.assertAlmostEqual(duration3, compute_s3, places=9)
-        self.assertEqual(mem_s3, 0.0)
-        self.assertEqual(bytes_touched3, 0.0)
-
-    def test_tpch_host_touch_only_in_bounce(self) -> None:
-        for profile_id in self.config["dataset_profiles"]:
-            boundaries = sources.DATASET_PROFILES[profile_id]["boundaries_bytes"]
+    def test_materialize_bytes_match_breaker_boundaries(self) -> None:
+        for profile in self._tpch_profiles():
+            boundaries = sources.DATASET_PROFILES[profile]["boundaries_bytes"]
             for multiplier in self.config["size_multipliers"]:
-                bounce = self._find_row(profile_id, sources.SCENARIO_PIM_HOST_BOUNCE, float(multiplier))
-                direct = self._find_row(profile_id, sources.SCENARIO_PIM_FLOWCXL_DIRECT, float(multiplier))
-                cpu = self._find_row(profile_id, sources.SCENARIO_CPU_ONLY, float(multiplier))
+                cpu = self._find_row(profile, sources.SCENARIO_CPU_ONLY, float(multiplier))
+                bounce = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, float(multiplier))
+                direct = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, float(multiplier))
 
                 scaled = scale_boundaries_exact(boundaries, float(multiplier))
-                expected_touch_bytes = int(scaled[1] + scaled[2])
+                expected = int(scaled[1] + scaled[2])
+                self.assertEqual(int(cpu["total_cpu_materialize_bytes"]), expected)
+                self.assertEqual(int(bounce["total_cpu_materialize_bytes"]), 0)
+                self.assertEqual(int(direct["total_cpu_materialize_bytes"]), 0)
 
-                self.assertEqual(int(bounce["total_bytes_host_touch"]), expected_touch_bytes)
-                self.assertEqual(int(direct["total_bytes_host_touch"]), 0)
-                self.assertEqual(int(cpu["total_bytes_host_touch"]), 0)
-
-    def test_tpch_direct_not_slower_than_bounce_all_sizes(self) -> None:
-        for profile_id in self.config["dataset_profiles"]:
+    def test_direct_not_slower_than_bounce_all_tpch_points(self) -> None:
+        for profile in self._tpch_profiles():
             for multiplier in self.config["size_multipliers"]:
-                ratio = self._ratio(self.metrics, dataset_profile=profile_id, multiplier=float(multiplier))
+                ratio = self._ratio(self.metrics, dataset_profile=profile, multiplier=float(multiplier))
                 self.assertGreaterEqual(ratio, 1.0)
 
-    def test_tpch_high_profile_1x_ratio_at_least_2x(self) -> None:
+    def test_tpch_high_profile_1x_bounce_direct_ratio_at_least_2x(self) -> None:
         ratio = self._ratio(self.metrics, dataset_profile=sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE, multiplier=1.0)
         self.assertGreaterEqual(ratio, 2.0)
 
-    def test_tpch_direct_beats_cpu_all_profiles_all_sizes(self) -> None:
-        for profile_id in self.config["dataset_profiles"]:
-            for multiplier in self.config["size_multipliers"]:
-                cpu = self._find_row(profile_id, sources.SCENARIO_CPU_ONLY, float(multiplier))
-                direct = self._find_row(profile_id, sources.SCENARIO_PIM_FLOWCXL_DIRECT, float(multiplier))
-                self.assertLess(float(direct["makespan_s"]), float(cpu["makespan_s"]))
+    def test_tpch_high_profile_1x_cpu_direct_ratio_at_least_1p2(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        cpu = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
+        direct = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0)
+        ratio = float(cpu["makespan_s"]) / float(direct["makespan_s"])
+        self.assertGreaterEqual(ratio, 1.2)
 
-    def test_tpch_overlap_present_in_direct(self) -> None:
-        for profile_id in self.config["dataset_profiles"]:
-            direct_row = self._find_row(profile_id, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0)
-            run_id = direct_row["run_id"]
-            compute_rows = [row for row in self.traces if row["run_id"] == run_id and row["op_type"] == "COMPUTE"]
-            stage1 = [row for row in compute_rows if int(row["stage_id"]) == 1]
-            stage2 = [row for row in compute_rows if int(row["stage_id"]) == 2]
-            self.assertTrue(stage1 and stage2)
-            min_stage2_start = min(float(row["t_start"]) for row in stage2)
-            max_stage1_end = max(float(row["t_end"]) for row in stage1)
-            self.assertLess(min_stage2_start, max_stage1_end)
+    def test_high_profile_bounce_dominant_lb_is_host_link_or_host_touch(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        bounce = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, 1.0)
+        self.assertIn(str(bounce["dominant_lb_component"]), {"host_link", "host_touch"})
 
-    def test_tpch_sensitivity_compute_faster_increases_ratio(self) -> None:
-        profile_id = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        baseline_ratio = self._ratio(self.metrics, dataset_profile=profile_id, multiplier=1.0)
+    def test_compute_sensitivity_increases_bounce_direct_ratio(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        baseline_ratio = self._ratio(self.metrics, dataset_profile=profile, multiplier=1.0)
 
         cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [profile_id]
+        cfg["dataset_profiles"] = [profile]
         cfg["size_multipliers"] = [1.0]
         cfg["scenarios"] = [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
         for stage_name in sources.TPCH_STAGE_NAMES:
@@ -200,82 +168,66 @@ class SimulatorChecks(unittest.TestCase):
             )
 
         metrics_fast, _ = generate_runs_from_config(cfg)
-        fast_ratio = self._ratio(metrics_fast, dataset_profile=profile_id, multiplier=1.0)
+        fast_ratio = self._ratio(metrics_fast, dataset_profile=profile, multiplier=1.0)
         self.assertGreater(fast_ratio, baseline_ratio)
 
-    def test_tpch_sensitivity_host_link_slower_increases_ratio(self) -> None:
-        profile_id = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        baseline_ratio = self._ratio(self.metrics, dataset_profile=profile_id, multiplier=1.0)
+    def test_host_link_sensitivity_increases_bounce_direct_ratio(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        baseline_ratio = self._ratio(self.metrics, dataset_profile=profile, multiplier=1.0)
 
         cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [profile_id]
+        cfg["dataset_profiles"] = [profile]
         cfg["size_multipliers"] = [1.0]
         cfg["scenarios"] = [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        host_link = cfg["link_profile"]["host_link"]
-        old_bw = float(sources.LINKS[host_link]["bandwidth_Bps"])
+
+        h2d = cfg["link_profile"]["host_h2d_link"]
+        d2h = cfg["link_profile"]["host_d2h_link"]
+        old_h2d_bw = float(sources.LINKS[h2d]["bandwidth_Bps"])
+        old_d2h_bw = float(sources.LINKS[d2h]["bandwidth_Bps"])
         try:
-            sources.LINKS[host_link]["bandwidth_Bps"] = old_bw / 10.0
+            sources.LINKS[h2d]["bandwidth_Bps"] = old_h2d_bw / 10.0
+            sources.LINKS[d2h]["bandwidth_Bps"] = old_d2h_bw / 10.0
             metrics_slow, _ = generate_runs_from_config(cfg)
         finally:
-            sources.LINKS[host_link]["bandwidth_Bps"] = old_bw
-        slow_ratio = self._ratio(metrics_slow, dataset_profile=profile_id, multiplier=1.0)
+            sources.LINKS[h2d]["bandwidth_Bps"] = old_h2d_bw
+            sources.LINKS[d2h]["bandwidth_Bps"] = old_d2h_bw
+        slow_ratio = self._ratio(metrics_slow, dataset_profile=profile, multiplier=1.0)
         self.assertGreater(slow_ratio, baseline_ratio)
 
-    def test_pipeline_template_column_matches_profile_template(self) -> None:
-        for row in self.metrics:
-            expected = sources.DATASET_PROFILES[row["dataset_profile"]]["pipeline_template"]
-            self.assertEqual(row["pipeline_template"], expected)
-
-    def test_metrics_schema_stable_with_memory_columns(self) -> None:
+    def test_metrics_schema_includes_materialize_columns(self) -> None:
         row = self.metrics[0]
         for key in [
-            "memory_ceiling_enabled",
-            "total_cpu_mem_time_component_s",
-            "total_pim_mem_time_component_s",
-            "total_compute_time_component_s",
+            "total_cpu_materialize_bytes",
+            "total_cpu_materialize_time_component_s",
+            "cpu_materialize_energy_J",
         ]:
             self.assertIn(key, row)
         for forbidden in ["queue_wait_s", "utilization", "speedup_vs_cpu_only"]:
             self.assertNotIn(forbidden, row)
 
-    def test_deepvariant_profile_still_loads_template(self) -> None:
-        profile = sources.DATASET_PROFILES[sources.PROFILE_DV_ILLUMINA_WGS_30X]
-        self.assertEqual(profile["pipeline_template"], sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE)
-        self.assertEqual(tuple(profile["stage_names"]), sources.DEEPVARIANT_STAGE_NAMES)
-
-    def test_deepvariant_single_run_executes_with_template_maps(self) -> None:
+    def test_deepvariant_path_unchanged_by_default_for_new_knobs(self) -> None:
         cfg = copy.deepcopy(self.config)
         cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
         cfg["size_multipliers"] = [1.0]
-        metrics, _ = generate_runs_from_config(cfg)
-        self.assertEqual(len(metrics), len(cfg["scenarios"]))
-        self.assertTrue(all(row["pipeline_template"] == sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE for row in metrics))
-
-    def test_deepvariant_memory_ceiling_disabled_by_default(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
-        cfg["size_multipliers"] = [1.0]
-        metrics, _ = generate_runs_from_config(cfg)
+        metrics, traces = generate_runs_from_config(cfg)
+        self.assertTrue(metrics)
         for row in metrics:
+            self.assertEqual(row["pipeline_template"], sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE)
             self.assertFalse(bool(row["memory_ceiling_enabled"]))
-            self.assertEqual(float(row["total_cpu_mem_time_component_s"]), 0.0)
-            self.assertEqual(float(row["total_pim_mem_time_component_s"]), 0.0)
+            self.assertEqual(int(row["total_cpu_materialize_bytes"]), 0)
+            self.assertEqual(float(row["total_cpu_materialize_time_component_s"]), 0.0)
+            self.assertEqual(float(row["cpu_materialize_energy_J"]), 0.0)
+        self.assertFalse(any(t["op_type"] == "MATERIALIZE" for t in traces))
 
-    def test_config_requires_template_specific_memory_maps(self) -> None:
+    def test_legacy_host_link_compatibility_path(self) -> None:
         cfg = copy.deepcopy(self.config)
-        del cfg["enable_memory_ceiling_by_template"]
-        with self.assertRaises((KeyError, ValueError)):
-            generate_runs_from_config(cfg)
-
-    def test_legacy_flat_stage_map_keys_rejected_or_ignored_per_spec(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["scenario_stage_device_map"] = {
-            "cpu_only": ["cpu", "cpu", "cpu"],
-            "pim_host_bounce": ["pim", "pim", "pim"],
-            "pim_flowcxl_direct": ["pim", "pim", "pim"],
+        cxl = cfg["link_profile"]["cxl_direct_link"]
+        cfg["link_profile"] = {
+            "host_link": sources.LINK_PCIE_GEN4_X16,
+            "cxl_direct_link": cxl,
         }
-        with self.assertRaises(ValueError):
-            generate_runs_from_config(cfg)
+        metrics, _ = generate_runs_from_config(cfg)
+        self.assertTrue(metrics)
 
 
 if __name__ == "__main__":

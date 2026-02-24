@@ -79,9 +79,11 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
         "makespan_s",
         "total_energy_J",
         "host_touch_energy_J",
+        "cpu_materialize_energy_J",
         "total_compute_time_component_s",
         "total_cpu_mem_time_component_s",
         "total_pim_mem_time_component_s",
+        "total_cpu_materialize_time_component_s",
         "lb_compute_stage_max_s",
         "lb_host_h2d_ingress_s",
         "lb_host_h2d_stage_s",
@@ -131,6 +133,9 @@ def _memory_ceiling_diagnostic_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
         "total_compute_time_component_s",
         "total_cpu_mem_time_component_s",
         "total_pim_mem_time_component_s",
+        "total_cpu_materialize_time_component_s",
+        "total_cpu_materialize_bytes",
+        "cpu_materialize_energy_J",
     ]
     subset = subset[cols]
     return _format_metric_fields(subset)
@@ -211,6 +216,31 @@ def _tpch_target_narrative(metrics_df: pd.DataFrame) -> str:
     )
 
 
+def _tpch_cpu_direct_regime_narrative(metrics_df: pd.DataFrame) -> str:
+    subset = metrics_df[
+        (metrics_df["dataset_profile"] == sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE)
+        & (metrics_df["stage_size_multiplier"] == 1.0)
+    ]
+    if subset.empty:
+        return "- High-intermediate CPU/direct regime check unavailable."
+
+    cpu = subset[subset["scenario"] == sources.SCENARIO_CPU_ONLY]
+    direct = subset[subset["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+    bounce = subset[subset["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE]
+    if cpu.empty or direct.empty or bounce.empty:
+        return "- High-intermediate CPU/direct regime check unavailable (missing scenario rows)."
+
+    cpu_direct_ratio = float(cpu.iloc[0]["makespan_s"]) / float(direct.iloc[0]["makespan_s"])
+    cpu_direct_status = "PASS" if cpu_direct_ratio >= 1.2 else "FAIL"
+    bounce_dominant = str(bounce.iloc[0]["dominant_lb_component"])
+    movement_bound_status = "PASS" if bounce_dominant in {"host_link", "host_touch"} else "FAIL"
+    return (
+        f"- `{sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE}` at `1x`: "
+        f"cpu/direct ratio `{cpu_direct_ratio:.6f}` -> `{cpu_direct_status}` (target `>=1.2`); "
+        f"bounce dominant `{bounce_dominant}` -> `{movement_bound_status}` (must be `host_link` or `host_touch`)."
+    )
+
+
 def main() -> None:
     metrics_path = Path("artifacts/metrics.csv")
     if not metrics_path.exists():
@@ -279,6 +309,7 @@ def main() -> None:
         "- Tile-by-tile pipelined execution with bounded in-flight admission\n"
         "- True host bounce for inter-PIM transfer: D2H -> HOST_TOUCH -> H2D(stage)\n"
         "- Split host H2D resources: ingress vs inter-stage staging\n"
+        "- Directional host-link modeling: separate host_h2d_link and host_d2h_link ceilings\n"
         "- Absolute makespan (seconds) and total energy (joules)\n"
         "- Lower-bound bottleneck diagnostics by resource family\n\n"
         "## Directional Check\n"
@@ -287,6 +318,9 @@ def main() -> None:
         "- In `tpch_3op`, large S1->S2 and S2->S3 intermediates make host-bounce pay double link traversal + touch, "
         "while FlowCXL direct pays a single inter-device transfer.\n"
         f"{_tpch_target_narrative(metrics_df)}\n\n"
+        "## High-Intermediate Regime Check\n"
+        "- Regime-based CPU comparison replaces brittle all-point CPU assertions.\n"
+        f"{_tpch_cpu_direct_regime_narrative(metrics_df)}\n\n"
         "## CPU Memory Ceiling Diagnostics (1x)\n"
         f"{_build_markdown_table(memory_diag_table)}\n\n"
         "## Plot Artifacts\n"

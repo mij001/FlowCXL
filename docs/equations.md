@@ -165,9 +165,17 @@ If memory ceiling is enabled for the template, stage memory bandwidth is shared 
 BW_{mem,unit}(s) = \frac{BW_{mem,stage}(s)}{U_s}
 \]
 
+For CPU stages, a stage-specific random-access penalty `p_{cpu}(s) >= 1` is applied:
+
+\[
+BW_{cpu,eff}(s) = \frac{BW_{cpu,stage}(s)}{p_{cpu}(s)}
+\]
+
 \[
 T_{mem}(s,k) = \frac{bytes\_touched(s,k)}{BW_{mem,unit}(s)}
 \]
+
+with `BW_mem,unit` taken from `BW_cpu,eff/U_cpu` for CPU stages and `BW_pim/U_pim` for PIM stages.
 
 Final compute-op duration:
 
@@ -183,10 +191,16 @@ T_{stage}(s,k) = T_{compute}(s,k)
 
 ## 6) Transfer duration
 
-Host-link transfer:
+Host H2D transfer:
 
 \[
-T_{host}(B) = T_{fixed,host} + \frac{B}{BW_{host}}
+T_{h2d}(B) = T_{fixed,host} + \frac{B}{BW_{h2d}}
+\]
+
+Host D2H transfer:
+
+\[
+T_{d2h}(B) = T_{fixed,host} + \frac{B}{BW_{d2h}}
 \]
 
 Direct CXL transfer:
@@ -201,6 +215,12 @@ Host-touch:
 T_{touch}(B) = T_{touch,fixed} + \frac{B}{BW_{touch}}
 \]
 
+CPU materialization barrier:
+
+\[
+T_{mat}(B) = T_{mat,fixed} + \frac{B}{BW_{mat}}
+\]
+
 ## 7) Transition-aware transfer graph
 
 For stage transition `s -> s+1`:
@@ -210,6 +230,7 @@ For stage transition `s -> s+1`:
 - `pim -> cpu`: `host_d2h`
 - `pim -> pim` in bounce: `host_d2h -> HOST_TOUCH -> host_h2d_stage`
 - `pim -> pim` in direct: `cxl_direct`
+- `cpu_only` pipeline-break boundaries in `tpch_3op`: `MATERIALIZE`
 
 Ingress `host_h2d_ingress` is added only when stage 1 is on PIM.
 Egress `host_d2h` is added only when final stage is on PIM.

@@ -18,7 +18,8 @@ scenarios:
   - pim_flowcxl_direct
 
 link_profile:
-  host_link: PCIe Gen4 x16
+  host_h2d_link: UPMEM_HOST_H2D_MEASURED
+  host_d2h_link: UPMEM_HOST_D2H_MEASURED
   cxl_direct_link: CXL_LOCAL
 
 resource_capacity:
@@ -27,6 +28,7 @@ resource_capacity:
   host_d2h_channels: 1
   cxl_direct_channels: 1
   host_touch_channels: 1
+  cpu_materialize_channels: 1
 
 stage_defaults:
   cpu_units: 32
@@ -120,11 +122,36 @@ bytes_touched_factors_by_stage_by_template:
       output_factor: 1.0
       amplification_factor: 1.0
 
+cpu_random_access_penalty_by_stage_by_template:
+  deepvariant_3stage:
+    make_examples: 1.0
+    call_variants: 1.0
+    postprocess_variants: 1.0
+  tpch_3op:
+    scan_filter_project: 1.0
+    join: 3.0
+    groupby_agg: 2.0
+
+cpu_materialization_by_template:
+  deepvariant_3stage:
+    enabled: false
+    scenarios: []
+    breaker_boundaries: []
+    materialize_Bps: 80000000000.0
+    fixed_s: 0.000002
+  tpch_3op:
+    enabled: true
+    scenarios: [cpu_only]
+    breaker_boundaries: [1, 2]
+    materialize_Bps: 80000000000.0
+    fixed_s: 0.000002
+
 transfer_power_W:
   host_h2d_ingress_channel: 20.0
   host_h2d_stage_channel: 20.0
   host_d2h_channel: 20.0
   cxl_direct_channel: 16.0
   host_touch_channel: 30.0
+  cpu_materialize_channel: 22.0
 
 stage_overrides: {}

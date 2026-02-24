@@ -33,6 +33,7 @@ The high-intermediate profile is configured to expose host-bounce penalties and 
   - `T_stage = max(T_compute, T_mem)`
   - CPU/PIM memory ceilings are configurable per stage and template
   - bytes-touched factors model scan/join/group-by read/write pressure
+  - CPU random-access penalties model join/group-by cache-miss pressure
 - Per-template scenario stage-device maps
 - Tile overlap with bounded in-flight window (`max_inflight_tiles`)
 - Transition-aware transfer graph:
@@ -43,6 +44,9 @@ The high-intermediate profile is configured to expose host-bounce penalties and 
     - bounce: `host_d2h -> HOST_TOUCH -> host_h2d_stage`
     - direct: `cxl_direct`
 - Split host H2D topology: ingress vs stage channels
+- Directional host links for host staging (`host_h2d_link`, `host_d2h_link`)
+  - Legacy `host_link` is still accepted and mapped to both directions
+- CPU-only materialization barriers for configured TPC-H pipeline-break boundaries
 - Makespan and energy accounting
 - Lower-bound bottleneck diagnostics (`lb_*`, `dominant_lb_component`)
 - Memory-ceiling diagnostics:
@@ -50,6 +54,7 @@ The high-intermediate profile is configured to expose host-bounce penalties and 
   - `total_compute_time_component_s`
   - `total_cpu_mem_time_component_s`
   - `total_pim_mem_time_component_s`
+  - `total_cpu_materialize_time_component_s`
 
 ## Repo layout
 

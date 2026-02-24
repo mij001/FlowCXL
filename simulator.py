@@ -166,6 +166,29 @@ def host_touch_duration_s(bytes_moved: int, touch_Bps: float, touch_fixed_s: flo
     return touch_fixed_s + (bytes_moved / touch_Bps)
 
 
+def materialize_duration_s(bytes_moved: int, materialize_Bps: float, fixed_s: float) -> float:
+    if materialize_Bps <= 0:
+        raise ValueError("materialize_Bps must be > 0")
+    if fixed_s < 0:
+        raise ValueError("materialize fixed_s must be >= 0")
+    return fixed_s + (bytes_moved / materialize_Bps)
+
+
+def _resolve_host_link_names(link_profile: Mapping[str, object]) -> Tuple[str, str]:
+    if "host_h2d_link" in link_profile or "host_d2h_link" in link_profile:
+        if "host_h2d_link" not in link_profile or "host_d2h_link" not in link_profile:
+            raise KeyError("link_profile must include both host_h2d_link and host_d2h_link when directional keys are used")
+        return str(link_profile["host_h2d_link"]), str(link_profile["host_d2h_link"])
+
+    if "host_link" in link_profile:
+        legacy = str(link_profile["host_link"])
+        return legacy, legacy
+
+    raise KeyError(
+        "link_profile must include host_h2d_link+host_d2h_link or legacy host_link"
+    )
+
+
 def _stage_overrides_for_dataset(
     stage_overrides: Dict[str, Dict[object, Dict[str, object]]], dataset_profile: str
 ) -> Dict[object, Dict[str, object]]:
@@ -351,9 +374,15 @@ def _build_stage_configs(
 def _build_tile_operations(
     scenario: str,
     stage_devices: Sequence[str],
+    pipeline_template: str,
+    cpu_materialization_by_template: Mapping[str, Mapping[str, object]],
 ) -> List[TileOperation]:
     num_stages = len(stage_devices)
     operations: List[TileOperation] = []
+    materialization_cfg = cpu_materialization_by_template.get(pipeline_template, {})
+    materialization_enabled = bool(materialization_cfg.get("enabled", False))
+    materialization_scenarios = {str(name) for name in materialization_cfg.get("scenarios", [])}
+    breaker_boundaries = {int(boundary) for boundary in materialization_cfg.get("breaker_boundaries", [])}
 
     if stage_devices[0] == sources.DEVICE_PIM:
         operations.append(
@@ -362,6 +391,20 @@ def _build_tile_operations(
 
     for stage_id in range(1, num_stages + 1):
         operations.append(TileOperation(op_type="COMPUTE", stage_id=stage_id, boundary_index=stage_id - 1))
+        if (
+            materialization_enabled
+            and scenario in materialization_scenarios
+            and stage_id in breaker_boundaries
+            and stage_id < num_stages
+        ):
+            operations.append(
+                TileOperation(
+                    op_type="MATERIALIZE",
+                    stage_id=stage_id,
+                    boundary_index=stage_id,
+                    transfer_path="cpu_materialize",
+                )
+            )
         if stage_id >= num_stages:
             continue
 
@@ -464,6 +507,8 @@ def _validate_config(config: Dict[str, object]) -> None:
         "cpu_mem_Bps_by_stage_by_template",
         "pim_mem_Bps_by_stage_by_template",
         "bytes_touched_factors_by_stage_by_template",
+        "cpu_random_access_penalty_by_stage_by_template",
+        "cpu_materialization_by_template",
     ]
     missing = [key for key in required_top_level if key not in config]
     if missing:
@@ -479,8 +524,17 @@ def _validate_config(config: Dict[str, object]) -> None:
         raise ValueError(f"legacy flat template keys are not allowed: {legacy_present}")
 
     link_profile = config["link_profile"]
-    if "host_link" not in link_profile or "cxl_direct_link" not in link_profile:
-        raise KeyError("link_profile must include host_link and cxl_direct_link")
+    host_h2d_link, host_d2h_link = _resolve_host_link_names(link_profile)
+    if "cxl_direct_link" not in link_profile:
+        raise KeyError("link_profile must include cxl_direct_link")
+    cxl_direct_link = str(link_profile["cxl_direct_link"])
+    for link_name, link_id in [
+        ("host_h2d_link", host_h2d_link),
+        ("host_d2h_link", host_d2h_link),
+        ("cxl_direct_link", cxl_direct_link),
+    ]:
+        if link_id not in sources.LINKS:
+            raise ValueError(f"{link_name} references unknown link: {link_id}")
 
     resource_capacity = config["resource_capacity"]
     for key in [
@@ -489,6 +543,7 @@ def _validate_config(config: Dict[str, object]) -> None:
         "host_d2h_channels",
         "cxl_direct_channels",
         "host_touch_channels",
+        "cpu_materialize_channels",
     ]:
         if key not in resource_capacity:
             raise KeyError(f"resource_capacity missing key: {key}")
@@ -502,6 +557,7 @@ def _validate_config(config: Dict[str, object]) -> None:
         "host_d2h_channel",
         "cxl_direct_channel",
         "host_touch_channel",
+        "cpu_materialize_channel",
     ]:
         if key not in transfer_power_W:
             raise KeyError(f"transfer_power_W missing key: {key}")
@@ -560,6 +616,8 @@ def _validate_config(config: Dict[str, object]) -> None:
     cpu_mem_Bps_by_stage_by_template = config["cpu_mem_Bps_by_stage_by_template"]
     pim_mem_Bps_by_stage_by_template = config["pim_mem_Bps_by_stage_by_template"]
     bytes_touched_factors_by_stage_by_template = config["bytes_touched_factors_by_stage_by_template"]
+    cpu_random_access_penalty_by_stage_by_template = config["cpu_random_access_penalty_by_stage_by_template"]
+    cpu_materialization_by_template = config["cpu_materialization_by_template"]
     for mapping_name, mapping in [
         ("scenario_stage_device_map_by_template", scenario_stage_device_map_by_template),
         ("pim_speedup_vs_cpu_by_stage_by_template", pim_speedup_by_template),
@@ -568,6 +626,8 @@ def _validate_config(config: Dict[str, object]) -> None:
         ("cpu_mem_Bps_by_stage_by_template", cpu_mem_Bps_by_stage_by_template),
         ("pim_mem_Bps_by_stage_by_template", pim_mem_Bps_by_stage_by_template),
         ("bytes_touched_factors_by_stage_by_template", bytes_touched_factors_by_stage_by_template),
+        ("cpu_random_access_penalty_by_stage_by_template", cpu_random_access_penalty_by_stage_by_template),
+        ("cpu_materialization_by_template", cpu_materialization_by_template),
     ]:
         if not isinstance(mapping, Mapping):
             raise ValueError(f"{mapping_name} must be a map")
@@ -587,6 +647,10 @@ def _validate_config(config: Dict[str, object]) -> None:
             raise KeyError(f"pim_mem_Bps_by_stage_by_template missing template {template}")
         if template not in bytes_touched_factors_by_stage_by_template:
             raise KeyError(f"bytes_touched_factors_by_stage_by_template missing template {template}")
+        if template not in cpu_random_access_penalty_by_stage_by_template:
+            raise KeyError(f"cpu_random_access_penalty_by_stage_by_template missing template {template}")
+        if template not in cpu_materialization_by_template:
+            raise KeyError(f"cpu_materialization_by_template missing template {template}")
 
         scenario_map = scenario_stage_device_map_by_template[template]
         if not isinstance(scenario_map, Mapping):
@@ -608,6 +672,8 @@ def _validate_config(config: Dict[str, object]) -> None:
         cpu_mem_map = cpu_mem_Bps_by_stage_by_template[template]
         pim_mem_map = pim_mem_Bps_by_stage_by_template[template]
         bytes_touched_map = bytes_touched_factors_by_stage_by_template[template]
+        cpu_penalty_map = cpu_random_access_penalty_by_stage_by_template[template]
+        materialization_cfg = cpu_materialization_by_template[template]
         if not isinstance(speedup_map, Mapping):
             raise ValueError(f"pim speedup map for template {template} must be a map")
         if not isinstance(rate_map, Mapping):
@@ -618,6 +684,10 @@ def _validate_config(config: Dict[str, object]) -> None:
             raise ValueError(f"pim memory map for template {template} must be a map")
         if not isinstance(bytes_touched_map, Mapping):
             raise ValueError(f"bytes touched map for template {template} must be a map")
+        if not isinstance(cpu_penalty_map, Mapping):
+            raise ValueError(f"cpu random access penalty map for template {template} must be a map")
+        if not isinstance(materialization_cfg, Mapping):
+            raise ValueError(f"cpu materialization config for template {template} must be a map")
 
         memory_flag = enable_memory_ceiling_by_template[template]
         if not isinstance(memory_flag, bool):
@@ -642,6 +712,10 @@ def _validate_config(config: Dict[str, object]) -> None:
                 raise KeyError(f"template {template} pim memory map missing stage {stage_name}")
             if float(pim_mem_map[stage_name]) <= 0:
                 raise ValueError(f"template {template} pim memory Bps for {stage_name} must be > 0")
+            if stage_name not in cpu_penalty_map:
+                raise KeyError(f"template {template} cpu random access penalty missing stage {stage_name}")
+            if float(cpu_penalty_map[stage_name]) < 1.0:
+                raise ValueError(f"template {template} cpu random access penalty for {stage_name} must be >= 1.0")
             if stage_name not in bytes_touched_map:
                 raise KeyError(f"template {template} bytes_touched map missing stage {stage_name}")
             factors = bytes_touched_map[stage_name]
@@ -657,6 +731,35 @@ def _validate_config(config: Dict[str, object]) -> None:
             if float(factors["amplification_factor"]) <= 0:
                 raise ValueError(
                     f"bytes_touched amplification_factor must be > 0 for {template}:{stage_name}"
+                )
+
+        for key in ["enabled", "scenarios", "breaker_boundaries", "materialize_Bps", "fixed_s"]:
+            if key not in materialization_cfg:
+                raise KeyError(f"cpu_materialization_by_template[{template}] missing key: {key}")
+        if not isinstance(materialization_cfg["enabled"], bool):
+            raise ValueError(f"cpu_materialization_by_template[{template}].enabled must be bool")
+        if float(materialization_cfg["materialize_Bps"]) <= 0:
+            raise ValueError(f"cpu_materialization_by_template[{template}].materialize_Bps must be > 0")
+        if float(materialization_cfg["fixed_s"]) < 0:
+            raise ValueError(f"cpu_materialization_by_template[{template}].fixed_s must be >= 0")
+
+        scenario_list = materialization_cfg["scenarios"]
+        if not isinstance(scenario_list, Sequence):
+            raise ValueError(f"cpu_materialization_by_template[{template}].scenarios must be a list")
+        for scenario_name in scenario_list:
+            if str(scenario_name) not in sources.SCENARIOS:
+                raise ValueError(
+                    f"cpu_materialization_by_template[{template}] has unknown scenario {scenario_name}"
+                )
+
+        breakers = materialization_cfg["breaker_boundaries"]
+        if not isinstance(breakers, Sequence):
+            raise ValueError(f"cpu_materialization_by_template[{template}].breaker_boundaries must be a list")
+        for breaker in breakers:
+            breaker_int = int(breaker)
+            if breaker_int <= 0 or breaker_int >= len(stage_names):
+                raise ValueError(
+                    f"cpu_materialization_by_template[{template}] breaker {breaker_int} must be in [1, {len(stage_names) - 1}]"
                 )
 
     if int(config["tile_size_bytes"]) <= 0:
@@ -695,7 +798,8 @@ def simulate_configuration(
     scenario: str,
     tile_size_bytes: int,
     max_inflight_tiles: int,
-    host_link: str,
+    host_h2d_link: str,
+    host_d2h_link: str,
     cxl_direct_link: str,
     resource_capacity: Dict[str, object],
     stage_defaults: Dict[str, object],
@@ -708,12 +812,16 @@ def simulate_configuration(
     cpu_mem_Bps_by_stage_by_template: Mapping[str, Mapping[str, object]],
     pim_mem_Bps_by_stage_by_template: Mapping[str, Mapping[str, object]],
     bytes_touched_factors_by_stage_by_template: Mapping[str, Mapping[str, Mapping[str, object]]],
+    cpu_random_access_penalty_by_stage_by_template: Mapping[str, Mapping[str, object]],
+    cpu_materialization_by_template: Mapping[str, Mapping[str, object]],
     trace_max_tiles: int | None = None,
 ) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
     if scenario not in sources.SCENARIOS:
         raise ValueError(f"unknown scenario: {scenario}")
-    if host_link not in sources.LINKS:
-        raise ValueError(f"unknown host link: {host_link}")
+    if host_h2d_link not in sources.LINKS:
+        raise ValueError(f"unknown host H2D link: {host_h2d_link}")
+    if host_d2h_link not in sources.LINKS:
+        raise ValueError(f"unknown host D2H link: {host_d2h_link}")
     if cxl_direct_link not in sources.LINKS:
         raise ValueError(f"unknown cxl direct link: {cxl_direct_link}")
 
@@ -736,6 +844,10 @@ def simulate_configuration(
         raise KeyError(f"missing pim memory map for template {pipeline_template}")
     if pipeline_template not in bytes_touched_factors_by_stage_by_template:
         raise KeyError(f"missing bytes_touched map for template {pipeline_template}")
+    if pipeline_template not in cpu_random_access_penalty_by_stage_by_template:
+        raise KeyError(f"missing cpu random-access penalty map for template {pipeline_template}")
+    if pipeline_template not in cpu_materialization_by_template:
+        raise KeyError(f"missing cpu materialization config for template {pipeline_template}")
 
     stage_devices = _stage_device_map_for_scenario(
         scenario_stage_device_map=scenario_stage_device_map_by_template[pipeline_template],
@@ -763,6 +875,8 @@ def simulate_configuration(
     cpu_mem_Bps_by_stage = cpu_mem_Bps_by_stage_by_template[pipeline_template]
     pim_mem_Bps_by_stage = pim_mem_Bps_by_stage_by_template[pipeline_template]
     bytes_touched_factors_by_stage = bytes_touched_factors_by_stage_by_template[pipeline_template]
+    cpu_random_access_penalty_by_stage = cpu_random_access_penalty_by_stage_by_template[pipeline_template]
+    cpu_materialization_cfg = cpu_materialization_by_template[pipeline_template]
 
     host_h2d_ingress_pool = ResourcePool(
         name="host_h2d_ingress",
@@ -789,6 +903,11 @@ def simulate_configuration(
         capacity=int(resource_capacity["host_touch_channels"]),
         power_W=float(transfer_power_W["host_touch_channel"]),
     )
+    cpu_materialize_pool = ResourcePool(
+        name="cpu_materialize",
+        capacity=int(resource_capacity["cpu_materialize_channels"]),
+        power_W=float(transfer_power_W["cpu_materialize_channel"]),
+    )
 
     compute_pools: List[ResourcePool] = []
     for stage_id in range(1, num_stages + 1):
@@ -811,7 +930,12 @@ def simulate_configuration(
                 )
             )
 
-    operations = _build_tile_operations(scenario=scenario, stage_devices=stage_devices)
+    operations = _build_tile_operations(
+        scenario=scenario,
+        stage_devices=stage_devices,
+        pipeline_template=pipeline_template,
+        cpu_materialization_by_template=cpu_materialization_by_template,
+    )
 
     traces: List[Dict[str, object]] = []
     completion_times = [0.0 for _ in range(num_tiles)]
@@ -828,9 +952,11 @@ def simulate_configuration(
     total_bytes_host_h2d_ingress = 0
     total_bytes_host_h2d_stage = 0
     total_bytes_host_d2h = 0
+    total_cpu_materialize_bytes = 0
     total_compute_time_component_s = 0.0
     total_cpu_mem_time_component_s = 0.0
     total_pim_mem_time_component_s = 0.0
+    total_cpu_materialize_time_component_s = 0.0
 
     while request_heap:
         t_req, tile_id = heapq.heappop(request_heap)
@@ -854,6 +980,8 @@ def simulate_configuration(
                 compute_rate = stage_cfg.cpu_unit_compute_Bps
                 stage_units = stage_cfg.cpu_units
                 memory_Bps_per_stage = float(cpu_mem_Bps_by_stage[stage_name])
+                cpu_penalty = float(cpu_random_access_penalty_by_stage[stage_name])
+                memory_Bps_per_stage = memory_Bps_per_stage / cpu_penalty
             else:
                 compute_rate = stage_cfg.pim_unit_compute_Bps
                 stage_units = stage_cfg.pim_units
@@ -880,6 +1008,17 @@ def simulate_configuration(
             pool = compute_pools[operation.stage_id - 1]
             link_used = ""
             transfer_path = ""
+        elif operation.op_type == "MATERIALIZE":
+            duration_s = materialize_duration_s(
+                bytes_moved=bytes_moved,
+                materialize_Bps=float(cpu_materialization_cfg["materialize_Bps"]),
+                fixed_s=float(cpu_materialization_cfg["fixed_s"]),
+            )
+            total_cpu_materialize_bytes += bytes_moved
+            total_cpu_materialize_time_component_s += duration_s
+            pool = cpu_materialize_pool
+            link_used = ""
+            transfer_path = operation.transfer_path
         elif operation.op_type == "HOST_TOUCH":
             duration_s = host_touch_duration_s(
                 bytes_moved=bytes_moved,
@@ -893,17 +1032,17 @@ def simulate_configuration(
         else:
             if operation.transfer_path == "host_h2d_ingress":
                 pool = host_h2d_ingress_pool
-                link_used = host_link
+                link_used = host_h2d_link
                 total_bytes_host_link += bytes_moved
                 total_bytes_host_h2d_ingress += bytes_moved
             elif operation.transfer_path == "host_h2d_stage":
                 pool = host_h2d_stage_pool
-                link_used = host_link
+                link_used = host_h2d_link
                 total_bytes_host_link += bytes_moved
                 total_bytes_host_h2d_stage += bytes_moved
             elif operation.transfer_path == "host_d2h":
                 pool = host_d2h_pool
-                link_used = host_link
+                link_used = host_d2h_link
                 total_bytes_host_link += bytes_moved
                 total_bytes_host_d2h += bytes_moved
             elif operation.transfer_path == "cxl_direct":
@@ -958,6 +1097,8 @@ def simulate_configuration(
     makespan_s = max(completion_times) if completion_times else 0.0
 
     compute_energy_J = sum(pool.busy_time_s * pool.power_W for pool in compute_pools)
+    cpu_materialize_energy_J = cpu_materialize_pool.busy_time_s * cpu_materialize_pool.power_W
+    compute_energy_J += cpu_materialize_energy_J
     host_touch_energy_J = host_touch_pool.busy_time_s * host_touch_pool.power_W
     transfer_energy_J = sum(
         pool.busy_time_s * pool.power_W
@@ -970,7 +1111,9 @@ def simulate_configuration(
     ) + host_touch_energy_J
     total_energy_J = compute_energy_J + transfer_energy_J
 
-    lb_compute_stage_max_s = max(_pool_lower_bound_s(pool) for pool in compute_pools) if compute_pools else 0.0
+    compute_lbs = [_pool_lower_bound_s(pool) for pool in compute_pools]
+    compute_lbs.append(_pool_lower_bound_s(cpu_materialize_pool))
+    lb_compute_stage_max_s = max(compute_lbs) if compute_lbs else 0.0
     lb_host_h2d_ingress_s = _pool_lower_bound_s(host_h2d_ingress_pool)
     lb_host_h2d_stage_s = _pool_lower_bound_s(host_h2d_stage_pool)
     lb_host_d2h_s = _pool_lower_bound_s(host_d2h_pool)
@@ -996,12 +1139,14 @@ def simulate_configuration(
         "compute_energy_J": compute_energy_J,
         "transfer_energy_J": transfer_energy_J,
         "host_touch_energy_J": host_touch_energy_J,
+        "cpu_materialize_energy_J": cpu_materialize_energy_J,
         "total_bytes_host_link": total_bytes_host_link,
         "total_bytes_cxl_direct": total_bytes_cxl_direct,
         "total_bytes_host_touch": total_bytes_host_touch,
         "total_bytes_host_h2d_ingress": total_bytes_host_h2d_ingress,
         "total_bytes_host_h2d_stage": total_bytes_host_h2d_stage,
         "total_bytes_host_d2h": total_bytes_host_d2h,
+        "total_cpu_materialize_bytes": total_cpu_materialize_bytes,
         "total_bytes_moved": total_bytes_host_link + total_bytes_cxl_direct,
         "lb_compute_stage_max_s": lb_compute_stage_max_s,
         "lb_host_h2d_ingress_s": lb_host_h2d_ingress_s,
@@ -1016,6 +1161,7 @@ def simulate_configuration(
         "total_cpu_mem_time_component_s": total_cpu_mem_time_component_s,
         "total_pim_mem_time_component_s": total_pim_mem_time_component_s,
         "total_compute_time_component_s": total_compute_time_component_s,
+        "total_cpu_materialize_time_component_s": total_cpu_materialize_time_component_s,
     }
     return metrics_row, traces
 
@@ -1031,7 +1177,7 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
     scenarios = config["scenarios"]
     tile_size_bytes = int(config["tile_size_bytes"])
     max_inflight_tiles = int(config["max_inflight_tiles"])
-    host_link = config["link_profile"]["host_link"]
+    host_h2d_link, host_d2h_link = _resolve_host_link_names(config["link_profile"])
     cxl_direct_link = config["link_profile"]["cxl_direct_link"]
     resource_capacity = config["resource_capacity"]
     stage_defaults = config["stage_defaults"]
@@ -1043,6 +1189,8 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
     cpu_mem_Bps_by_stage_by_template = config["cpu_mem_Bps_by_stage_by_template"]
     pim_mem_Bps_by_stage_by_template = config["pim_mem_Bps_by_stage_by_template"]
     bytes_touched_factors_by_stage_by_template = config["bytes_touched_factors_by_stage_by_template"]
+    cpu_random_access_penalty_by_stage_by_template = config["cpu_random_access_penalty_by_stage_by_template"]
+    cpu_materialization_by_template = config["cpu_materialization_by_template"]
     stage_overrides = config.get("stage_overrides", {})
     trace_max_tiles_raw = config.get("trace_max_tiles", 512)
     trace_max_tiles: int | None
@@ -1080,7 +1228,8 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                     scenario=scenario,
                     tile_size_bytes=tile_size_bytes,
                     max_inflight_tiles=max_inflight_tiles,
-                    host_link=host_link,
+                    host_h2d_link=host_h2d_link,
+                    host_d2h_link=host_d2h_link,
                     cxl_direct_link=cxl_direct_link,
                     resource_capacity=resource_capacity,
                     stage_defaults=stage_defaults,
@@ -1093,6 +1242,8 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                     cpu_mem_Bps_by_stage_by_template=cpu_mem_Bps_by_stage_by_template,
                     pim_mem_Bps_by_stage_by_template=pim_mem_Bps_by_stage_by_template,
                     bytes_touched_factors_by_stage_by_template=bytes_touched_factors_by_stage_by_template,
+                    cpu_random_access_penalty_by_stage_by_template=cpu_random_access_penalty_by_stage_by_template,
+                    cpu_materialization_by_template=cpu_materialization_by_template,
                     trace_max_tiles=trace_max_tiles,
                 )
                 metrics.append(row)
