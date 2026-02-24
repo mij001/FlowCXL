@@ -15,6 +15,10 @@ SCENARIO_ORDER = [
     sources.SCENARIO_PIM_HOST_BOUNCE,
     sources.SCENARIO_PIM_FLOWCXL_DIRECT,
 ]
+PIM_ONLY_SCENARIO_ORDER = [
+    sources.SCENARIO_PIM_HOST_BOUNCE,
+    sources.SCENARIO_PIM_FLOWCXL_DIRECT,
+]
 
 SCENARIO_LABELS = {
     sources.SCENARIO_CPU_ONLY: "CPU only",
@@ -43,6 +47,7 @@ def _plot_grouped_metric(
     ylabel: str,
     title: str,
     output_path: Path,
+    scenario_order: List[str] | None = None,
 ) -> None:
     subset = metrics_df[metrics_df["dataset_profile"] == dataset_profile].copy()
     if subset.empty:
@@ -52,13 +57,15 @@ def _plot_grouped_metric(
     subset = subset.dropna(subset=["stage_size_multiplier"])
     subset = subset.sort_values("stage_size_multiplier")
 
+    selected_scenarios = list(scenario_order or SCENARIO_ORDER)
+
     pivot = subset.pivot_table(
         index="stage_size_multiplier",
         columns="scenario",
         values=metric_col,
         aggfunc="first",
     )
-    pivot = pivot.reindex(columns=SCENARIO_ORDER)
+    pivot = pivot.reindex(columns=selected_scenarios)
     pivot = pivot.rename(columns=SCENARIO_LABELS)
 
     ax = pivot.plot(kind="bar", figsize=(10, 5), rot=0)
@@ -279,10 +286,28 @@ def main() -> None:
         _plot_grouped_metric(
             metrics_df=metrics_df,
             dataset_profile=dataset_profile,
+            metric_col="makespan_s",
+            ylabel="Makespan (s)",
+            title=f"Makespan by Stage Size (PIM only) ({dataset_profile})",
+            output_path=report_dir / f"plot_makespan_grouped_pim_only_{dataset_profile}.png",
+            scenario_order=PIM_ONLY_SCENARIO_ORDER,
+        )
+        _plot_grouped_metric(
+            metrics_df=metrics_df,
+            dataset_profile=dataset_profile,
             metric_col="total_energy_J",
             ylabel="Total Energy (J)",
             title=f"Total Energy by Stage Size and Scenario ({dataset_profile})",
             output_path=report_dir / f"plot_energy_grouped_{dataset_profile}.png",
+        )
+        _plot_grouped_metric(
+            metrics_df=metrics_df,
+            dataset_profile=dataset_profile,
+            metric_col="total_energy_J",
+            ylabel="Total Energy (J)",
+            title=f"Total Energy by Stage Size (PIM only) ({dataset_profile})",
+            output_path=report_dir / f"plot_energy_grouped_pim_only_{dataset_profile}.png",
+            scenario_order=PIM_ONLY_SCENARIO_ORDER,
         )
 
     summary_df = metrics_df[
@@ -312,6 +337,8 @@ def main() -> None:
     for dataset_profile in profiles:
         plot_lines.append(f"- plot_makespan_grouped_{dataset_profile}.png")
         plot_lines.append(f"- plot_energy_grouped_{dataset_profile}.png")
+        plot_lines.append(f"- plot_makespan_grouped_pim_only_{dataset_profile}.png")
+        plot_lines.append(f"- plot_energy_grouped_pim_only_{dataset_profile}.png")
 
     report_text = (
         "# FlowCXL Tiled Stage-Capacity Report\n\n"

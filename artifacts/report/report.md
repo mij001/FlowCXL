@@ -40,8 +40,12 @@ Template-aware stage modeling with true host bounce and direct CXL movement show
 ## Plot Artifacts
 - plot_makespan_grouped_PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE.png
 - plot_energy_grouped_PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE.png
+- plot_makespan_grouped_pim_only_PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE.png
+- plot_energy_grouped_pim_only_PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE.png
 - plot_makespan_grouped_PROFILE_TPCH_SF100_HIGH_INTERMEDIATE.png
 - plot_energy_grouped_PROFILE_TPCH_SF100_HIGH_INTERMEDIATE.png
+- plot_makespan_grouped_pim_only_PROFILE_TPCH_SF100_HIGH_INTERMEDIATE.png
+- plot_energy_grouped_pim_only_PROFILE_TPCH_SF100_HIGH_INTERMEDIATE.png
 
 ## Results Table
 | dataset_profile | pipeline_template | stage_size_multiplier | scenario | makespan_s | total_energy_J | host_touch_energy_J | total_bytes_host_touch | dominant_lb_component |
