@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import copy
+import csv
+import importlib
+import os
 import unittest
 import warnings
+from pathlib import Path
 
 import yaml
 
@@ -25,6 +29,8 @@ class SimulatorChecks(unittest.TestCase):
         scenario: str,
         multiplier: float,
         metrics: list[dict] | None = None,
+        workload_variant: str | None = None,
+        deepvariant_mode: str | None = None,
     ) -> dict:
         rows = self.metrics if metrics is None else metrics
         for row in rows:
@@ -32,6 +38,8 @@ class SimulatorChecks(unittest.TestCase):
                 row["dataset_profile"] == dataset_profile
                 and row["scenario"] == scenario
                 and abs(float(row["stage_size_multiplier"]) - float(multiplier)) < 1e-12
+                and (workload_variant is None or str(row.get("workload_variant")) == workload_variant)
+                and (deepvariant_mode is None or str(row.get("deepvariant_mode")) == deepvariant_mode)
             ):
                 return row
         raise KeyError((dataset_profile, scenario, multiplier))
@@ -434,6 +442,229 @@ class SimulatorChecks(unittest.TestCase):
 
         for forbidden in ["queue_wait_s", "utilization", "speedup_vs_cpu_only"]:
             self.assertNotIn(forbidden, row)
+
+    def test_workload_sweep_generates_tpch_and_deepvariant_rows(self) -> None:
+        families = {str(row.get("workload_family", "")) for row in self.metrics}
+        self.assertIn("tpch", families)
+        self.assertIn("deepvariant", families)
+
+    def test_workload_variants_expand_run_count(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
+        cfg["workload_variants"] = [
+            {"name": "base", "overrides": {}},
+            {"name": "v2", "overrides": {"stage_defaults": {"cpu_units": 16}}},
+        ]
+        cfg["deepvariant_mode_sweep"] = ["new"]
+        metrics, _ = generate_runs_from_config(cfg)
+        self.assertEqual(len(metrics), 2)
+        variants = {str(row["workload_variant"]) for row in metrics}
+        self.assertEqual(variants, {"base", "v2"})
+
+    def test_variant_override_deep_merge_applies_nested_stage_fields(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
+        cfg["workload_variants"] = [
+            {"name": "base", "overrides": {}},
+            {
+                "name": "cpuheavy",
+                "overrides": {
+                    "memory_system_by_template": {
+                        sources.PIPELINE_TEMPLATE_TPCH_3OP: {
+                            "cpu_baseline_system": {
+                                "stages": {
+                                    "join": {"row_hit_rate": 0.08, "mlp": 4, "avg_miss_latency_ns": 160.0},
+                                }
+                            }
+                        }
+                    }
+                },
+            },
+        ]
+        cfg["deepvariant_mode_sweep"] = ["new"]
+        metrics, _ = generate_runs_from_config(cfg)
+        base = next(row for row in metrics if row["workload_variant"] == "base")
+        cpuheavy = next(row for row in metrics if row["workload_variant"] == "cpuheavy")
+        self.assertGreater(float(cpuheavy["makespan_s"]), float(base["makespan_s"]))
+
+    def test_deepvariant_mode_sweep_expands_rows(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [],
+            "deepvariant_profiles": [sources.PROFILE_DV_ILLUMINA_WGS_30X],
+        }
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["deepvariant_mode_sweep"] = ["new", "legacy"]
+        metrics, _ = generate_runs_from_config(cfg)
+        modes = {str(row["deepvariant_mode"]) for row in metrics}
+        self.assertEqual(modes, {"new", "legacy"})
+        self.assertEqual(len(metrics), 2)
+
+    def test_deepvariant_legacy_forces_legacy_memory_path(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [],
+            "deepvariant_profiles": [sources.PROFILE_DV_ILLUMINA_WGS_30X],
+        }
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["deepvariant_mode_sweep"] = ["new", "legacy"]
+
+        stage_names = list(sources.DEEPVARIANT_STAGE_NAMES)
+        cfg["memory_system_by_template"][sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE] = {
+            "enabled": True,
+            "cpu_baseline_system": {
+                "baseline_engine": sources.CPU_ENGINE_VECTORIZED_PIPELINE,
+                "dram_channels": 8,
+                "banks_per_channel": 16,
+                "cacheline_bytes": 64,
+                "queueing_model": "utilization_penalty",
+                "queue_alpha": 0.35,
+                "rho_cap": 0.95,
+                "stages": {
+                    stage: {
+                        "access_pattern": sources.ACCESS_PATTERN_SEQUENTIAL_SCAN,
+                        "row_hit_rate": 0.9,
+                        "mlp": 32,
+                        "avg_miss_latency_ns": 100.0,
+                        "peak_bw_Bps": 120e9,
+                        "penalty_multiplier": 1.0,
+                    }
+                    for stage in stage_names
+                },
+                "materialization_policy": {
+                    "boundaries_by_engine": {
+                        sources.CPU_ENGINE_VECTORIZED_PIPELINE: [],
+                        sources.CPU_ENGINE_BLOCKING_VOLCANO: [],
+                    },
+                    "materialize_Bps": 80e9,
+                    "fixed_s": 2e-6,
+                    "scenarios": [],
+                },
+            },
+            "pim_system": {"enabled": False},
+        }
+        cfg["enable_memory_ceiling_by_template"][sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE] = False
+
+        metrics, _ = generate_runs_from_config(cfg)
+        new_row = next(row for row in metrics if row["deepvariant_mode"] == "new")
+        legacy_row = next(row for row in metrics if row["deepvariant_mode"] == "legacy")
+        self.assertTrue(bool(new_row["memory_ceiling_enabled"]))
+        self.assertFalse(bool(legacy_row["memory_ceiling_enabled"]))
+        self.assertGreater(float(new_row["total_cpu_mem_time_component_s"]), 0.0)
+        self.assertEqual(float(legacy_row["total_cpu_mem_time_component_s"]), 0.0)
+
+    def test_tpch_rows_ignore_deepvariant_mode_switch_logic(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["deepvariant_mode_sweep"] = ["new", "legacy"]
+        metrics, _ = generate_runs_from_config(cfg)
+        self.assertEqual(len(metrics), 1)
+        self.assertEqual(str(metrics[0]["deepvariant_mode"]), "new")
+
+    def test_metrics_schema_includes_workload_metadata_columns(self) -> None:
+        row = self.metrics[0]
+        for key in [
+            "workload_family",
+            "workload_profile",
+            "workload_variant",
+            "deepvariant_mode",
+            "baseline_id",
+        ]:
+            self.assertIn(key, row)
+
+    def test_traces_schema_includes_workload_metadata_columns(self) -> None:
+        self.assertTrue(self.traces)
+        row = self.traces[0]
+        for key in [
+            "workload_family",
+            "workload_profile",
+            "workload_variant",
+            "deepvariant_mode",
+            "baseline_id",
+        ]:
+            self.assertIn(key, row)
+
+    def test_relative_ratio_computation_direct_over_bounce(self) -> None:
+        try:
+            import pandas as pd  # noqa: F401
+            report = importlib.import_module("report")
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"report dependencies unavailable: {exc}")
+
+        df = pd.DataFrame(
+            [
+                {"stage_size_multiplier": 1.0, "scenario": sources.SCENARIO_PIM_HOST_BOUNCE, "makespan_s": 10.0},
+                {"stage_size_multiplier": 1.0, "scenario": sources.SCENARIO_PIM_FLOWCXL_DIRECT, "makespan_s": 5.0},
+                {"stage_size_multiplier": 1.0, "scenario": sources.SCENARIO_CPU_ONLY, "makespan_s": 8.0},
+            ]
+        )
+        ratio = report._build_ratio_wide(df, "makespan_s")
+        self.assertAlmostEqual(float(ratio.loc[1.0, "direct_over_bounce"]), 0.5)
+        self.assertAlmostEqual(float(ratio.loc[1.0, "cpu_over_bounce"]), 0.8)
+        self.assertAlmostEqual(float(ratio.loc[1.0, "bounce_over_bounce"]), 1.0)
+
+    def test_report_generates_relative_plot_files(self) -> None:
+        try:
+            import pandas as pd  # noqa: F401
+            import matplotlib.pyplot as plt  # noqa: F401
+            report = importlib.import_module("report")
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"report dependencies unavailable: {exc}")
+
+        artifacts_dir = Path("artifacts")
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = artifacts_dir / "metrics.csv"
+        with metrics_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(self.metrics[0].keys()))
+            writer.writeheader()
+            writer.writerows(self.metrics)
+
+        report.main()
+        report_dir = Path("artifacts/report")
+        generated = os.listdir(report_dir)
+        self.assertTrue(any(name.startswith("plot_ratio_direct_over_bounce_makespan_") for name in generated))
+        self.assertTrue(any(name.startswith("plot_ratio_direct_over_bounce_energy_") for name in generated))
+        self.assertTrue(any(name.startswith("plot_ratio_norm_to_bounce_makespan_") for name in generated))
+        self.assertTrue(any(name.startswith("plot_ratio_norm_to_bounce_energy_") for name in generated))
+
+    def test_backward_compat_without_workload_sweep(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg.pop("workload_sweep", None)
+        cfg.pop("workload_variants", None)
+        cfg.pop("deepvariant_mode_sweep", None)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
+        metrics, _ = generate_runs_from_config(cfg)
+        self.assertEqual(len(metrics), 1)
+        self.assertEqual(str(metrics[0]["workload_profile"]), sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE)
+        self.assertEqual(str(metrics[0]["workload_variant"]), "base")
+        self.assertEqual(str(metrics[0]["deepvariant_mode"]), "new")
 
 
 if __name__ == "__main__":

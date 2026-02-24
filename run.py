@@ -59,6 +59,11 @@ BASE_METRICS_COLUMNS = [
     "cxl_active_direct_endpoints",
     "cxl_effective_striping_factor",
     "total_cxl_dma_issue_time_component_s",
+    "workload_family",
+    "workload_profile",
+    "workload_variant",
+    "deepvariant_mode",
+    "baseline_id",
 ]
 TRACE_YAML_MAX_EVENTS = 2000
 

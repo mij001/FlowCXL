@@ -1,6 +1,22 @@
 dataset_profiles:
   - PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE
   - PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+  - PROFILE_DV_ILLUMINA_WGS_30X
+
+workload_sweep:
+  tpch_profiles:
+    - PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE
+    - PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+  deepvariant_profiles:
+    - PROFILE_DV_ILLUMINA_WGS_30X
+
+workload_variants:
+  - name: base
+    overrides: {}
+
+deepvariant_mode_sweep:
+  - new
+  - legacy
 
 size_multipliers:
   - 0.5

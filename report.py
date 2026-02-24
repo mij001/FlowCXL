@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -40,26 +40,57 @@ def _format_multiplier(value: float) -> str:
     return f"{float(value):g}x"
 
 
+def _sanitize_token(value: object) -> str:
+    token = str(value)
+    for ch in [" ", "/", "\\", ":", "|", "*", "?", "\"", "<", ">"]:
+        token = token.replace(ch, "_")
+    token = token.replace(".", "p")
+    return token
+
+
+def _ensure_workload_columns(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    out = metrics_df.copy()
+    if "workload_profile" not in out.columns:
+        out["workload_profile"] = out.get("dataset_profile", "")
+    if "workload_variant" not in out.columns:
+        out["workload_variant"] = "base"
+    if "deepvariant_mode" not in out.columns:
+        out["deepvariant_mode"] = "new"
+    if "workload_family" not in out.columns:
+        out["workload_family"] = out.get("pipeline_template", "").map(
+            lambda x: "deepvariant" if x == sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE else "tpch"
+        )
+    if "baseline_id" not in out.columns:
+        out["baseline_id"] = (
+            out["workload_family"].astype(str)
+            + "|"
+            + out["workload_profile"].astype(str)
+            + "|"
+            + out["workload_variant"].astype(str)
+            + "|"
+            + out["deepvariant_mode"].astype(str)
+            + "|m"
+            + out["stage_size_multiplier"].astype(str)
+        )
+    return out
+
+
 def _plot_grouped_metric(
-    metrics_df: pd.DataFrame,
-    dataset_profile: str,
+    subset: pd.DataFrame,
     metric_col: str,
     ylabel: str,
     title: str,
     output_path: Path,
     scenario_order: List[str] | None = None,
 ) -> None:
-    subset = metrics_df[metrics_df["dataset_profile"] == dataset_profile].copy()
     if subset.empty:
         return
-
-    subset["stage_size_multiplier"] = pd.to_numeric(subset["stage_size_multiplier"], errors="coerce")
-    subset = subset.dropna(subset=["stage_size_multiplier"])
-    subset = subset.sort_values("stage_size_multiplier")
-
     selected_scenarios = list(scenario_order or SCENARIO_ORDER)
-
-    pivot = subset.pivot_table(
+    use = subset.copy()
+    use["stage_size_multiplier"] = pd.to_numeric(use["stage_size_multiplier"], errors="coerce")
+    use = use.dropna(subset=["stage_size_multiplier"])
+    use = use.sort_values("stage_size_multiplier")
+    pivot = use.pivot_table(
         index="stage_size_multiplier",
         columns="scenario",
         values=metric_col,
@@ -80,9 +111,86 @@ def _plot_grouped_metric(
     plt.close()
 
 
+def _build_ratio_wide(subset: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    use = subset.copy()
+    use["stage_size_multiplier"] = pd.to_numeric(use["stage_size_multiplier"], errors="coerce")
+    use = use.dropna(subset=["stage_size_multiplier"])
+    pivot = use.pivot_table(
+        index="stage_size_multiplier",
+        columns="scenario",
+        values=value_col,
+        aggfunc="first",
+    )
+    required = [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+    if any(col not in pivot.columns for col in required):
+        return pd.DataFrame()
+
+    bounce = pivot[sources.SCENARIO_PIM_HOST_BOUNCE]
+    direct = pivot[sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+    result = pd.DataFrame(index=pivot.index)
+    result["direct_over_bounce"] = direct / bounce
+
+    if sources.SCENARIO_CPU_ONLY in pivot.columns:
+        result["cpu_over_bounce"] = pivot[sources.SCENARIO_CPU_ONLY] / bounce
+    else:
+        result["cpu_over_bounce"] = float("nan")
+
+    result["bounce_over_bounce"] = 1.0
+    return result.sort_index()
+
+
+def _plot_direct_over_bounce_ratio(
+    ratio_df: pd.DataFrame,
+    ylabel: str,
+    title: str,
+    output_path: Path,
+) -> None:
+    if ratio_df.empty:
+        return
+    series = ratio_df[["direct_over_bounce"]].rename(columns={"direct_over_bounce": "Direct/Bounce"})
+    ax = series.plot(kind="bar", figsize=(10, 5), rot=0)
+    ax.axhline(1.0, color="black", linewidth=1.0, linestyle="--")
+    ax.set_xlabel("Stage data size multiplier")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_xticklabels([_format_multiplier(value) for value in series.index])
+    ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+
+
+def _plot_norm_to_bounce_ratio(
+    ratio_df: pd.DataFrame,
+    ylabel: str,
+    title: str,
+    output_path: Path,
+) -> None:
+    if ratio_df.empty:
+        return
+    series = ratio_df[["cpu_over_bounce", "bounce_over_bounce", "direct_over_bounce"]].rename(
+        columns={
+            "cpu_over_bounce": "CPU/Bounce",
+            "bounce_over_bounce": "Bounce/Bounce",
+            "direct_over_bounce": "Direct/Bounce",
+        }
+    )
+    ax = series.plot(kind="bar", figsize=(10, 5), rot=0)
+    ax.axhline(1.0, color="black", linewidth=1.0, linestyle="--")
+    ax.set_xlabel("Stage data size multiplier")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_xticklabels([_format_multiplier(value) for value in series.index])
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(title="Ratio")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+
+
 def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
     out = table_df.copy()
-    for col in [
+    numeric_cols = [
         "makespan_s",
         "total_energy_J",
         "host_touch_energy_J",
@@ -111,114 +219,33 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
         "cxl_direct_stream_slots",
         "cxl_active_direct_endpoints",
         "cxl_effective_striping_factor",
-    ]:
-        if col in out:
+    ]
+    for col in numeric_cols:
+        if col in out.columns:
             out[col] = out[col].map(lambda value: f"{float(value):.6f}")
     return out
 
 
-def _dataset_diagnostic_table(metrics_df: pd.DataFrame, dataset_profile: str) -> pd.DataFrame:
-    subset = metrics_df[metrics_df["dataset_profile"] == dataset_profile].copy()
-    subset = subset.sort_values(["stage_size_multiplier", "scenario"])
-    subset["scenario"] = subset["scenario"].map(SCENARIO_LABELS)
-    subset["stage_size_multiplier"] = subset["stage_size_multiplier"].map(_format_multiplier)
-    cols = [
-        "dataset_profile",
-        "pipeline_template",
-        "cpu_baseline_engine",
-        "stage_size_multiplier",
-        "scenario",
-        "makespan_s",
-        "total_energy_J",
-        "dominant_lb_component",
-        "lb_compute_stage_max_s",
-        "lb_host_h2d_ingress_s",
-        "lb_host_h2d_stage_s",
-        "lb_host_d2h_s",
-        "lb_host_link_s",
-        "lb_host_touch_s",
-        "lb_cxl_direct_s",
-        "total_bytes_pim_retained",
-        "total_retain_fallback_bytes",
-        "total_retain_handoff_time_component_s",
-        "cxl_direct_stream_slots",
-        "cxl_active_direct_endpoints",
-        "cxl_effective_striping_factor",
-        "total_cxl_dma_issue_time_component_s",
-    ]
-    subset = subset[cols]
-    return _format_metric_fields(subset)
-
-
-def _memory_ceiling_diagnostic_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
-    subset = metrics_df[metrics_df["stage_size_multiplier"] == 1.0].copy()
-    subset = subset.sort_values(["dataset_profile", "scenario"])
-    subset["scenario"] = subset["scenario"].map(SCENARIO_LABELS)
-    cols = [
-        "dataset_profile",
-        "pipeline_template",
-        "cpu_baseline_engine",
-        "scenario",
-        "memory_ceiling_enabled",
-        "total_compute_time_component_s",
-        "total_cpu_mem_time_component_s",
-        "total_cpu_mem_latency_bound_time_component_s",
-        "total_cpu_mem_peak_bound_time_component_s",
-        "total_cpu_mem_service_time_component_s",
-        "total_cpu_mem_queue_delay_component_s",
-        "total_pim_mem_time_component_s",
-        "total_pim_mem_service_time_component_s",
-        "total_pim_mem_queue_delay_component_s",
-        "total_cpu_materialize_time_component_s",
-        "total_cpu_materialize_bytes",
-        "cpu_materialize_energy_J",
-        "total_bytes_pim_retained",
-        "total_retain_fallback_bytes",
-        "total_retain_handoff_time_component_s",
-        "cxl_direct_stream_slots",
-        "cxl_active_direct_endpoints",
-        "cxl_effective_striping_factor",
-        "total_cxl_dma_issue_time_component_s",
-    ]
-    subset = subset[cols]
-    return _format_metric_fields(subset)
-
-
-def _direct_path_narrative(metrics_df: pd.DataFrame) -> str:
-    lines: List[str] = []
-    subset = metrics_df[metrics_df["stage_size_multiplier"] == 1.0].copy()
-    if subset.empty:
-        return "- No 1x rows available for direct-path diagnostics."
-    for dataset_profile in sorted(subset["dataset_profile"].dropna().unique()):
-        prof = subset[subset["dataset_profile"] == dataset_profile]
-        if prof.empty:
-            continue
-        bounce = prof[prof["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE]
-        direct = prof[prof["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        if bounce.empty or direct.empty:
-            continue
-        b = bounce.iloc[0]
-        d = direct.iloc[0]
-        retained = float(d.get("total_bytes_pim_retained", 0.0))
-        fallback = float(d.get("total_retain_fallback_bytes", 0.0))
-        striping = float(d.get("cxl_effective_striping_factor", 1.0))
-        issue_s = float(d.get("total_cxl_dma_issue_time_component_s", 0.0))
-        lines.append(
-            f"- {dataset_profile}: direct retained-bytes `{retained:.0f}`, retain-fallback-bytes `{fallback:.0f}`, "
-            f"effective striping `{striping:.2f}`, direct DMA-issue time `{issue_s:.6f}s`."
-        )
-    if not lines:
-        return "- No bounce/direct pairs available for direct-path diagnostics."
-    return "\n".join(lines)
+def _default_view(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    view = metrics_df.copy()
+    if "workload_variant" in view.columns:
+        view = view[view["workload_variant"] == "base"]
+    if "deepvariant_mode" in view.columns:
+        view = view[view["deepvariant_mode"] == "new"]
+    return view
 
 
 def _directional_narrative(metrics_df: pd.DataFrame) -> str:
     lines: List[str] = []
-    profiles = sorted(metrics_df["dataset_profile"].dropna().unique())
-    for dataset_profile in profiles:
-        subset = metrics_df[metrics_df["dataset_profile"] == dataset_profile]
-        template = str(subset.iloc[0]["pipeline_template"]) if not subset.empty else "unknown"
-        ratios: List[tuple[float, float, str, str]] = []
+    group_cols = ["workload_profile", "workload_variant", "deepvariant_mode"]
+    for _, group_row in metrics_df[group_cols].drop_duplicates().sort_values(group_cols).iterrows():
+        mask = (
+            (metrics_df["workload_profile"] == group_row["workload_profile"])
+            & (metrics_df["workload_variant"] == group_row["workload_variant"])
+            & (metrics_df["deepvariant_mode"] == group_row["deepvariant_mode"])
+        )
+        subset = metrics_df[mask]
+        ratios: List[float] = []
         for multiplier in sorted(subset["stage_size_multiplier"].unique()):
             bounce = subset[
                 (subset["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE)
@@ -230,45 +257,22 @@ def _directional_narrative(metrics_df: pd.DataFrame) -> str:
             ]
             if bounce.empty or direct.empty:
                 continue
-            b = bounce.iloc[0]
-            d = direct.iloc[0]
-            ratio = float(b["makespan_s"]) / float(d["makespan_s"])
-            ratios.append((float(multiplier), ratio, str(b["dominant_lb_component"]), str(d["dominant_lb_component"])))
-
+            ratios.append(float(direct.iloc[0]["makespan_s"]) / float(bounce.iloc[0]["makespan_s"]))
         if not ratios:
-            lines.append(f"- {dataset_profile}: insufficient bounce/direct rows.")
             continue
-
-        directional_ok = all(ratio >= 1.0 - 1e-12 for _, ratio, _, _ in ratios)
-        strict_points = sum(1 for _, ratio, _, _ in ratios if ratio > 1.0 + 1e-9)
-        min_ratio = min(ratio for _, ratio, _, _ in ratios)
-        max_ratio = max(ratio for _, ratio, _, _ in ratios)
-        ratio_1x_info = next((info for info in ratios if abs(info[0] - 1.0) < 1e-12), None)
-
-        if ratio_1x_info is None:
-            ratio_1x_text = "n/a"
-            dom_text = "n/a"
-        else:
-            ratio_1x_text = f"{ratio_1x_info[1]:.6f}"
-            dom_text = f"bounce `{ratio_1x_info[2]}`, direct `{ratio_1x_info[3]}`"
-
+        directional_ok = all(value <= 1.0 + 1e-12 for value in ratios)
         lines.append(
-            f"- {dataset_profile} (`{template}`): directional `{str(directional_ok).lower()}`, "
-            f"strictly-better points `{strict_points}`, "
-            f"1x bounce/direct ratio `{ratio_1x_text}`, "
-            f"ratio range `{min_ratio:.6f}` to `{max_ratio:.6f}`, 1x dominants {dom_text}."
+            f"- {group_row['workload_profile']} ({group_row['workload_variant']}, {group_row['deepvariant_mode']}): "
+            f"direct<=bounce `{str(directional_ok).lower()}`, direct/bounce range `{min(ratios):.6f}` to `{max(ratios):.6f}`."
         )
-
-    lines.append(
-        "- Directional condition checks `direct <= bounce`; ratio range captures sensitivity across stage-size multipliers."
-    )
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else "- No groups with both bounce and direct scenarios."
 
 
 def _tpch_target_narrative(metrics_df: pd.DataFrame) -> str:
-    subset = metrics_df[
-        (metrics_df["dataset_profile"] == sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE)
-        & (metrics_df["stage_size_multiplier"] == 1.0)
+    subset = _default_view(metrics_df)
+    subset = subset[
+        (subset["workload_profile"] == sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE)
+        & (subset["stage_size_multiplier"] == 1.0)
     ]
     if subset.empty:
         return "- TPC-H high profile 1x target unavailable."
@@ -288,9 +292,10 @@ def _tpch_target_narrative(metrics_df: pd.DataFrame) -> str:
 
 
 def _tpch_cpu_direct_regime_narrative(metrics_df: pd.DataFrame) -> str:
-    subset = metrics_df[
-        (metrics_df["dataset_profile"] == sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE)
-        & (metrics_df["stage_size_multiplier"] == 1.0)
+    subset = _default_view(metrics_df)
+    subset = subset[
+        (subset["workload_profile"] == sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE)
+        & (subset["stage_size_multiplier"] == 1.0)
     ]
     if subset.empty:
         return "- High-intermediate CPU/direct regime check unavailable."
@@ -312,6 +317,78 @@ def _tpch_cpu_direct_regime_narrative(metrics_df: pd.DataFrame) -> str:
     )
 
 
+def _relative_results_narrative(metrics_df: pd.DataFrame) -> str:
+    records: List[Dict[str, object]] = []
+    group_cols = ["workload_profile", "workload_variant", "deepvariant_mode"]
+    for _, group_row in metrics_df[group_cols].drop_duplicates().sort_values(group_cols).iterrows():
+        mask = (
+            (metrics_df["workload_profile"] == group_row["workload_profile"])
+            & (metrics_df["workload_variant"] == group_row["workload_variant"])
+            & (metrics_df["deepvariant_mode"] == group_row["deepvariant_mode"])
+        )
+        ratio_df = _build_ratio_wide(metrics_df[mask], "makespan_s")
+        for multiplier, row in ratio_df.iterrows():
+            records.append(
+                {
+                    "workload_profile": group_row["workload_profile"],
+                    "workload_variant": group_row["workload_variant"],
+                    "deepvariant_mode": group_row["deepvariant_mode"],
+                    "stage_size_multiplier": float(multiplier),
+                    "direct_over_bounce": float(row["direct_over_bounce"]),
+                }
+            )
+    if not records:
+        return "- Relative ratio table unavailable (missing bounce/direct pairs)."
+
+    rel_df = pd.DataFrame(records)
+    best = rel_df.loc[rel_df["direct_over_bounce"].idxmin()]
+    worst = rel_df.loc[rel_df["direct_over_bounce"].idxmax()]
+    return (
+        "- Best direct_over_bounce makespan: "
+        f"`{best['direct_over_bounce']:.6f}` at `{best['workload_profile']}`/`{best['workload_variant']}`/`{best['deepvariant_mode']}`/`{_format_multiplier(best['stage_size_multiplier'])}`.\n"
+        "- Worst direct_over_bounce makespan: "
+        f"`{worst['direct_over_bounce']:.6f}` at `{worst['workload_profile']}`/`{worst['workload_variant']}`/`{worst['deepvariant_mode']}`/`{_format_multiplier(worst['stage_size_multiplier'])}`."
+    )
+
+
+def _deepvariant_legacy_delta_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    subset = metrics_df[
+        (metrics_df["workload_family"] == "deepvariant")
+        & (metrics_df["stage_size_multiplier"] == 1.0)
+        & (metrics_df["deepvariant_mode"].isin(["new", "legacy"]))
+    ].copy()
+    if subset.empty:
+        return pd.DataFrame(columns=["note"])
+
+    rows: List[Dict[str, object]] = []
+    for keys, group in subset.groupby(["workload_profile", "workload_variant", "scenario"], dropna=False):
+        new_rows = group[group["deepvariant_mode"] == "new"]
+        legacy_rows = group[group["deepvariant_mode"] == "legacy"]
+        if new_rows.empty or legacy_rows.empty:
+            continue
+        new_row = new_rows.iloc[0]
+        legacy_row = legacy_rows.iloc[0]
+        rows.append(
+            {
+                "workload_profile": keys[0],
+                "workload_variant": keys[1],
+                "scenario": SCENARIO_LABELS.get(keys[2], str(keys[2])),
+                "makespan_new_s": float(new_row["makespan_s"]),
+                "makespan_legacy_s": float(legacy_row["makespan_s"]),
+                "legacy_over_new_makespan": float(legacy_row["makespan_s"]) / float(new_row["makespan_s"]),
+                "energy_new_J": float(new_row["total_energy_J"]),
+                "energy_legacy_J": float(legacy_row["total_energy_J"]),
+                "legacy_over_new_energy": float(legacy_row["total_energy_J"]) / float(new_row["total_energy_J"]),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=["note"])
+
+    out = pd.DataFrame(rows)
+    return _format_metric_fields(out)
+
+
 def main() -> None:
     metrics_path = Path("artifacts/metrics.csv")
     if not metrics_path.exists():
@@ -319,104 +396,215 @@ def main() -> None:
 
     report_dir = Path("artifacts/report")
     report_dir.mkdir(parents=True, exist_ok=True)
+    for stale_plot in report_dir.glob("plot_*.png"):
+        stale_plot.unlink()
 
     metrics_df = pd.read_csv(metrics_path)
-    profiles = list(metrics_df["dataset_profile"].dropna().unique())
+    metrics_df = _ensure_workload_columns(metrics_df)
 
-    for dataset_profile in profiles:
+    group_cols = ["workload_family", "workload_profile", "workload_variant", "deepvariant_mode"]
+    group_rows = metrics_df[group_cols].drop_duplicates().sort_values(group_cols)
+
+    plot_lines: List[str] = []
+    diagnostic_tables: List[str] = []
+
+    for _, group in group_rows.iterrows():
+        mask = (
+            (metrics_df["workload_family"] == group["workload_family"])
+            & (metrics_df["workload_profile"] == group["workload_profile"])
+            & (metrics_df["workload_variant"] == group["workload_variant"])
+            & (metrics_df["deepvariant_mode"] == group["deepvariant_mode"])
+        )
+        subset = metrics_df[mask].copy()
+
+        profile_token = _sanitize_token(group["workload_profile"])
+        variant_token = _sanitize_token(group["workload_variant"])
+        mode_token = _sanitize_token(group["deepvariant_mode"])
+        group_token = f"{profile_token}_{variant_token}_{mode_token}"
+
+        makespan_plot = f"plot_makespan_grouped_{group_token}.png"
+        makespan_pim_only_plot = f"plot_makespan_grouped_pim_only_{group_token}.png"
+        energy_plot = f"plot_energy_grouped_{group_token}.png"
+        energy_pim_only_plot = f"plot_energy_grouped_pim_only_{group_token}.png"
+
         _plot_grouped_metric(
-            metrics_df=metrics_df,
-            dataset_profile=dataset_profile,
+            subset=subset,
             metric_col="makespan_s",
             ylabel="Makespan (s)",
-            title=f"Makespan by Stage Size and Scenario ({dataset_profile})",
-            output_path=report_dir / f"plot_makespan_grouped_{dataset_profile}.png",
+            title=(
+                "Makespan by Stage Size and Scenario "
+                f"({group['workload_profile']} | {group['workload_variant']} | {group['deepvariant_mode']})"
+            ),
+            output_path=report_dir / makespan_plot,
         )
         _plot_grouped_metric(
-            metrics_df=metrics_df,
-            dataset_profile=dataset_profile,
+            subset=subset,
             metric_col="makespan_s",
             ylabel="Makespan (s)",
-            title=f"Makespan by Stage Size (PIM only) ({dataset_profile})",
-            output_path=report_dir / f"plot_makespan_grouped_pim_only_{dataset_profile}.png",
+            title=(
+                "Makespan by Stage Size (PIM only) "
+                f"({group['workload_profile']} | {group['workload_variant']} | {group['deepvariant_mode']})"
+            ),
+            output_path=report_dir / makespan_pim_only_plot,
             scenario_order=PIM_ONLY_SCENARIO_ORDER,
         )
         _plot_grouped_metric(
-            metrics_df=metrics_df,
-            dataset_profile=dataset_profile,
+            subset=subset,
             metric_col="total_energy_J",
             ylabel="Total Energy (J)",
-            title=f"Total Energy by Stage Size and Scenario ({dataset_profile})",
-            output_path=report_dir / f"plot_energy_grouped_{dataset_profile}.png",
+            title=(
+                "Total Energy by Stage Size and Scenario "
+                f"({group['workload_profile']} | {group['workload_variant']} | {group['deepvariant_mode']})"
+            ),
+            output_path=report_dir / energy_plot,
         )
         _plot_grouped_metric(
-            metrics_df=metrics_df,
-            dataset_profile=dataset_profile,
+            subset=subset,
             metric_col="total_energy_J",
             ylabel="Total Energy (J)",
-            title=f"Total Energy by Stage Size (PIM only) ({dataset_profile})",
-            output_path=report_dir / f"plot_energy_grouped_pim_only_{dataset_profile}.png",
+            title=(
+                "Total Energy by Stage Size (PIM only) "
+                f"({group['workload_profile']} | {group['workload_variant']} | {group['deepvariant_mode']})"
+            ),
+            output_path=report_dir / energy_pim_only_plot,
             scenario_order=PIM_ONLY_SCENARIO_ORDER,
         )
 
-    summary_df = metrics_df[
-        [
-            "dataset_profile",
-            "pipeline_template",
+        ratio_make = _build_ratio_wide(subset, "makespan_s")
+        ratio_energy = _build_ratio_wide(subset, "total_energy_J")
+
+        rel_make_plot = (
+            f"plot_ratio_direct_over_bounce_makespan_{profile_token}_{variant_token}_{mode_token}.png"
+        )
+        rel_energy_plot = (
+            f"plot_ratio_direct_over_bounce_energy_{profile_token}_{variant_token}_{mode_token}.png"
+        )
+        rel_norm_make_plot = (
+            f"plot_ratio_norm_to_bounce_makespan_{profile_token}_{variant_token}_{mode_token}.png"
+        )
+        rel_norm_energy_plot = (
+            f"plot_ratio_norm_to_bounce_energy_{profile_token}_{variant_token}_{mode_token}.png"
+        )
+
+        _plot_direct_over_bounce_ratio(
+            ratio_df=ratio_make,
+            ylabel="Direct/Bounce Makespan Ratio",
+            title=(
+                "Direct/Bounce Makespan Ratio "
+                f"({group['workload_profile']} | {group['workload_variant']} | {group['deepvariant_mode']})"
+            ),
+            output_path=report_dir / rel_make_plot,
+        )
+        _plot_direct_over_bounce_ratio(
+            ratio_df=ratio_energy,
+            ylabel="Direct/Bounce Energy Ratio",
+            title=(
+                "Direct/Bounce Energy Ratio "
+                f"({group['workload_profile']} | {group['workload_variant']} | {group['deepvariant_mode']})"
+            ),
+            output_path=report_dir / rel_energy_plot,
+        )
+        _plot_norm_to_bounce_ratio(
+            ratio_df=ratio_make,
+            ylabel="Scenario/Bounce Makespan Ratio",
+            title=(
+                "Scenario Normalized to Bounce (Makespan) "
+                f"({group['workload_profile']} | {group['workload_variant']} | {group['deepvariant_mode']})"
+            ),
+            output_path=report_dir / rel_norm_make_plot,
+        )
+        _plot_norm_to_bounce_ratio(
+            ratio_df=ratio_energy,
+            ylabel="Scenario/Bounce Energy Ratio",
+            title=(
+                "Scenario Normalized to Bounce (Energy) "
+                f"({group['workload_profile']} | {group['workload_variant']} | {group['deepvariant_mode']})"
+            ),
+            output_path=report_dir / rel_norm_energy_plot,
+        )
+
+        for item in [
+            makespan_plot,
+            energy_plot,
+            makespan_pim_only_plot,
+            energy_pim_only_plot,
+            rel_make_plot,
+            rel_energy_plot,
+            rel_norm_make_plot,
+            rel_norm_energy_plot,
+        ]:
+            plot_lines.append(f"- {item}")
+
+        diag_cols = [
+            "workload_family",
+            "workload_profile",
+            "workload_variant",
+            "deepvariant_mode",
             "stage_size_multiplier",
             "scenario",
             "makespan_s",
             "total_energy_J",
-            "host_touch_energy_J",
-            "total_bytes_host_touch",
             "dominant_lb_component",
+            "lb_compute_stage_max_s",
+            "lb_host_h2d_ingress_s",
+            "lb_host_h2d_stage_s",
+            "lb_host_d2h_s",
+            "lb_host_link_s",
+            "lb_host_touch_s",
+            "lb_cxl_direct_s",
+            "total_bytes_pim_retained",
+            "total_retain_fallback_bytes",
+            "cxl_effective_striping_factor",
+            "total_cxl_dma_issue_time_component_s",
         ]
-    ].copy()
+        diag_df = subset[diag_cols].copy()
+        diag_df["scenario"] = diag_df["scenario"].map(SCENARIO_LABELS)
+        diag_df["stage_size_multiplier"] = diag_df["stage_size_multiplier"].map(_format_multiplier)
+        diag_df = _format_metric_fields(diag_df)
+        diagnostic_tables.append(
+            "### "
+            f"{group['workload_profile']} | {group['workload_variant']} | {group['deepvariant_mode']}"
+            "\n\n"
+            f"{_build_markdown_table(diag_df)}"
+        )
+
+    summary_cols = [
+        "workload_family",
+        "workload_profile",
+        "workload_variant",
+        "deepvariant_mode",
+        "stage_size_multiplier",
+        "scenario",
+        "makespan_s",
+        "total_energy_J",
+        "dominant_lb_component",
+    ]
+    summary_df = metrics_df[summary_cols].copy()
     summary_df["scenario"] = summary_df["scenario"].map(SCENARIO_LABELS)
     summary_df["stage_size_multiplier"] = summary_df["stage_size_multiplier"].map(_format_multiplier)
     summary_df = _format_metric_fields(summary_df)
 
-    diagnostic_tables = []
-    for dataset_profile in profiles:
-        diag_df = _dataset_diagnostic_table(metrics_df=metrics_df, dataset_profile=dataset_profile)
-        diagnostic_tables.append(f"### {dataset_profile}\n\n{_build_markdown_table(diag_df)}")
-    memory_diag_table = _memory_ceiling_diagnostic_table(metrics_df=metrics_df)
-
-    plot_lines: List[str] = []
-    for dataset_profile in profiles:
-        plot_lines.append(f"- plot_makespan_grouped_{dataset_profile}.png")
-        plot_lines.append(f"- plot_energy_grouped_{dataset_profile}.png")
-        plot_lines.append(f"- plot_makespan_grouped_pim_only_{dataset_profile}.png")
-        plot_lines.append(f"- plot_energy_grouped_pim_only_{dataset_profile}.png")
+    legacy_delta_df = _deepvariant_legacy_delta_table(metrics_df)
+    if "note" in legacy_delta_df.columns:
+        legacy_delta_text = "- No DeepVariant new/legacy pairs at 1x in this run matrix."
+    else:
+        legacy_delta_text = _build_markdown_table(legacy_delta_df)
 
     report_text = (
         "# FlowCXL Tiled Stage-Capacity Report\n\n"
         "## Single Claim\n"
         "Template-aware stage modeling with true host bounce and direct CXL movement shows where "
         "intermediate-staging penalties dominate multi-stage pipelines.\n\n"
-        "## Modeled\n"
-        "- Dual templates: DeepVariant (`deepvariant_3stage`) and OLAP (`tpch_3op`)\n"
-        "- Stage-limited compute capacity with per-template stage-device maps\n"
-        "- Tile-by-tile pipelined execution with bounded in-flight admission\n"
-        "- True host bounce for inter-PIM transfer: D2H -> HOST_TOUCH -> H2D(stage)\n"
-        "- Split host H2D resources: ingress vs inter-stage staging\n"
-        "- Directional host-link modeling: separate host_h2d_link and host_d2h_link ceilings\n"
-        "- Access-pattern DRAM-service CPU model for TPC-H memory components\n"
-        "- Absolute makespan (seconds) and total energy (joules)\n"
-        "- Lower-bound bottleneck diagnostics by resource family\n\n"
         "## Directional Check\n"
         f"{_directional_narrative(metrics_df)}\n\n"
+        "## Relative Results\n"
+        f"{_relative_results_narrative(metrics_df)}\n\n"
         "## TPC-H Target Check\n"
-        "- In `tpch_3op`, large S1->S2 and S2->S3 intermediates make host-bounce pay double link traversal + touch, "
-        "while FlowCXL direct pays a single inter-device transfer.\n"
         f"{_tpch_target_narrative(metrics_df)}\n\n"
         "## High-Intermediate Regime Check\n"
-        "- Regime-based CPU comparison replaces brittle all-point CPU assertions.\n"
         f"{_tpch_cpu_direct_regime_narrative(metrics_df)}\n\n"
-        "## Direct-Path Diagnostics (1x)\n"
-        f"{_direct_path_narrative(metrics_df)}\n\n"
-        "## Memory-System Diagnostics (1x)\n"
-        f"{_build_markdown_table(memory_diag_table)}\n\n"
+        "## DeepVariant New vs Legacy (1x)\n"
+        f"{legacy_delta_text}\n\n"
         "## Plot Artifacts\n"
         f"{chr(10).join(plot_lines)}\n\n"
         "## Results Table\n"
