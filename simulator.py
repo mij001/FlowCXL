@@ -158,6 +158,61 @@ def compute_stage_duration_components_s(
     return max(compute_component_s, memory_component_s), compute_component_s, memory_component_s, bytes_touched
 
 
+def compute_cpu_effective_mem_bw(
+    stage_name: str,
+    cpu_units: int,
+    bw_peak_Bps: float,
+    access_pattern: str,
+    row_hit_rate: float,
+    mlp: float,
+    avg_miss_latency_ns: float,
+    cacheline_bytes: float,
+    cpu_random_access_penalty: float,
+) -> Dict[str, float | str]:
+    if cpu_units <= 0:
+        raise ValueError(f"cpu_units must be > 0 for stage {stage_name}")
+    if bw_peak_Bps <= 0:
+        raise ValueError(f"bw_peak_Bps must be > 0 for stage {stage_name}")
+    if access_pattern not in sources.ACCESS_PATTERNS:
+        raise ValueError(f"unknown access pattern {access_pattern} for stage {stage_name}")
+    if not 0.0 <= row_hit_rate <= 1.0:
+        raise ValueError(f"row_hit_rate must be in [0,1] for stage {stage_name}")
+    if mlp <= 0:
+        raise ValueError(f"mlp must be > 0 for stage {stage_name}")
+    if avg_miss_latency_ns <= 0:
+        raise ValueError(f"avg_miss_latency_ns must be > 0 for stage {stage_name}")
+    if cacheline_bytes <= 0:
+        raise ValueError("cacheline_bytes must be > 0")
+    if cpu_random_access_penalty <= 0:
+        raise ValueError("cpu_random_access_penalty must be > 0")
+
+    miss_fraction = max(1e-6, 1.0 - row_hit_rate)
+    latency_s = avg_miss_latency_ns * 1e-9
+    bw_latency_Bps = (mlp * cacheline_bytes) / (latency_s * miss_fraction)
+
+    if access_pattern == sources.ACCESS_PATTERN_SEQUENTIAL_SCAN:
+        bw_service_Bps = bw_peak_Bps
+        mem_bound_mode = "peak_streaming"
+    else:
+        bw_service_Bps = min(bw_peak_Bps, bw_latency_Bps)
+        mem_bound_mode = "latency_limited" if bw_latency_Bps < bw_peak_Bps else "peak_streaming"
+
+    bw_eff_stage_Bps = bw_service_Bps / cpu_random_access_penalty
+    bw_eff_per_unit_Bps = bw_eff_stage_Bps / float(cpu_units)
+
+    return {
+        "cpu_access_pattern": access_pattern,
+        "cpu_row_hit_rate": row_hit_rate,
+        "cpu_mlp": mlp,
+        "cpu_avg_miss_latency_ns": avg_miss_latency_ns,
+        "cpu_bw_peak_Bps": bw_peak_Bps,
+        "cpu_bw_latency_Bps": bw_latency_Bps,
+        "cpu_bw_eff_stage_Bps": bw_eff_stage_Bps,
+        "cpu_bw_eff_per_unit_Bps": bw_eff_per_unit_Bps,
+        "cpu_mem_bound_mode": mem_bound_mode,
+    }
+
+
 def host_touch_duration_s(bytes_moved: int, touch_Bps: float, touch_fixed_s: float) -> float:
     if touch_Bps <= 0:
         raise ValueError("host touch bandwidth must be > 0")
@@ -504,10 +559,12 @@ def _validate_config(config: Dict[str, object]) -> None:
         "pim_speedup_vs_cpu_by_stage_by_template",
         "cpu_stage_unit_compute_Bps_by_template",
         "enable_memory_ceiling_by_template",
+        "dram_service_defaults",
         "cpu_mem_Bps_by_stage_by_template",
         "pim_mem_Bps_by_stage_by_template",
         "bytes_touched_factors_by_stage_by_template",
         "cpu_random_access_penalty_by_stage_by_template",
+        "cpu_access_pattern_by_stage_by_template",
         "cpu_materialization_by_template",
     ]
     missing = [key for key in required_top_level if key not in config]
@@ -586,6 +643,14 @@ def _validate_config(config: Dict[str, object]) -> None:
     if float(stage_defaults["host_touch_fixed_s"]) < 0:
         raise ValueError("host_touch_fixed_s must be >= 0")
 
+    dram_service_defaults = config["dram_service_defaults"]
+    if not isinstance(dram_service_defaults, Mapping):
+        raise ValueError("dram_service_defaults must be a map")
+    if "cacheline_bytes" not in dram_service_defaults:
+        raise KeyError("dram_service_defaults missing key: cacheline_bytes")
+    if float(dram_service_defaults["cacheline_bytes"]) <= 0:
+        raise ValueError("dram_service_defaults.cacheline_bytes must be > 0")
+
     for scenario in config["scenarios"]:
         if scenario not in sources.SCENARIOS:
             raise ValueError(f"unknown scenario in config: {scenario}")
@@ -617,6 +682,7 @@ def _validate_config(config: Dict[str, object]) -> None:
     pim_mem_Bps_by_stage_by_template = config["pim_mem_Bps_by_stage_by_template"]
     bytes_touched_factors_by_stage_by_template = config["bytes_touched_factors_by_stage_by_template"]
     cpu_random_access_penalty_by_stage_by_template = config["cpu_random_access_penalty_by_stage_by_template"]
+    cpu_access_pattern_by_stage_by_template = config["cpu_access_pattern_by_stage_by_template"]
     cpu_materialization_by_template = config["cpu_materialization_by_template"]
     for mapping_name, mapping in [
         ("scenario_stage_device_map_by_template", scenario_stage_device_map_by_template),
@@ -627,6 +693,7 @@ def _validate_config(config: Dict[str, object]) -> None:
         ("pim_mem_Bps_by_stage_by_template", pim_mem_Bps_by_stage_by_template),
         ("bytes_touched_factors_by_stage_by_template", bytes_touched_factors_by_stage_by_template),
         ("cpu_random_access_penalty_by_stage_by_template", cpu_random_access_penalty_by_stage_by_template),
+        ("cpu_access_pattern_by_stage_by_template", cpu_access_pattern_by_stage_by_template),
         ("cpu_materialization_by_template", cpu_materialization_by_template),
     ]:
         if not isinstance(mapping, Mapping):
@@ -649,6 +716,8 @@ def _validate_config(config: Dict[str, object]) -> None:
             raise KeyError(f"bytes_touched_factors_by_stage_by_template missing template {template}")
         if template not in cpu_random_access_penalty_by_stage_by_template:
             raise KeyError(f"cpu_random_access_penalty_by_stage_by_template missing template {template}")
+        if template not in cpu_access_pattern_by_stage_by_template:
+            raise KeyError(f"cpu_access_pattern_by_stage_by_template missing template {template}")
         if template not in cpu_materialization_by_template:
             raise KeyError(f"cpu_materialization_by_template missing template {template}")
 
@@ -673,6 +742,7 @@ def _validate_config(config: Dict[str, object]) -> None:
         pim_mem_map = pim_mem_Bps_by_stage_by_template[template]
         bytes_touched_map = bytes_touched_factors_by_stage_by_template[template]
         cpu_penalty_map = cpu_random_access_penalty_by_stage_by_template[template]
+        cpu_access_pattern_map = cpu_access_pattern_by_stage_by_template[template]
         materialization_cfg = cpu_materialization_by_template[template]
         if not isinstance(speedup_map, Mapping):
             raise ValueError(f"pim speedup map for template {template} must be a map")
@@ -686,6 +756,8 @@ def _validate_config(config: Dict[str, object]) -> None:
             raise ValueError(f"bytes touched map for template {template} must be a map")
         if not isinstance(cpu_penalty_map, Mapping):
             raise ValueError(f"cpu random access penalty map for template {template} must be a map")
+        if not isinstance(cpu_access_pattern_map, Mapping):
+            raise ValueError(f"cpu access pattern map for template {template} must be a map")
         if not isinstance(materialization_cfg, Mapping):
             raise ValueError(f"cpu materialization config for template {template} must be a map")
 
@@ -716,6 +788,23 @@ def _validate_config(config: Dict[str, object]) -> None:
                 raise KeyError(f"template {template} cpu random access penalty missing stage {stage_name}")
             if float(cpu_penalty_map[stage_name]) < 1.0:
                 raise ValueError(f"template {template} cpu random access penalty for {stage_name} must be >= 1.0")
+            if stage_name not in cpu_access_pattern_map:
+                raise KeyError(f"template {template} cpu access pattern map missing stage {stage_name}")
+            access_cfg = cpu_access_pattern_map[stage_name]
+            if not isinstance(access_cfg, Mapping):
+                raise ValueError(f"cpu access pattern config for {template}:{stage_name} must be a map")
+            for key in ["access_pattern", "row_hit_rate", "mlp", "avg_miss_latency_ns"]:
+                if key not in access_cfg:
+                    raise KeyError(f"cpu access pattern config for {template}:{stage_name} missing {key}")
+            if str(access_cfg["access_pattern"]) not in sources.ACCESS_PATTERNS:
+                raise ValueError(f"invalid access_pattern for {template}:{stage_name}")
+            row_hit_rate = float(access_cfg["row_hit_rate"])
+            if row_hit_rate < 0.0 or row_hit_rate > 1.0:
+                raise ValueError(f"row_hit_rate must be in [0,1] for {template}:{stage_name}")
+            if float(access_cfg["mlp"]) <= 0:
+                raise ValueError(f"mlp must be > 0 for {template}:{stage_name}")
+            if float(access_cfg["avg_miss_latency_ns"]) <= 0:
+                raise ValueError(f"avg_miss_latency_ns must be > 0 for {template}:{stage_name}")
             if stage_name not in bytes_touched_map:
                 raise KeyError(f"template {template} bytes_touched map missing stage {stage_name}")
             factors = bytes_touched_map[stage_name]
@@ -809,10 +898,12 @@ def simulate_configuration(
     pim_speedup_vs_cpu_by_stage_by_template: Mapping[str, Mapping[str, object]],
     cpu_stage_unit_compute_Bps_by_template: Mapping[str, Mapping[str, object]],
     enable_memory_ceiling_by_template: Mapping[str, bool],
+    dram_service_defaults: Mapping[str, object],
     cpu_mem_Bps_by_stage_by_template: Mapping[str, Mapping[str, object]],
     pim_mem_Bps_by_stage_by_template: Mapping[str, Mapping[str, object]],
     bytes_touched_factors_by_stage_by_template: Mapping[str, Mapping[str, Mapping[str, object]]],
     cpu_random_access_penalty_by_stage_by_template: Mapping[str, Mapping[str, object]],
+    cpu_access_pattern_by_stage_by_template: Mapping[str, Mapping[str, Mapping[str, object]]],
     cpu_materialization_by_template: Mapping[str, Mapping[str, object]],
     trace_max_tiles: int | None = None,
 ) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
@@ -846,8 +937,12 @@ def simulate_configuration(
         raise KeyError(f"missing bytes_touched map for template {pipeline_template}")
     if pipeline_template not in cpu_random_access_penalty_by_stage_by_template:
         raise KeyError(f"missing cpu random-access penalty map for template {pipeline_template}")
+    if pipeline_template not in cpu_access_pattern_by_stage_by_template:
+        raise KeyError(f"missing cpu access pattern map for template {pipeline_template}")
     if pipeline_template not in cpu_materialization_by_template:
         raise KeyError(f"missing cpu materialization config for template {pipeline_template}")
+    if "cacheline_bytes" not in dram_service_defaults:
+        raise KeyError("dram_service_defaults missing cacheline_bytes")
 
     stage_devices = _stage_device_map_for_scenario(
         scenario_stage_device_map=scenario_stage_device_map_by_template[pipeline_template],
@@ -876,7 +971,9 @@ def simulate_configuration(
     pim_mem_Bps_by_stage = pim_mem_Bps_by_stage_by_template[pipeline_template]
     bytes_touched_factors_by_stage = bytes_touched_factors_by_stage_by_template[pipeline_template]
     cpu_random_access_penalty_by_stage = cpu_random_access_penalty_by_stage_by_template[pipeline_template]
+    cpu_access_pattern_by_stage = cpu_access_pattern_by_stage_by_template[pipeline_template]
     cpu_materialization_cfg = cpu_materialization_by_template[pipeline_template]
+    cacheline_bytes = float(dram_service_defaults["cacheline_bytes"])
 
     host_h2d_ingress_pool = ResourcePool(
         name="host_h2d_ingress",
@@ -955,6 +1052,8 @@ def simulate_configuration(
     total_cpu_materialize_bytes = 0
     total_compute_time_component_s = 0.0
     total_cpu_mem_time_component_s = 0.0
+    total_cpu_mem_latency_bound_time_component_s = 0.0
+    total_cpu_mem_peak_bound_time_component_s = 0.0
     total_pim_mem_time_component_s = 0.0
     total_cpu_materialize_time_component_s = 0.0
 
@@ -971,6 +1070,15 @@ def simulate_configuration(
         compute_component_s = 0.0
         memory_component_s = 0.0
         bytes_touched = 0.0
+        cpu_access_pattern = ""
+        cpu_row_hit_rate = 0.0
+        cpu_mlp = 0.0
+        cpu_avg_miss_latency_ns = 0.0
+        cpu_bw_peak_Bps = 0.0
+        cpu_bw_latency_Bps = 0.0
+        cpu_bw_eff_stage_Bps = 0.0
+        cpu_bw_eff_per_unit_Bps = 0.0
+        cpu_mem_bound_mode = ""
 
         if operation.op_type == "COMPUTE":
             stage_name = stage_names[operation.stage_id - 1]
@@ -979,9 +1087,28 @@ def simulate_configuration(
             if stage_device == sources.DEVICE_CPU:
                 compute_rate = stage_cfg.cpu_unit_compute_Bps
                 stage_units = stage_cfg.cpu_units
-                memory_Bps_per_stage = float(cpu_mem_Bps_by_stage[stage_name])
-                cpu_penalty = float(cpu_random_access_penalty_by_stage[stage_name])
-                memory_Bps_per_stage = memory_Bps_per_stage / cpu_penalty
+                cpu_access_cfg = cpu_access_pattern_by_stage[stage_name]
+                cpu_bw = compute_cpu_effective_mem_bw(
+                    stage_name=stage_name,
+                    cpu_units=stage_units,
+                    bw_peak_Bps=float(cpu_mem_Bps_by_stage[stage_name]),
+                    access_pattern=str(cpu_access_cfg["access_pattern"]),
+                    row_hit_rate=float(cpu_access_cfg["row_hit_rate"]),
+                    mlp=float(cpu_access_cfg["mlp"]),
+                    avg_miss_latency_ns=float(cpu_access_cfg["avg_miss_latency_ns"]),
+                    cacheline_bytes=cacheline_bytes,
+                    cpu_random_access_penalty=float(cpu_random_access_penalty_by_stage[stage_name]),
+                )
+                memory_Bps_per_stage = float(cpu_bw["cpu_bw_eff_stage_Bps"])
+                cpu_access_pattern = str(cpu_bw["cpu_access_pattern"])
+                cpu_row_hit_rate = float(cpu_bw["cpu_row_hit_rate"])
+                cpu_mlp = float(cpu_bw["cpu_mlp"])
+                cpu_avg_miss_latency_ns = float(cpu_bw["cpu_avg_miss_latency_ns"])
+                cpu_bw_peak_Bps = float(cpu_bw["cpu_bw_peak_Bps"])
+                cpu_bw_latency_Bps = float(cpu_bw["cpu_bw_latency_Bps"])
+                cpu_bw_eff_stage_Bps = float(cpu_bw["cpu_bw_eff_stage_Bps"])
+                cpu_bw_eff_per_unit_Bps = float(cpu_bw["cpu_bw_eff_per_unit_Bps"])
+                cpu_mem_bound_mode = str(cpu_bw["cpu_mem_bound_mode"])
             else:
                 compute_rate = stage_cfg.pim_unit_compute_Bps
                 stage_units = stage_cfg.pim_units
@@ -1003,6 +1130,10 @@ def simulate_configuration(
             if memory_ceiling_enabled:
                 if stage_device == sources.DEVICE_CPU:
                     total_cpu_mem_time_component_s += memory_component_s
+                    if cpu_mem_bound_mode == "latency_limited":
+                        total_cpu_mem_latency_bound_time_component_s += memory_component_s
+                    else:
+                        total_cpu_mem_peak_bound_time_component_s += memory_component_s
                 else:
                     total_pim_mem_time_component_s += memory_component_s
             pool = compute_pools[operation.stage_id - 1]
@@ -1082,6 +1213,15 @@ def simulate_configuration(
                     "compute_component_s": compute_component_s,
                     "memory_component_s": memory_component_s,
                     "bytes_touched": bytes_touched,
+                    "cpu_access_pattern": cpu_access_pattern,
+                    "cpu_row_hit_rate": cpu_row_hit_rate,
+                    "cpu_mlp": cpu_mlp,
+                    "cpu_avg_miss_latency_ns": cpu_avg_miss_latency_ns,
+                    "cpu_bw_peak_Bps": cpu_bw_peak_Bps,
+                    "cpu_bw_latency_Bps": cpu_bw_latency_Bps,
+                    "cpu_bw_eff_stage_Bps": cpu_bw_eff_stage_Bps,
+                    "cpu_bw_eff_per_unit_Bps": cpu_bw_eff_per_unit_Bps,
+                    "cpu_mem_bound_mode": cpu_mem_bound_mode,
                     "memory_ceiling_enabled": memory_ceiling_enabled,
                 }
             )
@@ -1159,6 +1299,8 @@ def simulate_configuration(
         "pipeline_template": pipeline_template,
         "memory_ceiling_enabled": memory_ceiling_enabled,
         "total_cpu_mem_time_component_s": total_cpu_mem_time_component_s,
+        "total_cpu_mem_latency_bound_time_component_s": total_cpu_mem_latency_bound_time_component_s,
+        "total_cpu_mem_peak_bound_time_component_s": total_cpu_mem_peak_bound_time_component_s,
         "total_pim_mem_time_component_s": total_pim_mem_time_component_s,
         "total_compute_time_component_s": total_compute_time_component_s,
         "total_cpu_materialize_time_component_s": total_cpu_materialize_time_component_s,
@@ -1186,10 +1328,12 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
     pim_speedup_vs_cpu_by_stage_by_template = config["pim_speedup_vs_cpu_by_stage_by_template"]
     cpu_stage_unit_compute_Bps_by_template = config["cpu_stage_unit_compute_Bps_by_template"]
     enable_memory_ceiling_by_template = config["enable_memory_ceiling_by_template"]
+    dram_service_defaults = config["dram_service_defaults"]
     cpu_mem_Bps_by_stage_by_template = config["cpu_mem_Bps_by_stage_by_template"]
     pim_mem_Bps_by_stage_by_template = config["pim_mem_Bps_by_stage_by_template"]
     bytes_touched_factors_by_stage_by_template = config["bytes_touched_factors_by_stage_by_template"]
     cpu_random_access_penalty_by_stage_by_template = config["cpu_random_access_penalty_by_stage_by_template"]
+    cpu_access_pattern_by_stage_by_template = config["cpu_access_pattern_by_stage_by_template"]
     cpu_materialization_by_template = config["cpu_materialization_by_template"]
     stage_overrides = config.get("stage_overrides", {})
     trace_max_tiles_raw = config.get("trace_max_tiles", 512)
@@ -1239,10 +1383,12 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                     pim_speedup_vs_cpu_by_stage_by_template=pim_speedup_vs_cpu_by_stage_by_template,
                     cpu_stage_unit_compute_Bps_by_template=cpu_stage_unit_compute_Bps_by_template,
                     enable_memory_ceiling_by_template=enable_memory_ceiling_by_template,
+                    dram_service_defaults=dram_service_defaults,
                     cpu_mem_Bps_by_stage_by_template=cpu_mem_Bps_by_stage_by_template,
                     pim_mem_Bps_by_stage_by_template=pim_mem_Bps_by_stage_by_template,
                     bytes_touched_factors_by_stage_by_template=bytes_touched_factors_by_stage_by_template,
                     cpu_random_access_penalty_by_stage_by_template=cpu_random_access_penalty_by_stage_by_template,
+                    cpu_access_pattern_by_stage_by_template=cpu_access_pattern_by_stage_by_template,
                     cpu_materialization_by_template=cpu_materialization_by_template,
                     trace_max_tiles=trace_max_tiles,
                 )

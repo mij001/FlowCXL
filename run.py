@@ -40,6 +40,8 @@ BASE_METRICS_COLUMNS = [
     "pipeline_template",
     "memory_ceiling_enabled",
     "total_cpu_mem_time_component_s",
+    "total_cpu_mem_latency_bound_time_component_s",
+    "total_cpu_mem_peak_bound_time_component_s",
     "total_pim_mem_time_component_s",
     "total_compute_time_component_s",
     "total_cpu_materialize_bytes",

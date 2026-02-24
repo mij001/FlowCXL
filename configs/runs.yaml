@@ -74,6 +74,9 @@ enable_memory_ceiling_by_template:
   deepvariant_3stage: false
   tpch_3op: true
 
+dram_service_defaults:
+  cacheline_bytes: 64
+
 cpu_mem_Bps_by_stage_by_template:
   deepvariant_3stage:
     make_examples: 120000000000.0
@@ -131,6 +134,40 @@ cpu_random_access_penalty_by_stage_by_template:
     scan_filter_project: 1.0
     join: 3.0
     groupby_agg: 2.0
+
+cpu_access_pattern_by_stage_by_template:
+  deepvariant_3stage:
+    make_examples:
+      access_pattern: sequential_scan
+      row_hit_rate: 0.90
+      mlp: 32
+      avg_miss_latency_ns: 100.0
+    call_variants:
+      access_pattern: sequential_scan
+      row_hit_rate: 0.90
+      mlp: 32
+      avg_miss_latency_ns: 100.0
+    postprocess_variants:
+      access_pattern: sequential_scan
+      row_hit_rate: 0.90
+      mlp: 32
+      avg_miss_latency_ns: 100.0
+  tpch_3op:
+    scan_filter_project:
+      access_pattern: sequential_scan
+      row_hit_rate: 0.92
+      mlp: 32
+      avg_miss_latency_ns: 95.0
+    join:
+      access_pattern: hash_probe
+      row_hit_rate: 0.18
+      mlp: 8
+      avg_miss_latency_ns: 130.0
+    groupby_agg:
+      access_pattern: groupby_update
+      row_hit_rate: 0.28
+      mlp: 10
+      avg_miss_latency_ns: 125.0
 
 cpu_materialization_by_template:
   deepvariant_3stage:

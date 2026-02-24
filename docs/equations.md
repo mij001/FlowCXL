@@ -165,10 +165,35 @@ If memory ceiling is enabled for the template, stage memory bandwidth is shared 
 BW_{mem,unit}(s) = \frac{BW_{mem,stage}(s)}{U_s}
 \]
 
-For CPU stages, a stage-specific random-access penalty `p_{cpu}(s) >= 1` is applied:
+For CPU stages, access-pattern DRAM-service modeling is used:
+
+- `a_s`: access pattern in `{sequential_scan, hash_probe, hash_build, groupby_update}`
+- `h_s`: row-hit proxy in `[0,1]`
+- `m_s`: memory-level parallelism (MLP), `> 0`
+- `L_s`: average miss latency in ns, `> 0`
+- `CL`: cacheline bytes
 
 \[
-BW_{cpu,eff}(s) = \frac{BW_{cpu,stage}(s)}{p_{cpu}(s)}
+miss_s = max(10^{-6}, 1-h_s)
+\]
+\[
+BW_{lat}(s) = \frac{m_s \cdot CL}{(L_s \cdot 10^{-9}) \cdot miss_s}
+\]
+
+Pattern service cap:
+
+\[
+BW_{service}(s) =
+\begin{cases}
+BW_{peak}(s), & a_s = sequential\_scan \\
+min(BW_{peak}(s), BW_{lat}(s)), & \text{otherwise}
+\end{cases}
+\]
+
+Legacy stage penalty multiplier `p_{cpu}(s) >= 1` is then applied:
+
+\[
+BW_{cpu,eff}(s) = \frac{BW_{service}(s)}{p_{cpu}(s)}
 \]
 
 \[

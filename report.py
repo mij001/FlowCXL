@@ -82,6 +82,8 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
         "cpu_materialize_energy_J",
         "total_compute_time_component_s",
         "total_cpu_mem_time_component_s",
+        "total_cpu_mem_latency_bound_time_component_s",
+        "total_cpu_mem_peak_bound_time_component_s",
         "total_pim_mem_time_component_s",
         "total_cpu_materialize_time_component_s",
         "lb_compute_stage_max_s",
@@ -132,6 +134,8 @@ def _memory_ceiling_diagnostic_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
         "memory_ceiling_enabled",
         "total_compute_time_component_s",
         "total_cpu_mem_time_component_s",
+        "total_cpu_mem_latency_bound_time_component_s",
+        "total_cpu_mem_peak_bound_time_component_s",
         "total_pim_mem_time_component_s",
         "total_cpu_materialize_time_component_s",
         "total_cpu_materialize_bytes",
@@ -310,6 +314,7 @@ def main() -> None:
         "- True host bounce for inter-PIM transfer: D2H -> HOST_TOUCH -> H2D(stage)\n"
         "- Split host H2D resources: ingress vs inter-stage staging\n"
         "- Directional host-link modeling: separate host_h2d_link and host_d2h_link ceilings\n"
+        "- Access-pattern DRAM-service CPU model for TPC-H memory components\n"
         "- Absolute makespan (seconds) and total energy (joules)\n"
         "- Lower-bound bottleneck diagnostics by resource family\n\n"
         "## Directional Check\n"

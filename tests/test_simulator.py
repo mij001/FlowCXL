@@ -1,4 +1,4 @@
-"""Checks for directional host links, CPU penalties, and CPU materialization modeling."""
+"""Checks for directional links, access-pattern DRAM service, and materialization modeling."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import unittest
 import yaml
 
 import sources
-from simulator import generate_runs_from_config, scale_boundaries_exact
+from simulator import compute_cpu_effective_mem_bw, generate_runs_from_config, scale_boundaries_exact
 
 
 class SimulatorChecks(unittest.TestCase):
@@ -56,6 +56,29 @@ class SimulatorChecks(unittest.TestCase):
             sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
         ]
 
+    def _compute_traces(
+        self,
+        run_id: str,
+        stage_name: str,
+        stage_device: str = sources.DEVICE_CPU,
+    ) -> list[dict]:
+        return [
+            row
+            for row in self.traces
+            if row["run_id"] == run_id
+            and row["op_type"] == "COMPUTE"
+            and row["stage_name"] == stage_name
+            and row["stage_device"] == stage_device
+        ]
+
+    def test_access_pattern_schema_validation_tpch(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["cpu_access_pattern_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["join"].pop(
+            "mlp", None
+        )
+        with self.assertRaises((KeyError, ValueError)):
+            generate_runs_from_config(cfg)
+
     def test_directional_host_links_are_required_for_new_schema(self) -> None:
         cfg = copy.deepcopy(self.config)
         link_profile = dict(cfg["link_profile"])
@@ -83,7 +106,56 @@ class SimulatorChecks(unittest.TestCase):
         self.assertTrue(all(r["link_type"] == h2d_link for r in ingress_or_stage))
         self.assertTrue(all(r["link_type"] == d2h_link for r in d2h))
 
-    def test_tpch_cpu_random_access_penalty_applies_join_groupby(self) -> None:
+    def test_cpu_bw_eff_sequential_uses_peak_cap(self) -> None:
+        stage_cfg = self.config["cpu_access_pattern_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
+            "scan_filter_project"
+        ]
+        bw = compute_cpu_effective_mem_bw(
+            stage_name="scan_filter_project",
+            cpu_units=32,
+            bw_peak_Bps=120_000_000_000.0,
+            access_pattern=stage_cfg["access_pattern"],
+            row_hit_rate=float(stage_cfg["row_hit_rate"]),
+            mlp=float(stage_cfg["mlp"]),
+            avg_miss_latency_ns=float(stage_cfg["avg_miss_latency_ns"]),
+            cacheline_bytes=float(self.config["dram_service_defaults"]["cacheline_bytes"]),
+            cpu_random_access_penalty=1.0,
+        )
+        self.assertEqual(str(bw["cpu_mem_bound_mode"]), "peak_streaming")
+        self.assertAlmostEqual(float(bw["cpu_bw_eff_stage_Bps"]), 120_000_000_000.0)
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        cpu_row = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
+        scan_compute_rows = self._compute_traces(run_id=cpu_row["run_id"], stage_name="scan_filter_project")
+        self.assertTrue(scan_compute_rows)
+        self.assertTrue(all(row["cpu_mem_bound_mode"] == "peak_streaming" for row in scan_compute_rows))
+
+    def test_cpu_bw_eff_hash_can_be_latency_limited(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        cpu_row = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
+        join_compute_rows = self._compute_traces(run_id=cpu_row["run_id"], stage_name="join")
+        groupby_compute_rows = self._compute_traces(run_id=cpu_row["run_id"], stage_name="groupby_agg")
+        self.assertTrue(join_compute_rows)
+        self.assertTrue(groupby_compute_rows)
+        self.assertTrue(any(row["cpu_mem_bound_mode"] == "latency_limited" for row in join_compute_rows))
+        self.assertTrue(any(row["cpu_mem_bound_mode"] == "latency_limited" for row in groupby_compute_rows))
+
+    def test_row_hit_and_mlp_monotonicity(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        baseline = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
+        baseline_makespan = float(baseline["makespan_s"])
+
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [profile]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
+        access_cfg = cfg["cpu_access_pattern_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["join"]
+        access_cfg["row_hit_rate"] = min(0.99, float(access_cfg["row_hit_rate"]) + 0.20)
+        access_cfg["mlp"] = float(access_cfg["mlp"]) * 2.0
+        improved_metrics, _ = generate_runs_from_config(cfg)
+        improved_row = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0, metrics=improved_metrics)
+        self.assertLessEqual(float(improved_row["makespan_s"]), baseline_makespan)
+
+    def test_legacy_penalty_still_applies_as_multiplier(self) -> None:
         profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
         baseline = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
         baseline_makespan = float(baseline["makespan_s"])
@@ -102,7 +174,7 @@ class SimulatorChecks(unittest.TestCase):
         )
         self.assertGreater(baseline_makespan, float(no_penalty_row["makespan_s"]))
 
-    def test_materialize_ops_present_only_tpch_cpu_only(self) -> None:
+    def test_materialize_ops_unchanged_tpch_cpu_only(self) -> None:
         for profile in self._tpch_profiles():
             for scenario in self.config["scenarios"]:
                 row = self._find_row(profile, scenario, 1.0)
@@ -200,10 +272,18 @@ class SimulatorChecks(unittest.TestCase):
             "total_cpu_materialize_bytes",
             "total_cpu_materialize_time_component_s",
             "cpu_materialize_energy_J",
+            "total_cpu_mem_latency_bound_time_component_s",
+            "total_cpu_mem_peak_bound_time_component_s",
         ]:
             self.assertIn(key, row)
         for forbidden in ["queue_wait_s", "utilization", "speedup_vs_cpu_only"]:
             self.assertNotIn(forbidden, row)
+
+    def test_directional_links_unchanged_with_access_model(self) -> None:
+        self.test_directional_link_routing_uses_h2d_vs_d2h_paths()
+
+    def test_metrics_schema_includes_cpu_dram_service_columns(self) -> None:
+        self.test_metrics_schema_includes_materialize_columns()
 
     def test_deepvariant_path_unchanged_by_default_for_new_knobs(self) -> None:
         cfg = copy.deepcopy(self.config)
@@ -217,6 +297,8 @@ class SimulatorChecks(unittest.TestCase):
             self.assertEqual(int(row["total_cpu_materialize_bytes"]), 0)
             self.assertEqual(float(row["total_cpu_materialize_time_component_s"]), 0.0)
             self.assertEqual(float(row["cpu_materialize_energy_J"]), 0.0)
+            self.assertEqual(float(row["total_cpu_mem_latency_bound_time_component_s"]), 0.0)
+            self.assertEqual(float(row["total_cpu_mem_peak_bound_time_component_s"]), 0.0)
         self.assertFalse(any(t["op_type"] == "MATERIALIZE" for t in traces))
 
     def test_legacy_host_link_compatibility_path(self) -> None:

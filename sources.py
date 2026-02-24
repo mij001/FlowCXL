@@ -22,6 +22,18 @@ SCENARIOS = (
 DEVICE_CPU = "cpu"
 DEVICE_PIM = "pim"
 
+ACCESS_PATTERN_SEQUENTIAL_SCAN = "sequential_scan"
+ACCESS_PATTERN_HASH_PROBE = "hash_probe"
+ACCESS_PATTERN_HASH_BUILD = "hash_build"
+ACCESS_PATTERN_GROUPBY_UPDATE = "groupby_update"
+
+ACCESS_PATTERNS = (
+    ACCESS_PATTERN_SEQUENTIAL_SCAN,
+    ACCESS_PATTERN_HASH_PROBE,
+    ACCESS_PATTERN_HASH_BUILD,
+    ACCESS_PATTERN_GROUPBY_UPDATE,
+)
+
 PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE = "deepvariant_3stage"
 PIPELINE_TEMPLATE_TPCH_3OP = "tpch_3op"
 
@@ -386,6 +398,12 @@ CITED_VALUES = {
         "quote": "Operator placement is sensitive to host-device transfer overhead.",
         "how_used": "Supports memory/transfer bottleneck framing for OLAP stage modeling.",
     },
+    "HASH_RANDOM_ACCESS_MEMORY_CONTEXT": {
+        "value": "qualitative",
+        "url": "https://spacefrontiers.org/r/10.14778/2732951.2732959",
+        "quote": "Hash-intensive operators are sensitive to memory access behavior and locality.",
+        "how_used": "Supports latency-limited memory-service modeling for hash probe/build and groupby updates.",
+    },
     "UPMEM_SCAN_CONTEXT": {
         "value": "qualitative",
         "url": "https://link.springer.com/article/10.1007/s11227-024-06378-8",
@@ -415,6 +433,12 @@ CITED_VALUES = {
         "url": "https://arxiv.org/abs/2303.07591",
         "quote": "Join design and evaluation target real UPMEM DIMM constraints.",
         "how_used": "Context for join-stage PIM acceleration assumptions.",
+    },
+    "UPMEM_DPU_OLAP_CONTEXT": {
+        "value": "qualitative",
+        "url": "https://github.com/upmem/dpu_olap",
+        "quote": "Public OLAP-oriented PIM kernels demonstrate in-memory operator implementations.",
+        "how_used": "Context for stage-level PIM operator capability assumptions in TPC-H modeling.",
     },
 }
 
