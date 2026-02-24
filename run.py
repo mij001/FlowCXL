@@ -52,6 +52,13 @@ BASE_METRICS_COLUMNS = [
     "total_cpu_mem_queue_delay_component_s",
     "total_pim_mem_service_time_component_s",
     "total_pim_mem_queue_delay_component_s",
+    "total_bytes_pim_retained",
+    "total_retain_fallback_bytes",
+    "total_retain_handoff_time_component_s",
+    "cxl_direct_stream_slots",
+    "cxl_active_direct_endpoints",
+    "cxl_effective_striping_factor",
+    "total_cxl_dma_issue_time_component_s",
 ]
 TRACE_YAML_MAX_EVENTS = 2000
 

@@ -97,6 +97,8 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
         "total_pim_mem_service_time_component_s",
         "total_pim_mem_queue_delay_component_s",
         "total_cpu_materialize_time_component_s",
+        "total_retain_handoff_time_component_s",
+        "total_cxl_dma_issue_time_component_s",
         "lb_compute_stage_max_s",
         "lb_host_h2d_ingress_s",
         "lb_host_h2d_stage_s",
@@ -104,6 +106,11 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
         "lb_host_link_s",
         "lb_host_touch_s",
         "lb_cxl_direct_s",
+        "total_bytes_pim_retained",
+        "total_retain_fallback_bytes",
+        "cxl_direct_stream_slots",
+        "cxl_active_direct_endpoints",
+        "cxl_effective_striping_factor",
     ]:
         if col in out:
             out[col] = out[col].map(lambda value: f"{float(value):.6f}")
@@ -131,6 +138,13 @@ def _dataset_diagnostic_table(metrics_df: pd.DataFrame, dataset_profile: str) ->
         "lb_host_link_s",
         "lb_host_touch_s",
         "lb_cxl_direct_s",
+        "total_bytes_pim_retained",
+        "total_retain_fallback_bytes",
+        "total_retain_handoff_time_component_s",
+        "cxl_direct_stream_slots",
+        "cxl_active_direct_endpoints",
+        "cxl_effective_striping_factor",
+        "total_cxl_dma_issue_time_component_s",
     ]
     subset = subset[cols]
     return _format_metric_fields(subset)
@@ -158,9 +172,44 @@ def _memory_ceiling_diagnostic_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
         "total_cpu_materialize_time_component_s",
         "total_cpu_materialize_bytes",
         "cpu_materialize_energy_J",
+        "total_bytes_pim_retained",
+        "total_retain_fallback_bytes",
+        "total_retain_handoff_time_component_s",
+        "cxl_direct_stream_slots",
+        "cxl_active_direct_endpoints",
+        "cxl_effective_striping_factor",
+        "total_cxl_dma_issue_time_component_s",
     ]
     subset = subset[cols]
     return _format_metric_fields(subset)
+
+
+def _direct_path_narrative(metrics_df: pd.DataFrame) -> str:
+    lines: List[str] = []
+    subset = metrics_df[metrics_df["stage_size_multiplier"] == 1.0].copy()
+    if subset.empty:
+        return "- No 1x rows available for direct-path diagnostics."
+    for dataset_profile in sorted(subset["dataset_profile"].dropna().unique()):
+        prof = subset[subset["dataset_profile"] == dataset_profile]
+        if prof.empty:
+            continue
+        bounce = prof[prof["scenario"] == sources.SCENARIO_PIM_HOST_BOUNCE]
+        direct = prof[prof["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        if bounce.empty or direct.empty:
+            continue
+        b = bounce.iloc[0]
+        d = direct.iloc[0]
+        retained = float(d.get("total_bytes_pim_retained", 0.0))
+        fallback = float(d.get("total_retain_fallback_bytes", 0.0))
+        striping = float(d.get("cxl_effective_striping_factor", 1.0))
+        issue_s = float(d.get("total_cxl_dma_issue_time_component_s", 0.0))
+        lines.append(
+            f"- {dataset_profile}: direct retained-bytes `{retained:.0f}`, retain-fallback-bytes `{fallback:.0f}`, "
+            f"effective striping `{striping:.2f}`, direct DMA-issue time `{issue_s:.6f}s`."
+        )
+    if not lines:
+        return "- No bounce/direct pairs available for direct-path diagnostics."
+    return "\n".join(lines)
 
 
 def _directional_narrative(metrics_df: pd.DataFrame) -> str:
@@ -364,6 +413,8 @@ def main() -> None:
         "## High-Intermediate Regime Check\n"
         "- Regime-based CPU comparison replaces brittle all-point CPU assertions.\n"
         f"{_tpch_cpu_direct_regime_narrative(metrics_df)}\n\n"
+        "## Direct-Path Diagnostics (1x)\n"
+        f"{_direct_path_narrative(metrics_df)}\n\n"
         "## Memory-System Diagnostics (1x)\n"
         f"{_build_markdown_table(memory_diag_table)}\n\n"
         "## Plot Artifacts\n"

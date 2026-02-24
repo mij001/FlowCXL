@@ -180,6 +180,205 @@ class SimulatorChecks(unittest.TestCase):
         self.assertTrue(all(r["link_type"] == h2d_link for r in h2d_rows))
         self.assertTrue(all(r["link_type"] == d2h_link for r in d2h_rows))
 
+    def test_default_endpoint_policy_colocate_derivation(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["default_pim_endpoint_policy"] = "colocate"
+        cfg["pim_retention"]["pim_retention_capacity_bytes"] = 10**15
+        cfg.pop("scenario_stage_endpoint_map_by_template", None)
+        metrics, traces = generate_runs_from_config(cfg)
+        row = metrics[0]
+        self.assertGreater(float(row["total_bytes_pim_retained"]), 0.0)
+        self.assertEqual(float(row["total_retain_fallback_bytes"]), 0.0)
+        handoff_rows = [t for t in traces if str(t.get("handoff_mode", ""))]
+        self.assertTrue(handoff_rows)
+        self.assertTrue(all(t["handoff_mode"] == "retain" for t in handoff_rows))
+        self.assertTrue(all(t["stage_src_endpoint"] == "pim0" for t in handoff_rows))
+        self.assertTrue(all(t["stage_dst_endpoint"] == "pim0" for t in handoff_rows))
+
+    def test_default_endpoint_policy_spread_derivation(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["default_pim_endpoint_policy"] = "spread"
+        cfg.pop("scenario_stage_endpoint_map_by_template", None)
+        metrics, traces = generate_runs_from_config(cfg)
+        row = metrics[0]
+        self.assertEqual(float(row["total_bytes_pim_retained"]), 0.0)
+        handoff_rows = [t for t in traces if str(t.get("handoff_mode", ""))]
+        self.assertTrue(handoff_rows)
+        self.assertTrue(all(t["handoff_mode"] == "transfer_direct" for t in handoff_rows))
+        self.assertTrue(any(t["stage_src_endpoint"] != t["stage_dst_endpoint"] for t in handoff_rows))
+
+    def test_retention_not_triggered_when_endpoints_spread(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        direct = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0)
+        self.assertEqual(float(direct["total_bytes_pim_retained"]), 0.0)
+        self.assertGreater(float(direct["total_bytes_cxl_direct"]), 0.0)
+        run_id = direct["run_id"]
+        handoff_rows = [t for t in self.traces if t["run_id"] == run_id and str(t.get("handoff_mode", ""))]
+        self.assertTrue(handoff_rows)
+        self.assertFalse(any(t["handoff_mode"] == "retain" for t in handoff_rows))
+
+    def test_retain_only_on_pim_same_endpoint_transition(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT, sources.SCENARIO_CPU_ONLY]
+        cfg["pim_retention"]["pim_retention_capacity_bytes"] = 10**15
+        cfg["scenario_stage_endpoint_map_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
+            sources.SCENARIO_PIM_FLOWCXL_DIRECT
+        ] = ["pim0", "pim0", "pim0"]
+        metrics, traces = generate_runs_from_config(cfg)
+
+        direct = next(row for row in metrics if row["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT)
+        cpu = next(row for row in metrics if row["scenario"] == sources.SCENARIO_CPU_ONLY)
+        self.assertGreater(float(direct["total_bytes_pim_retained"]), 0.0)
+        self.assertEqual(float(cpu["total_bytes_pim_retained"]), 0.0)
+        direct_handoff_rows = [t for t in traces if t["run_id"] == direct["run_id"] and str(t.get("handoff_mode", ""))]
+        self.assertTrue(direct_handoff_rows)
+        self.assertTrue(all(t["handoff_mode"] == "retain" for t in direct_handoff_rows))
+        cpu_handoff_rows = [t for t in traces if t["run_id"] == cpu["run_id"] and str(t.get("handoff_mode", ""))]
+        self.assertFalse(cpu_handoff_rows)
+
+    def test_retention_capacity_limit_falls_back_to_transfer(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["scenario_stage_endpoint_map_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
+            sources.SCENARIO_PIM_FLOWCXL_DIRECT
+        ] = ["pim0", "pim0", "pim0"]
+        cfg["pim_retention"]["pim_retention_capacity_bytes"] = 1024
+        metrics, traces = generate_runs_from_config(cfg)
+        row = metrics[0]
+        self.assertEqual(float(row["total_bytes_pim_retained"]), 0.0)
+        self.assertGreater(float(row["total_retain_fallback_bytes"]), 0.0)
+        self.assertGreater(float(row["total_bytes_cxl_direct"]), 0.0)
+        handoff_rows = [t for t in traces if str(t.get("handoff_mode", ""))]
+        self.assertTrue(any(bool(t["retention_capacity_blocked"]) for t in handoff_rows))
+        self.assertTrue(all(t["handoff_mode"] == "transfer_direct" for t in handoff_rows))
+
+    def test_cxl_vc_does_not_hard_partition_bandwidth(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["tile_size_bytes"] = 10**15
+        cfg["max_inflight_tiles"] = 1
+
+        cfg_vc1 = copy.deepcopy(cfg)
+        cfg_vc1["cxl_direct_concurrency"]["virtual_channels_per_channel"] = 1
+        metrics_vc1, _ = generate_runs_from_config(cfg_vc1)
+        makespan_vc1 = float(metrics_vc1[0]["makespan_s"])
+
+        cfg_vc8 = copy.deepcopy(cfg)
+        cfg_vc8["cxl_direct_concurrency"]["virtual_channels_per_channel"] = 8
+        metrics_vc8, _ = generate_runs_from_config(cfg_vc8)
+        makespan_vc8 = float(metrics_vc8[0]["makespan_s"])
+
+        self.assertAlmostEqual(makespan_vc1, makespan_vc8, places=9)
+
+    def test_striping_factor_uses_physical_cap_and_active_direct_endpoints(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["link_profile"]["cxl_direct_link"] = sources.LINK_CXL_SWITCH
+        cfg["cxl_topology"]["enabled"] = True
+        cfg["cxl_topology"]["max_stripes"] = 4
+        cfg["cxl_topology"]["num_physical_links"] = 2
+        cfg["cxl_topology"]["applies_to_links"] = [sources.LINK_CXL_SWITCH]
+        cfg["scenario_stage_endpoint_map_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
+            sources.SCENARIO_PIM_FLOWCXL_DIRECT
+        ] = ["pim0", "pim1", "pim2"]
+        metrics, _ = generate_runs_from_config(cfg)
+        row = metrics[0]
+        self.assertEqual(int(float(row["cxl_active_direct_endpoints"])), 3)
+        self.assertEqual(int(float(row["cxl_effective_striping_factor"])), 2)
+
+    def test_cxl_switch_striping_improves_or_equals_local_under_transfer_bound_case(self) -> None:
+        cfg_local = copy.deepcopy(self.config)
+        cfg_local["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg_local["size_multipliers"] = [1.0]
+        cfg_local["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg_local["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["enabled"] = False
+        for stage in sources.TPCH_STAGE_NAMES:
+            cfg_local["cpu_stage_unit_compute_Bps_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][stage] = 1.0e12
+        cfg_local["link_profile"]["host_h2d_link"] = sources.LINK_PCIE_GEN4_X16
+        cfg_local["link_profile"]["host_d2h_link"] = sources.LINK_PCIE_GEN4_X16
+        cfg_local["link_profile"]["cxl_direct_link"] = sources.LINK_CXL_LOCAL
+        local_metrics, _ = generate_runs_from_config(cfg_local)
+        local_makespan = float(local_metrics[0]["makespan_s"])
+
+        cfg_switch = copy.deepcopy(cfg_local)
+        cfg_switch["link_profile"]["cxl_direct_link"] = sources.LINK_CXL_SWITCH
+        cfg_switch["cxl_topology"]["enabled"] = True
+        cfg_switch["cxl_topology"]["max_stripes"] = 4
+        cfg_switch["cxl_topology"]["num_physical_links"] = 4
+        cfg_switch["cxl_topology"]["applies_to_links"] = [sources.LINK_CXL_SWITCH]
+        cfg_switch["scenario_stage_endpoint_map_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
+            sources.SCENARIO_PIM_FLOWCXL_DIRECT
+        ] = ["pim0", "pim1", "pim2"]
+        switch_metrics, _ = generate_runs_from_config(cfg_switch)
+        switch_makespan = float(switch_metrics[0]["makespan_s"])
+
+        self.assertLessEqual(switch_makespan, local_makespan)
+
+    def test_compute_dominated_profile_direct_concurrency_no_effect(self) -> None:
+        cfg_slow = copy.deepcopy(self.config)
+        cfg_slow["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg_slow["size_multipliers"] = [1.0]
+        cfg_slow["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg_slow["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["enabled"] = False
+        for stage in sources.TPCH_STAGE_NAMES:
+            cfg_slow["cpu_stage_unit_compute_Bps_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][stage] = 1.0e7
+        cfg_slow["cxl_direct_concurrency"]["virtual_channels_per_channel"] = 1
+        cfg_slow["cxl_direct_concurrency"]["dma_outstanding_per_vc"] = 1
+        cfg_slow["resource_capacity"]["cxl_direct_channels"] = 1
+        slow_metrics, _ = generate_runs_from_config(cfg_slow)
+        slow_makespan = float(slow_metrics[0]["makespan_s"])
+
+        cfg_fast = copy.deepcopy(cfg_slow)
+        cfg_fast["cxl_direct_concurrency"]["virtual_channels_per_channel"] = 8
+        cfg_fast["cxl_direct_concurrency"]["dma_outstanding_per_vc"] = 64
+        cfg_fast["resource_capacity"]["cxl_direct_channels"] = 4
+        fast_metrics, _ = generate_runs_from_config(cfg_fast)
+        fast_makespan = float(fast_metrics[0]["makespan_s"])
+
+        relative_delta = abs(fast_makespan - slow_makespan) / max(slow_makespan, 1e-12)
+        self.assertLessEqual(relative_delta, 1e-2)
+
+    def test_new_metrics_and_trace_fields_exist_append_only(self) -> None:
+        row = self.metrics[0]
+        for key in [
+            "total_bytes_pim_retained",
+            "total_retain_fallback_bytes",
+            "total_retain_handoff_time_component_s",
+            "cxl_direct_stream_slots",
+            "cxl_active_direct_endpoints",
+            "cxl_effective_striping_factor",
+            "total_cxl_dma_issue_time_component_s",
+        ]:
+            self.assertIn(key, row)
+
+        self.assertTrue(self.traces)
+        trace_row = self.traces[0]
+        for key in [
+            "stage_src_endpoint",
+            "stage_dst_endpoint",
+            "handoff_mode",
+            "retention_capacity_blocked",
+            "cxl_active_streams",
+            "cxl_bw_share_Bps",
+            "cxl_issue_overhead_s",
+            "cxl_striping_factor",
+        ]:
+            self.assertIn(key, trace_row)
+
     def test_direct_not_slower_than_bounce_all_tpch_points(self) -> None:
         for profile in self._tpch_profiles():
             for multiplier in self.config["size_multipliers"]:

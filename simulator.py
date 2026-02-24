@@ -72,6 +72,37 @@ class TileOperation:
     stage_id: int
     boundary_index: int
     transfer_path: str = ""
+    src_stage_id: int = 0
+    dst_stage_id: int = 0
+
+
+@dataclass(frozen=True)
+class PIMRetentionConfig:
+    enabled: bool
+    applies_to_scenarios: Tuple[str, ...]
+    same_endpoint_short_circuit: bool
+    retain_fixed_s: float
+    retain_metadata_bytes: int
+    retain_local_BW_Bps: float
+    pim_retention_capacity_bytes: int
+    overflow_policy: str
+
+
+@dataclass(frozen=True)
+class CXLDirectConcurrencyConfig:
+    virtual_channels_per_channel: int
+    dma_outstanding_per_vc: int
+    full_bw_outstanding_threshold: int
+    dma_issue_fixed_s: float
+
+
+@dataclass(frozen=True)
+class CXLTopologyConfig:
+    enabled: bool
+    mode: str
+    max_stripes: int
+    num_physical_links: int
+    applies_to_links: Tuple[str, ...]
 
 
 @dataclass
@@ -273,6 +304,20 @@ def materialize_duration_s(bytes_moved: int, materialize_Bps: float, fixed_s: fl
     return fixed_s + (bytes_moved / materialize_Bps)
 
 
+def retain_duration_s(retain_fixed_s: float, retain_metadata_bytes: int, retain_local_BW_Bps: float) -> float:
+    if retain_fixed_s < 0:
+        raise ValueError("retain_fixed_s must be >= 0")
+    if retain_metadata_bytes < 0:
+        raise ValueError("retain_metadata_bytes must be >= 0")
+    if retain_local_BW_Bps <= 0:
+        raise ValueError("retain_local_BW_Bps must be > 0")
+    return retain_fixed_s + (float(retain_metadata_bytes) / retain_local_BW_Bps)
+
+
+def _active_slots_at_time(pool: ResourcePool, t_point: float) -> int:
+    return sum(1 for free_t in pool.next_free_time_by_slot if free_t > t_point)
+
+
 def _resolve_host_link_names(link_profile: Mapping[str, object]) -> Tuple[str, str]:
     if "host_h2d_link" in link_profile or "host_d2h_link" in link_profile:
         if "host_h2d_link" not in link_profile or "host_d2h_link" not in link_profile:
@@ -286,6 +331,19 @@ def _resolve_host_link_names(link_profile: Mapping[str, object]) -> Tuple[str, s
     raise KeyError(
         "link_profile must include host_h2d_link+host_d2h_link or legacy host_link"
     )
+
+
+def _template_to_stage_names_from_config(config: Mapping[str, object]) -> Dict[str, List[str]]:
+    dataset_profiles = config["dataset_profiles"]
+    template_to_stage_names: Dict[str, List[str]] = {}
+    for dataset_profile in dataset_profiles:
+        profile = sources.DATASET_PROFILES[dataset_profile]
+        stage_names = _profile_stage_names(profile)
+        template = _profile_template(profile)
+        if template in template_to_stage_names and template_to_stage_names[template] != stage_names:
+            raise ValueError(f"inconsistent stage_names for template {template}")
+        template_to_stage_names[template] = stage_names
+    return template_to_stage_names
 
 
 def _coerce_stage_memory_cfg(
@@ -750,6 +808,206 @@ def _compute_stage_memory_service(
     }
 
 
+def _normalize_endpoint_map(
+    *,
+    config: Mapping[str, object],
+    template_to_stage_names: Mapping[str, Sequence[str]],
+    scenarios: Sequence[str],
+    scenario_stage_device_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
+    warn_defaults: bool,
+) -> Tuple[str, Dict[str, Dict[str, List[str]]]]:
+    default_policy = str(config.get("default_pim_endpoint_policy", "colocate"))
+    if default_policy not in {"colocate", "spread"}:
+        raise ValueError("default_pim_endpoint_policy must be one of: colocate, spread")
+
+    derived_map: Dict[str, Dict[str, List[str]]] = {}
+    for template, stage_names in template_to_stage_names.items():
+        derived_map[template] = {}
+        device_map = scenario_stage_device_map_by_template[template]
+        for scenario in scenarios:
+            devices = [str(device).strip().lower() for device in device_map[scenario]]
+            if len(devices) != len(stage_names):
+                raise ValueError(
+                    f"endpoint derivation mismatch for template {template} scenario {scenario}: "
+                    f"{len(devices)} devices vs {len(stage_names)} stages"
+                )
+            endpoints: List[str] = []
+            pim_counter = 0
+            for device in devices:
+                if device == sources.DEVICE_CPU:
+                    endpoints.append("cpu0")
+                elif default_policy == "colocate":
+                    endpoints.append("pim0")
+                else:
+                    endpoints.append(f"pim{pim_counter}")
+                    pim_counter += 1
+            derived_map[template][scenario] = endpoints
+
+    explicit_raw = config.get("scenario_stage_endpoint_map_by_template")
+    if explicit_raw is None:
+        if warn_defaults:
+            warnings.warn(
+                "scenario_stage_endpoint_map_by_template missing; derived from stage-device map and default_pim_endpoint_policy.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return default_policy, derived_map
+    if not isinstance(explicit_raw, Mapping):
+        raise ValueError("scenario_stage_endpoint_map_by_template must be a map")
+
+    merged: Dict[str, Dict[str, List[str]]] = {
+        template: {scenario: list(values) for scenario, values in scenario_map.items()}
+        for template, scenario_map in derived_map.items()
+    }
+    for template, stage_names in template_to_stage_names.items():
+        if template not in explicit_raw:
+            continue
+        template_map = explicit_raw[template]
+        if not isinstance(template_map, Mapping):
+            raise ValueError(f"scenario_stage_endpoint_map_by_template[{template}] must be a map")
+        for scenario in scenarios:
+            if scenario not in template_map:
+                continue
+            endpoints_raw = template_map[scenario]
+            if not isinstance(endpoints_raw, Sequence):
+                raise ValueError(
+                    f"endpoint map for template {template} scenario {scenario} must be a sequence"
+                )
+            endpoints = [str(value).strip() for value in endpoints_raw]
+            if len(endpoints) != len(stage_names):
+                raise ValueError(
+                    f"endpoint map for template {template} scenario {scenario} has {len(endpoints)} entries, "
+                    f"expected {len(stage_names)}"
+                )
+            if any(not endpoint for endpoint in endpoints):
+                raise ValueError(
+                    f"endpoint map for template {template} scenario {scenario} contains empty endpoint id"
+                )
+            merged[template][scenario] = endpoints
+    return default_policy, merged
+
+
+def _normalize_pim_retention_config(config: Mapping[str, object], warn_defaults: bool) -> PIMRetentionConfig:
+    defaults: Dict[str, object] = {
+        "enabled": True,
+        "applies_to_scenarios": [sources.SCENARIO_PIM_FLOWCXL_DIRECT, sources.SCENARIO_PIM_HOST_BOUNCE],
+        "same_endpoint_short_circuit": True,
+        "retain_fixed_s": 3e-7,
+        "retain_metadata_bytes": 4096,
+        "retain_local_BW_Bps": 200e9,
+        "pim_retention_capacity_bytes": 34_359_738_368,
+        "overflow_policy": "fallback_transfer",
+    }
+    raw = config.get("pim_retention")
+    if raw is None:
+        if warn_defaults:
+            warnings.warn("pim_retention missing; using defaults.", UserWarning, stacklevel=2)
+        raw = defaults
+    if not isinstance(raw, Mapping):
+        raise ValueError("pim_retention must be a map")
+    merged = dict(defaults)
+    merged.update(raw)
+    applies = tuple(str(value) for value in merged["applies_to_scenarios"])
+    for scenario in applies:
+        if scenario not in sources.SCENARIOS:
+            raise ValueError(f"pim_retention.applies_to_scenarios has unknown scenario {scenario}")
+    overflow_policy = str(merged["overflow_policy"])
+    if overflow_policy != "fallback_transfer":
+        raise ValueError("pim_retention.overflow_policy must be fallback_transfer")
+    cfg = PIMRetentionConfig(
+        enabled=bool(merged["enabled"]),
+        applies_to_scenarios=applies,
+        same_endpoint_short_circuit=bool(merged["same_endpoint_short_circuit"]),
+        retain_fixed_s=float(merged["retain_fixed_s"]),
+        retain_metadata_bytes=int(merged["retain_metadata_bytes"]),
+        retain_local_BW_Bps=float(merged["retain_local_BW_Bps"]),
+        pim_retention_capacity_bytes=int(merged["pim_retention_capacity_bytes"]),
+        overflow_policy=overflow_policy,
+    )
+    if cfg.retain_fixed_s < 0:
+        raise ValueError("pim_retention.retain_fixed_s must be >= 0")
+    if cfg.retain_metadata_bytes < 0:
+        raise ValueError("pim_retention.retain_metadata_bytes must be >= 0")
+    if cfg.retain_local_BW_Bps <= 0:
+        raise ValueError("pim_retention.retain_local_BW_Bps must be > 0")
+    if cfg.pim_retention_capacity_bytes <= 0:
+        raise ValueError("pim_retention.pim_retention_capacity_bytes must be > 0")
+    return cfg
+
+
+def _normalize_cxl_direct_concurrency_config(
+    config: Mapping[str, object], warn_defaults: bool
+) -> CXLDirectConcurrencyConfig:
+    defaults: Dict[str, object] = {
+        "virtual_channels_per_channel": 4,
+        "dma_outstanding_per_vc": 16,
+        "full_bw_outstanding_threshold": 8,
+        "dma_issue_fixed_s": 2e-7,
+    }
+    raw = config.get("cxl_direct_concurrency")
+    if raw is None:
+        if warn_defaults:
+            warnings.warn("cxl_direct_concurrency missing; using defaults.", UserWarning, stacklevel=2)
+        raw = defaults
+    if not isinstance(raw, Mapping):
+        raise ValueError("cxl_direct_concurrency must be a map")
+    merged = dict(defaults)
+    merged.update(raw)
+    cfg = CXLDirectConcurrencyConfig(
+        virtual_channels_per_channel=int(merged["virtual_channels_per_channel"]),
+        dma_outstanding_per_vc=int(merged["dma_outstanding_per_vc"]),
+        full_bw_outstanding_threshold=int(merged["full_bw_outstanding_threshold"]),
+        dma_issue_fixed_s=float(merged["dma_issue_fixed_s"]),
+    )
+    if cfg.virtual_channels_per_channel <= 0:
+        raise ValueError("cxl_direct_concurrency.virtual_channels_per_channel must be > 0")
+    if cfg.dma_outstanding_per_vc <= 0:
+        raise ValueError("cxl_direct_concurrency.dma_outstanding_per_vc must be > 0")
+    if cfg.full_bw_outstanding_threshold <= 0:
+        raise ValueError("cxl_direct_concurrency.full_bw_outstanding_threshold must be > 0")
+    if cfg.dma_issue_fixed_s < 0:
+        raise ValueError("cxl_direct_concurrency.dma_issue_fixed_s must be >= 0")
+    return cfg
+
+
+def _normalize_cxl_topology_config(config: Mapping[str, object], warn_defaults: bool) -> CXLTopologyConfig:
+    defaults: Dict[str, object] = {
+        "enabled": True,
+        "mode": "dynamic_striping",
+        "max_stripes": 4,
+        "num_physical_links": 4,
+        "applies_to_links": [sources.LINK_CXL_SWITCH],
+    }
+    raw = config.get("cxl_topology")
+    if raw is None:
+        if warn_defaults:
+            warnings.warn("cxl_topology missing; using defaults.", UserWarning, stacklevel=2)
+        raw = defaults
+    if not isinstance(raw, Mapping):
+        raise ValueError("cxl_topology must be a map")
+    merged = dict(defaults)
+    merged.update(raw)
+    mode = str(merged["mode"])
+    if mode != "dynamic_striping":
+        raise ValueError("cxl_topology.mode must be dynamic_striping")
+    applies_to_links = tuple(str(value) for value in merged["applies_to_links"])
+    for link_name in applies_to_links:
+        if link_name not in sources.LINKS:
+            raise ValueError(f"cxl_topology.applies_to_links has unknown link {link_name}")
+    cfg = CXLTopologyConfig(
+        enabled=bool(merged["enabled"]),
+        mode=mode,
+        max_stripes=int(merged["max_stripes"]),
+        num_physical_links=int(merged["num_physical_links"]),
+        applies_to_links=applies_to_links,
+    )
+    if cfg.max_stripes <= 0:
+        raise ValueError("cxl_topology.max_stripes must be > 0")
+    if cfg.num_physical_links <= 0:
+        raise ValueError("cxl_topology.num_physical_links must be > 0")
+    return cfg
+
+
 def _stage_overrides_for_dataset(
     stage_overrides: Dict[str, Dict[object, Dict[str, object]]], dataset_profile: str
 ) -> Dict[object, Dict[str, object]]:
@@ -790,6 +1048,23 @@ def _stage_device_map_for_scenario(
     if invalid:
         raise ValueError(f"invalid stage devices for scenario {scenario}: {invalid}")
     return stage_devices
+
+
+def _stage_endpoint_map_for_scenario(
+    scenario_stage_endpoint_map: Mapping[str, Sequence[str]],
+    scenario: str,
+    num_stages: int,
+) -> List[str]:
+    if scenario not in scenario_stage_endpoint_map:
+        raise KeyError(f"scenario_stage_endpoint_map missing scenario: {scenario}")
+    endpoints = [str(endpoint).strip() for endpoint in scenario_stage_endpoint_map[scenario]]
+    if len(endpoints) != num_stages:
+        raise ValueError(
+            f"scenario {scenario} has {len(endpoints)} stage endpoints, expected {num_stages}"
+        )
+    if any(not endpoint for endpoint in endpoints):
+        raise ValueError(f"scenario {scenario} has empty endpoint ids")
+    return endpoints
 
 
 def _derive_compute_rates_for_stages(
@@ -935,10 +1210,13 @@ def _build_stage_configs(
 def _build_tile_operations(
     scenario: str,
     stage_devices: Sequence[str],
+    stage_endpoints: Sequence[str],
     materialization_policy: MaterializationPolicyConfig,
     baseline_engine: str,
 ) -> List[TileOperation]:
     num_stages = len(stage_devices)
+    if len(stage_endpoints) != num_stages:
+        raise ValueError("stage_endpoints length must match stage_devices length")
     operations: List[TileOperation] = []
     materialization_scenarios = set(materialization_policy.scenarios)
     breaker_boundaries = set(materialization_policy.boundaries_by_engine.get(baseline_engine, []))
@@ -993,44 +1271,20 @@ def _build_tile_operations(
             )
             continue
         if src == sources.DEVICE_PIM and dst == sources.DEVICE_PIM:
-            if scenario == sources.SCENARIO_PIM_HOST_BOUNCE:
-                operations.append(
-                    TileOperation(
-                        op_type="TRANSFER",
-                        stage_id=stage_id,
-                        boundary_index=boundary_index,
-                        transfer_path="host_d2h",
-                    )
-                )
-                operations.append(
-                    TileOperation(
-                        op_type="HOST_TOUCH",
-                        stage_id=stage_id,
-                        boundary_index=boundary_index,
-                        transfer_path="host_touch",
-                    )
-                )
-                operations.append(
-                    TileOperation(
-                        op_type="TRANSFER",
-                        stage_id=stage_id + 1,
-                        boundary_index=boundary_index,
-                        transfer_path="host_h2d_stage",
-                    )
-                )
-            elif scenario == sources.SCENARIO_PIM_FLOWCXL_DIRECT:
-                operations.append(
-                    TileOperation(
-                        op_type="TRANSFER",
-                        stage_id=stage_id,
-                        boundary_index=boundary_index,
-                        transfer_path="cxl_direct",
-                    )
-                )
-            else:
+            if scenario not in {sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT}:
                 raise ValueError(
                     f"scenario {scenario} cannot route PIM->PIM transition at stage {stage_id}->{stage_id + 1}"
                 )
+            operations.append(
+                TileOperation(
+                    op_type="PIM_HANDOFF",
+                    stage_id=stage_id,
+                    boundary_index=boundary_index,
+                    transfer_path="pim_handoff",
+                    src_stage_id=stage_id,
+                    dst_stage_id=stage_id + 1,
+                )
+            )
             continue
         raise ValueError(f"unknown stage-device transition: {src}->{dst}")
 
@@ -1245,6 +1499,17 @@ def _validate_config(
         template_to_stage_names=template_to_stage_names,
     )
 
+    _normalize_endpoint_map(
+        config=config,
+        template_to_stage_names=template_to_stage_names,
+        scenarios=config["scenarios"],
+        scenario_stage_device_map_by_template=scenario_stage_device_map_by_template,
+        warn_defaults=False,
+    )
+    _normalize_pim_retention_config(config=config, warn_defaults=False)
+    _normalize_cxl_direct_concurrency_config(config=config, warn_defaults=False)
+    _normalize_cxl_topology_config(config=config, warn_defaults=False)
+
     if int(config["tile_size_bytes"]) <= 0:
         raise ValueError("tile_size_bytes must be > 0")
     if int(config["max_inflight_tiles"]) <= 0:
@@ -1291,9 +1556,13 @@ def simulate_configuration(
     transfer_power_W: Dict[str, object],
     stage_overrides: Dict[str, Dict[object, Dict[str, object]]],
     scenario_stage_device_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
+    scenario_stage_endpoint_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
     pim_speedup_vs_cpu_by_stage_by_template: Mapping[str, Mapping[str, object]],
     cpu_stage_unit_compute_Bps_by_template: Mapping[str, Mapping[str, object]],
     memory_system_by_template: Mapping[str, Mapping[str, object]],
+    pim_retention: PIMRetentionConfig,
+    cxl_direct_concurrency: CXLDirectConcurrencyConfig,
+    cxl_topology: CXLTopologyConfig,
     bytes_touched_factors_by_stage_by_template: Mapping[str, Mapping[str, Mapping[str, object]]],
     trace_max_tiles: int | None = None,
 ) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
@@ -1313,6 +1582,8 @@ def simulate_configuration(
         )
     if pipeline_template not in scenario_stage_device_map_by_template:
         raise KeyError(f"missing scenario stage map for template {pipeline_template}")
+    if pipeline_template not in scenario_stage_endpoint_map_by_template:
+        raise KeyError(f"missing scenario endpoint map for template {pipeline_template}")
     if pipeline_template not in pim_speedup_vs_cpu_by_stage_by_template:
         raise KeyError(f"missing pim speedup map for template {pipeline_template}")
     if pipeline_template not in cpu_stage_unit_compute_Bps_by_template:
@@ -1324,6 +1595,11 @@ def simulate_configuration(
 
     stage_devices = _stage_device_map_for_scenario(
         scenario_stage_device_map=scenario_stage_device_map_by_template[pipeline_template],
+        scenario=scenario,
+        num_stages=num_stages,
+    )
+    stage_endpoints = _stage_endpoint_map_for_scenario(
+        scenario_stage_endpoint_map=scenario_stage_endpoint_map_by_template[pipeline_template],
         scenario=scenario,
         num_stages=num_stages,
     )
@@ -1350,6 +1626,12 @@ def simulate_configuration(
     )
     bytes_touched_factors_by_stage = bytes_touched_factors_by_stage_by_template[pipeline_template]
     cpu_baseline_engine = cpu_baseline_cfg.baseline_engine
+    cxl_direct_stream_slots = int(resource_capacity["cxl_direct_channels"]) * int(
+        cxl_direct_concurrency.virtual_channels_per_channel
+    )
+    cxl_power_per_stream_slot = float(transfer_power_W["cxl_direct_channel"]) / float(
+        cxl_direct_concurrency.virtual_channels_per_channel
+    )
 
     host_h2d_ingress_pool = ResourcePool(
         name="host_h2d_ingress",
@@ -1368,8 +1650,8 @@ def simulate_configuration(
     )
     cxl_direct_pool = ResourcePool(
         name="cxl_direct",
-        capacity=int(resource_capacity["cxl_direct_channels"]),
-        power_W=float(transfer_power_W["cxl_direct_channel"]),
+        capacity=cxl_direct_stream_slots,
+        power_W=cxl_power_per_stream_slot,
     )
     host_touch_pool = ResourcePool(
         name="host_touch",
@@ -1381,6 +1663,17 @@ def simulate_configuration(
         capacity=int(resource_capacity["cpu_materialize_channels"]),
         power_W=float(transfer_power_W["cpu_materialize_channel"]),
     )
+    active_pim_endpoints = sorted(
+        {
+            stage_endpoints[stage_id - 1]
+            for stage_id in range(1, num_stages + 1)
+            if stage_devices[stage_id - 1] == sources.DEVICE_PIM
+        }
+    )
+    retain_pools: Dict[str, ResourcePool] = {
+        endpoint: ResourcePool(name=f"retain_{endpoint}", capacity=1, power_W=0.0)
+        for endpoint in active_pim_endpoints
+    }
 
     compute_pools: List[ResourcePool] = []
     for stage_id in range(1, num_stages + 1):
@@ -1406,9 +1699,40 @@ def simulate_configuration(
     operations = _build_tile_operations(
         scenario=scenario,
         stage_devices=stage_devices,
+        stage_endpoints=stage_endpoints,
         materialization_policy=cpu_baseline_cfg.materialization_policy,
         baseline_engine=cpu_baseline_engine,
     )
+    active_direct_endpoints: set[str] = set()
+    if scenario == sources.SCENARIO_PIM_FLOWCXL_DIRECT:
+        for operation in operations:
+            if operation.op_type != "PIM_HANDOFF":
+                continue
+            src_id = operation.src_stage_id or operation.stage_id
+            dst_id = operation.dst_stage_id if operation.dst_stage_id > 0 else src_id + 1
+            if dst_id <= 0 or dst_id > num_stages:
+                continue
+            src_endpoint = stage_endpoints[src_id - 1]
+            dst_endpoint = stage_endpoints[dst_id - 1]
+            if src_endpoint != dst_endpoint:
+                active_direct_endpoints.add(src_endpoint)
+                active_direct_endpoints.add(dst_endpoint)
+    active_direct_endpoint_count = len(active_direct_endpoints)
+    cxl_striping_factor = 1
+    cxl_link = sources.LINKS[cxl_direct_link]
+    supports_dynamic_striping = bool(cxl_link.get("supports_dynamic_striping", False))
+    if (
+        cxl_topology.enabled
+        and cxl_topology.mode == "dynamic_striping"
+        and supports_dynamic_striping
+        and cxl_direct_link in cxl_topology.applies_to_links
+    ):
+        endpoint_factor = max(1, active_direct_endpoint_count)
+        cxl_striping_factor = min(
+            cxl_topology.max_stripes,
+            cxl_topology.num_physical_links,
+            endpoint_factor,
+        )
 
     traces: List[Dict[str, object]] = []
     completion_times = [0.0 for _ in range(num_tiles)]
@@ -1425,6 +1749,8 @@ def simulate_configuration(
     total_bytes_host_h2d_ingress = 0
     total_bytes_host_h2d_stage = 0
     total_bytes_host_d2h = 0
+    total_bytes_pim_retained = 0
+    total_retain_fallback_bytes = 0
     total_cpu_materialize_bytes = 0
     total_compute_time_component_s = 0.0
     total_cpu_mem_time_component_s = 0.0
@@ -1436,6 +1762,8 @@ def simulate_configuration(
     total_pim_mem_service_time_component_s = 0.0
     total_pim_mem_queue_delay_component_s = 0.0
     total_cpu_materialize_time_component_s = 0.0
+    total_retain_handoff_time_component_s = 0.0
+    total_cxl_dma_issue_time_component_s = 0.0
 
     while request_heap:
         t_req, tile_id = heapq.heappop(request_heap)
@@ -1465,6 +1793,16 @@ def simulate_configuration(
         mem_rho = 0.0
         mem_service_time_s = 0.0
         mem_queue_delay_s = 0.0
+        stage_src_endpoint = stage_endpoints[operation.stage_id - 1]
+        stage_dst_endpoint = stage_src_endpoint
+        handoff_mode = ""
+        retention_capacity_blocked = False
+        cxl_active_streams = 0
+        cxl_bw_share_Bps = 0.0
+        cxl_issue_overhead_s = 0.0
+        cxl_striping_factor_trace = 1
+
+        event_specs: List[Dict[str, object]] = []
 
         if operation.op_type == "COMPUTE":
             stage_name = stage_names[operation.stage_id - 1]
@@ -1544,9 +1882,17 @@ def simulate_configuration(
                     total_pim_mem_time_component_s += memory_component_s
                     total_pim_mem_service_time_component_s += mem_service_time_s
                     total_pim_mem_queue_delay_component_s += mem_queue_delay_s
-            pool = compute_pools[operation.stage_id - 1]
-            link_used = ""
-            transfer_path = ""
+            event_specs.append(
+                {
+                    "op_type": "COMPUTE",
+                    "stage_id": operation.stage_id,
+                    "pool": compute_pools[operation.stage_id - 1],
+                    "duration_s": duration_s,
+                    "transfer_path": "",
+                    "link_used": "",
+                    "bytes": bytes_moved,
+                }
+            )
         elif operation.op_type == "MATERIALIZE":
             duration_s = materialize_duration_s(
                 bytes_moved=bytes_moved,
@@ -1555,91 +1901,298 @@ def simulate_configuration(
             )
             total_cpu_materialize_bytes += bytes_moved
             total_cpu_materialize_time_component_s += duration_s
-            pool = cpu_materialize_pool
-            link_used = ""
-            transfer_path = operation.transfer_path
+            event_specs.append(
+                {
+                    "op_type": "MATERIALIZE",
+                    "stage_id": operation.stage_id,
+                    "pool": cpu_materialize_pool,
+                    "duration_s": duration_s,
+                    "transfer_path": operation.transfer_path,
+                    "link_used": "",
+                    "bytes": bytes_moved,
+                }
+            )
         elif operation.op_type == "HOST_TOUCH":
             duration_s = host_touch_duration_s(
                 bytes_moved=bytes_moved,
                 touch_Bps=stage_cfg.host_touch_Bps,
                 touch_fixed_s=stage_cfg.host_touch_fixed_s,
             )
-            pool = host_touch_pool
-            link_used = ""
-            transfer_path = operation.transfer_path
             total_bytes_host_touch += bytes_moved
-        else:
-            if operation.transfer_path == "host_h2d_ingress":
-                pool = host_h2d_ingress_pool
-                link_used = host_h2d_link
-                total_bytes_host_link += bytes_moved
-                total_bytes_host_h2d_ingress += bytes_moved
-            elif operation.transfer_path == "host_h2d_stage":
-                pool = host_h2d_stage_pool
-                link_used = host_h2d_link
-                total_bytes_host_link += bytes_moved
-                total_bytes_host_h2d_stage += bytes_moved
-            elif operation.transfer_path == "host_d2h":
-                pool = host_d2h_pool
-                link_used = host_d2h_link
-                total_bytes_host_link += bytes_moved
-                total_bytes_host_d2h += bytes_moved
-            elif operation.transfer_path == "cxl_direct":
-                pool = cxl_direct_pool
-                link_used = cxl_direct_link
-                total_bytes_cxl_direct += bytes_moved
-            else:
-                raise ValueError(f"unknown transfer path: {operation.transfer_path}")
-            transfer_path = operation.transfer_path
-            duration_s = transfer_duration_s(bytes_moved=bytes_moved, link_type=link_used)
-
-        t_start, t_end, wait_s, slot_idx = pool.schedule(t_req=t_req, duration_s=duration_s)
-        if trace_max_tiles is None or tile_id < trace_max_tiles:
-            traces.append(
+            event_specs.append(
                 {
-                    "run_id": run_id,
-                    "dataset_profile": dataset_profile,
-                    "stage_size_multiplier": size_multiplier,
-                    "scenario": scenario,
-                    "pipeline_template": pipeline_template,
-                    "tile_id": tile_id,
-                    "op_index": op_index + 1,
+                    "op_type": "HOST_TOUCH",
                     "stage_id": operation.stage_id,
-                    "stage_name": stage_names[operation.stage_id - 1],
-                    "stage_device": stage_device,
-                    "op_type": operation.op_type,
-                    "transfer_path": transfer_path,
-                    "resource": pool.name,
-                    "resource_slot": slot_idx,
-                    "link_type": link_used,
-                    "bytes": bytes_moved,
-                    "t_req": t_req,
-                    "t_start": t_start,
-                    "t_end": t_end,
+                    "pool": host_touch_pool,
                     "duration_s": duration_s,
-                    "wait_s": wait_s,
-                    "compute_component_s": compute_component_s,
-                    "memory_component_s": memory_component_s,
-                    "bytes_touched": bytes_touched,
-                    "cpu_access_pattern": cpu_access_pattern,
-                    "cpu_row_hit_rate": cpu_row_hit_rate,
-                    "cpu_mlp": cpu_mlp,
-                    "cpu_avg_miss_latency_ns": cpu_avg_miss_latency_ns,
-                    "cpu_bw_peak_Bps": cpu_bw_peak_Bps,
-                    "cpu_bw_latency_Bps": cpu_bw_latency_Bps,
-                    "cpu_bw_eff_stage_Bps": cpu_bw_eff_stage_Bps,
-                    "cpu_bw_eff_per_unit_Bps": cpu_bw_eff_per_unit_Bps,
-                    "cpu_mem_bound_mode": cpu_mem_bound_mode,
-                    "memory_ceiling_enabled": memory_system_enabled,
-                    "memory_system_role": memory_system_role,
-                    "mem_service_Bps": mem_service_Bps,
-                    "mem_queue_multiplier": mem_queue_multiplier,
-                    "mem_rho": mem_rho,
-                    "mem_service_time_s": mem_service_time_s,
-                    "mem_queue_delay_s": mem_queue_delay_s,
-                    "cpu_baseline_engine": cpu_baseline_engine,
+                    "transfer_path": operation.transfer_path,
+                    "link_used": "",
+                    "bytes": bytes_moved,
                 }
             )
+        elif operation.op_type == "PIM_HANDOFF":
+            src_stage_id = operation.src_stage_id if operation.src_stage_id > 0 else operation.stage_id
+            dst_stage_id = operation.dst_stage_id if operation.dst_stage_id > 0 else src_stage_id + 1
+            if src_stage_id <= 0 or src_stage_id > num_stages or dst_stage_id <= 0 or dst_stage_id > num_stages:
+                raise ValueError(f"invalid PIM_HANDOFF stage ids: {src_stage_id}->{dst_stage_id}")
+            src_endpoint = stage_endpoints[src_stage_id - 1]
+            dst_endpoint = stage_endpoints[dst_stage_id - 1]
+            stage_src_endpoint = src_endpoint
+            stage_dst_endpoint = dst_endpoint
+
+            retain_allowed = (
+                pim_retention.enabled
+                and pim_retention.same_endpoint_short_circuit
+                and scenario in pim_retention.applies_to_scenarios
+                and stage_devices[src_stage_id - 1] == sources.DEVICE_PIM
+                and stage_devices[dst_stage_id - 1] == sources.DEVICE_PIM
+                and src_endpoint == dst_endpoint
+            )
+            if retain_allowed:
+                boundary_total_bytes = int(scaled_boundaries[operation.boundary_index])
+                if boundary_total_bytes <= pim_retention.pim_retention_capacity_bytes:
+                    handoff_mode = "retain"
+                    retain_duration = retain_duration_s(
+                        retain_fixed_s=pim_retention.retain_fixed_s,
+                        retain_metadata_bytes=pim_retention.retain_metadata_bytes,
+                        retain_local_BW_Bps=pim_retention.retain_local_BW_Bps,
+                    )
+                    total_bytes_pim_retained += bytes_moved
+                    total_retain_handoff_time_component_s += retain_duration
+                    retain_pool = retain_pools[src_endpoint]
+                    event_specs.append(
+                        {
+                            "op_type": "PIM_HANDOFF",
+                            "stage_id": src_stage_id,
+                            "pool": retain_pool,
+                            "duration_s": retain_duration,
+                            "transfer_path": "retain",
+                            "link_used": "",
+                            "bytes": bytes_moved,
+                        }
+                    )
+                else:
+                    retention_capacity_blocked = True
+                    total_retain_fallback_bytes += bytes_moved
+
+            if not event_specs:
+                if scenario == sources.SCENARIO_PIM_FLOWCXL_DIRECT:
+                    handoff_mode = "transfer_direct"
+                    earliest_slot_free = min(cxl_direct_pool.next_free_time_by_slot)
+                    t_direct_start_snapshot = max(t_req, earliest_slot_free)
+                    active_direct_streams = _active_slots_at_time(cxl_direct_pool, t_direct_start_snapshot)
+                    cxl_active_streams = active_direct_streams + 1
+                    cxl_striping_factor_trace = cxl_striping_factor
+                    total_cxl_bw_Bps = float(cxl_link["bandwidth_Bps"]) * float(cxl_striping_factor_trace)
+                    cxl_bw_share_Bps = total_cxl_bw_Bps / float(max(1, cxl_active_streams))
+                    u_out = min(
+                        1.0,
+                        float(cxl_direct_concurrency.dma_outstanding_per_vc)
+                        / float(cxl_direct_concurrency.full_bw_outstanding_threshold),
+                    )
+                    cxl_issue_overhead_s = cxl_direct_concurrency.dma_issue_fixed_s / max(u_out, 1e-6)
+                    total_cxl_dma_issue_time_component_s += cxl_issue_overhead_s
+                    direct_duration = (
+                        float(cxl_link["latency_s"])
+                        + cxl_issue_overhead_s
+                        + (bytes_moved / cxl_bw_share_Bps)
+                    )
+                    total_bytes_cxl_direct += bytes_moved
+                    event_specs.append(
+                        {
+                            "op_type": "TRANSFER",
+                            "stage_id": src_stage_id,
+                            "pool": cxl_direct_pool,
+                            "duration_s": direct_duration,
+                            "transfer_path": "cxl_direct",
+                            "link_used": cxl_direct_link,
+                            "bytes": bytes_moved,
+                        }
+                    )
+                elif scenario == sources.SCENARIO_PIM_HOST_BOUNCE:
+                    handoff_mode = "transfer_bounce"
+                    d2h_duration = transfer_duration_s(bytes_moved=bytes_moved, link_type=host_d2h_link)
+                    touch_duration = host_touch_duration_s(
+                        bytes_moved=bytes_moved,
+                        touch_Bps=stage_cfg.host_touch_Bps,
+                        touch_fixed_s=stage_cfg.host_touch_fixed_s,
+                    )
+                    h2d_duration = transfer_duration_s(bytes_moved=bytes_moved, link_type=host_h2d_link)
+                    total_bytes_host_link += bytes_moved * 2
+                    total_bytes_host_d2h += bytes_moved
+                    total_bytes_host_h2d_stage += bytes_moved
+                    total_bytes_host_touch += bytes_moved
+                    event_specs.extend(
+                        [
+                            {
+                                "op_type": "TRANSFER",
+                                "stage_id": src_stage_id,
+                                "pool": host_d2h_pool,
+                                "duration_s": d2h_duration,
+                                "transfer_path": "host_d2h",
+                                "link_used": host_d2h_link,
+                                "bytes": bytes_moved,
+                            },
+                            {
+                                "op_type": "HOST_TOUCH",
+                                "stage_id": src_stage_id,
+                                "pool": host_touch_pool,
+                                "duration_s": touch_duration,
+                                "transfer_path": "host_touch",
+                                "link_used": "",
+                                "bytes": bytes_moved,
+                            },
+                            {
+                                "op_type": "TRANSFER",
+                                "stage_id": dst_stage_id,
+                                "pool": host_h2d_stage_pool,
+                                "duration_s": h2d_duration,
+                                "transfer_path": "host_h2d_stage",
+                                "link_used": host_h2d_link,
+                                "bytes": bytes_moved,
+                            },
+                        ]
+                    )
+                else:
+                    raise ValueError(f"PIM_HANDOFF is not valid for scenario {scenario}")
+        else:
+            if operation.transfer_path == "host_h2d_ingress":
+                total_bytes_host_link += bytes_moved
+                total_bytes_host_h2d_ingress += bytes_moved
+                stage_src_endpoint = "host0"
+                stage_dst_endpoint = stage_endpoints[operation.stage_id - 1]
+                event_specs.append(
+                    {
+                        "op_type": "TRANSFER",
+                        "stage_id": operation.stage_id,
+                        "pool": host_h2d_ingress_pool,
+                        "duration_s": transfer_duration_s(bytes_moved=bytes_moved, link_type=host_h2d_link),
+                        "transfer_path": "host_h2d_ingress",
+                        "link_used": host_h2d_link,
+                        "bytes": bytes_moved,
+                    }
+                )
+            elif operation.transfer_path == "host_h2d_stage":
+                total_bytes_host_link += bytes_moved
+                total_bytes_host_h2d_stage += bytes_moved
+                stage_src_endpoint = "host0"
+                stage_dst_endpoint = stage_endpoints[operation.stage_id - 1]
+                event_specs.append(
+                    {
+                        "op_type": "TRANSFER",
+                        "stage_id": operation.stage_id,
+                        "pool": host_h2d_stage_pool,
+                        "duration_s": transfer_duration_s(bytes_moved=bytes_moved, link_type=host_h2d_link),
+                        "transfer_path": "host_h2d_stage",
+                        "link_used": host_h2d_link,
+                        "bytes": bytes_moved,
+                    }
+                )
+            elif operation.transfer_path == "host_d2h":
+                total_bytes_host_link += bytes_moved
+                total_bytes_host_d2h += bytes_moved
+                stage_src_endpoint = stage_endpoints[operation.stage_id - 1]
+                stage_dst_endpoint = "host0"
+                event_specs.append(
+                    {
+                        "op_type": "TRANSFER",
+                        "stage_id": operation.stage_id,
+                        "pool": host_d2h_pool,
+                        "duration_s": transfer_duration_s(bytes_moved=bytes_moved, link_type=host_d2h_link),
+                        "transfer_path": "host_d2h",
+                        "link_used": host_d2h_link,
+                        "bytes": bytes_moved,
+                    }
+                )
+            elif operation.transfer_path == "cxl_direct":
+                total_bytes_cxl_direct += bytes_moved
+                event_specs.append(
+                    {
+                        "op_type": "TRANSFER",
+                        "stage_id": operation.stage_id,
+                        "pool": cxl_direct_pool,
+                        "duration_s": transfer_duration_s(bytes_moved=bytes_moved, link_type=cxl_direct_link),
+                        "transfer_path": "cxl_direct",
+                        "link_used": cxl_direct_link,
+                        "bytes": bytes_moved,
+                    }
+                )
+            else:
+                raise ValueError(f"unknown transfer path: {operation.transfer_path}")
+
+        if not event_specs:
+            raise AssertionError(f"no event generated for op_type={operation.op_type}")
+
+        t_cursor = t_req
+        t_end = t_req
+        for event in event_specs:
+            pool = event["pool"]
+            duration_s = float(event["duration_s"])
+            transfer_path = str(event["transfer_path"])
+            link_used = str(event["link_used"])
+            event_stage_id = int(event["stage_id"])
+            event_stage_device = stage_devices[event_stage_id - 1]
+            event_bytes = int(event["bytes"])
+            event_op_type = str(event["op_type"])
+            event_t_req = t_cursor
+
+            t_start, t_end, wait_s, slot_idx = pool.schedule(t_req=t_cursor, duration_s=duration_s)
+            t_cursor = t_end
+
+            if trace_max_tiles is None or tile_id < trace_max_tiles:
+                traces.append(
+                    {
+                        "run_id": run_id,
+                        "dataset_profile": dataset_profile,
+                        "stage_size_multiplier": size_multiplier,
+                        "scenario": scenario,
+                        "pipeline_template": pipeline_template,
+                        "tile_id": tile_id,
+                        "op_index": op_index + 1,
+                        "stage_id": event_stage_id,
+                        "stage_name": stage_names[event_stage_id - 1],
+                        "stage_device": event_stage_device,
+                        "op_type": event_op_type,
+                        "transfer_path": transfer_path,
+                        "resource": pool.name,
+                        "resource_slot": slot_idx,
+                        "link_type": link_used,
+                        "bytes": event_bytes,
+                        "t_req": event_t_req,
+                        "t_start": t_start,
+                        "t_end": t_end,
+                        "duration_s": duration_s,
+                        "wait_s": wait_s,
+                        "compute_component_s": compute_component_s if event_op_type == "COMPUTE" else 0.0,
+                        "memory_component_s": memory_component_s if event_op_type == "COMPUTE" else 0.0,
+                        "bytes_touched": bytes_touched if event_op_type == "COMPUTE" else 0.0,
+                        "cpu_access_pattern": cpu_access_pattern if event_op_type == "COMPUTE" else "",
+                        "cpu_row_hit_rate": cpu_row_hit_rate if event_op_type == "COMPUTE" else 0.0,
+                        "cpu_mlp": cpu_mlp if event_op_type == "COMPUTE" else 0.0,
+                        "cpu_avg_miss_latency_ns": cpu_avg_miss_latency_ns if event_op_type == "COMPUTE" else 0.0,
+                        "cpu_bw_peak_Bps": cpu_bw_peak_Bps if event_op_type == "COMPUTE" else 0.0,
+                        "cpu_bw_latency_Bps": cpu_bw_latency_Bps if event_op_type == "COMPUTE" else 0.0,
+                        "cpu_bw_eff_stage_Bps": cpu_bw_eff_stage_Bps if event_op_type == "COMPUTE" else 0.0,
+                        "cpu_bw_eff_per_unit_Bps": cpu_bw_eff_per_unit_Bps if event_op_type == "COMPUTE" else 0.0,
+                        "cpu_mem_bound_mode": cpu_mem_bound_mode if event_op_type == "COMPUTE" else "",
+                        "memory_ceiling_enabled": memory_system_enabled,
+                        "memory_system_role": memory_system_role if event_op_type == "COMPUTE" else "",
+                        "mem_service_Bps": mem_service_Bps if event_op_type == "COMPUTE" else 0.0,
+                        "mem_queue_multiplier": mem_queue_multiplier if event_op_type == "COMPUTE" else 1.0,
+                        "mem_rho": mem_rho if event_op_type == "COMPUTE" else 0.0,
+                        "mem_service_time_s": mem_service_time_s if event_op_type == "COMPUTE" else 0.0,
+                        "mem_queue_delay_s": mem_queue_delay_s if event_op_type == "COMPUTE" else 0.0,
+                        "cpu_baseline_engine": cpu_baseline_engine,
+                        "stage_src_endpoint": stage_src_endpoint,
+                        "stage_dst_endpoint": stage_dst_endpoint,
+                        "handoff_mode": handoff_mode,
+                        "retention_capacity_blocked": retention_capacity_blocked,
+                        "cxl_active_streams": cxl_active_streams,
+                        "cxl_bw_share_Bps": cxl_bw_share_Bps,
+                        "cxl_issue_overhead_s": cxl_issue_overhead_s,
+                        "cxl_striping_factor": cxl_striping_factor_trace,
+                    }
+                )
 
         next_op_index[tile_id] = op_index + 1
         completion_times[tile_id] = t_end
@@ -1701,6 +2254,8 @@ def simulate_configuration(
         "total_bytes_host_h2d_ingress": total_bytes_host_h2d_ingress,
         "total_bytes_host_h2d_stage": total_bytes_host_h2d_stage,
         "total_bytes_host_d2h": total_bytes_host_d2h,
+        "total_bytes_pim_retained": total_bytes_pim_retained,
+        "total_retain_fallback_bytes": total_retain_fallback_bytes,
         "total_cpu_materialize_bytes": total_cpu_materialize_bytes,
         "total_bytes_moved": total_bytes_host_link + total_bytes_cxl_direct,
         "lb_compute_stage_max_s": lb_compute_stage_max_s,
@@ -1724,6 +2279,11 @@ def simulate_configuration(
         "total_pim_mem_queue_delay_component_s": total_pim_mem_queue_delay_component_s,
         "total_compute_time_component_s": total_compute_time_component_s,
         "total_cpu_materialize_time_component_s": total_cpu_materialize_time_component_s,
+        "total_retain_handoff_time_component_s": total_retain_handoff_time_component_s,
+        "cxl_direct_stream_slots": cxl_direct_stream_slots,
+        "cxl_active_direct_endpoints": active_direct_endpoint_count,
+        "cxl_effective_striping_factor": cxl_striping_factor,
+        "total_cxl_dma_issue_time_component_s": total_cxl_dma_issue_time_component_s,
     }
     return metrics_row, traces
 
@@ -1745,6 +2305,18 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
     stage_defaults = config["stage_defaults"]
     transfer_power_W = config["transfer_power_W"]
     scenario_stage_device_map_by_template = config["scenario_stage_device_map_by_template"]
+    template_to_stage_names = _template_to_stage_names_from_config(config)
+    default_pim_endpoint_policy, scenario_stage_endpoint_map_by_template = _normalize_endpoint_map(
+        config=config,
+        template_to_stage_names=template_to_stage_names,
+        scenarios=scenarios,
+        scenario_stage_device_map_by_template=scenario_stage_device_map_by_template,
+        warn_defaults=True,
+    )
+    _ = default_pim_endpoint_policy
+    pim_retention_cfg = _normalize_pim_retention_config(config=config, warn_defaults=True)
+    cxl_direct_concurrency_cfg = _normalize_cxl_direct_concurrency_config(config=config, warn_defaults=True)
+    cxl_topology_cfg = _normalize_cxl_topology_config(config=config, warn_defaults=True)
     pim_speedup_vs_cpu_by_stage_by_template = config["pim_speedup_vs_cpu_by_stage_by_template"]
     cpu_stage_unit_compute_Bps_by_template = config["cpu_stage_unit_compute_Bps_by_template"]
     bytes_touched_factors_by_stage_by_template = config["bytes_touched_factors_by_stage_by_template"]
@@ -1793,9 +2365,13 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                     transfer_power_W=transfer_power_W,
                     stage_overrides=stage_overrides,
                     scenario_stage_device_map_by_template=scenario_stage_device_map_by_template,
+                    scenario_stage_endpoint_map_by_template=scenario_stage_endpoint_map_by_template,
                     pim_speedup_vs_cpu_by_stage_by_template=pim_speedup_vs_cpu_by_stage_by_template,
                     cpu_stage_unit_compute_Bps_by_template=cpu_stage_unit_compute_Bps_by_template,
                     memory_system_by_template=memory_system_by_template,
+                    pim_retention=pim_retention_cfg,
+                    cxl_direct_concurrency=cxl_direct_concurrency_cfg,
+                    cxl_topology=cxl_topology_cfg,
                     bytes_touched_factors_by_stage_by_template=bytes_touched_factors_by_stage_by_template,
                     trace_max_tiles=trace_max_tiles,
                 )

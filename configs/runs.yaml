@@ -22,6 +22,41 @@ link_profile:
   host_d2h_link: UPMEM_HOST_D2H_MEASURED
   cxl_direct_link: CXL_LOCAL
 
+default_pim_endpoint_policy: colocate
+
+scenario_stage_endpoint_map_by_template:
+  deepvariant_3stage:
+    cpu_only: [cpu0, cpu0, cpu0]
+    pim_host_bounce: [pim0, pim1, cpu0]
+    pim_flowcxl_direct: [pim0, pim1, cpu0]
+  tpch_3op:
+    cpu_only: [cpu0, cpu0, cpu0]
+    pim_host_bounce: [pim0, pim1, pim2]
+    pim_flowcxl_direct: [pim0, pim1, pim2]
+
+pim_retention:
+  enabled: true
+  applies_to_scenarios: [pim_flowcxl_direct, pim_host_bounce]
+  same_endpoint_short_circuit: true
+  retain_fixed_s: 0.0000003
+  retain_metadata_bytes: 4096
+  retain_local_BW_Bps: 200000000000.0
+  pim_retention_capacity_bytes: 34359738368
+  overflow_policy: fallback_transfer
+
+cxl_direct_concurrency:
+  virtual_channels_per_channel: 4
+  dma_outstanding_per_vc: 16
+  full_bw_outstanding_threshold: 8
+  dma_issue_fixed_s: 0.0000002
+
+cxl_topology:
+  enabled: true
+  mode: dynamic_striping
+  max_stripes: 4
+  num_physical_links: 4
+  applies_to_links: [CXL_SWITCH]
+
 resource_capacity:
   host_h2d_ingress_channels: 1
   host_h2d_stage_channels: 1

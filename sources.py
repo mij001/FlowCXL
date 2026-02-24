@@ -56,6 +56,7 @@ LINK_PCIE_GEN4_X16 = "PCIe Gen4 x16"
 LINK_UPMEM_HOST_H2D_MEASURED = "UPMEM_HOST_H2D_MEASURED"
 LINK_UPMEM_HOST_D2H_MEASURED = "UPMEM_HOST_D2H_MEASURED"
 LINK_CXL_LOCAL = "CXL_LOCAL"
+LINK_CXL_SWITCH = "CXL_SWITCH"
 LINK_CXL_REMOTE = "CXL_REMOTE"
 
 PCIE4_X16_BW_Bps = 32e9
@@ -69,6 +70,9 @@ CXL_LOCAL_BW_Bps = 52e9
 
 CXL_REMOTE_LAT_s = 621e-9
 CXL_REMOTE_BW_Bps = 13e9
+
+CXL_SWITCH_LAT_s = 350e-9
+CXL_SWITCH_BW_Bps = 64e9
 
 UPMEM_HOST_H2D_MEASURED_BW_Bps = 6.68e9
 UPMEM_HOST_D2H_MEASURED_BW_Bps = 4.74e9
@@ -299,11 +303,19 @@ LINKS = {
     LINK_CXL_LOCAL: {
         "bandwidth_Bps": CXL_LOCAL_BW_Bps,
         "latency_s": CXL_LOCAL_LAT_s,
+        "supports_dynamic_striping": False,
         "how_used": "Used by direct PIM-to-PIM transfer equation (local point).",
+    },
+    LINK_CXL_SWITCH: {
+        "bandwidth_Bps": CXL_SWITCH_BW_Bps,
+        "latency_s": CXL_SWITCH_LAT_s,
+        "supports_dynamic_striping": True,
+        "how_used": "Used by direct PIM-to-PIM transfer equation for switch-attached topology points.",
     },
     LINK_CXL_REMOTE: {
         "bandwidth_Bps": CXL_REMOTE_BW_Bps,
         "latency_s": CXL_REMOTE_LAT_s,
+        "supports_dynamic_striping": False,
         "how_used": "Used by direct PIM-to-PIM transfer equation (remote point).",
     },
 }
@@ -356,6 +368,18 @@ CITED_VALUES = {
         "url": "https://huaicheng.github.io/p/asplos25-melody.pdf",
         "quote": "remote entries show higher latency and reduced bandwidth (~13-14GB/s)",
         "how_used": "Representative remote bandwidth point for CXL direct transfers.",
+    },
+    "CXL_SWITCH_LAT_s": {
+        "value": CXL_SWITCH_LAT_s,
+        "url": "https://www.computeexpresslink.org/",
+        "quote": "CXL switched fabrics introduce additional hop latency versus local attachment.",
+        "how_used": "Configurable switch-link direct-path latency assumption.",
+    },
+    "CXL_SWITCH_BW_Bps": {
+        "value": CXL_SWITCH_BW_Bps,
+        "url": "https://www.computeexpresslink.org/",
+        "quote": "CXL fabrics can aggregate bandwidth across switched links and ports.",
+        "how_used": "Configurable switch-link direct-path bandwidth assumption with striping support.",
     },
     "UPMEM_HOST_H2D_MEASURED_BW_Bps": {
         "value": UPMEM_HOST_H2D_MEASURED_BW_Bps,
