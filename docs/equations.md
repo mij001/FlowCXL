@@ -147,6 +147,40 @@ Tile compute duration:
 T_{compute}(s,k) = \frac{X_{s-1,k}}{R_s}
 \]
 
+## 5b) Bytes touched and memory ceiling
+
+For tile `k` at stage `s`:
+
+- `bytes_in = X_{s-1,k}`
+- `bytes_out = X_{s,k}`
+- factors: `f_in`, `f_out`, `f_amp`
+
+\[
+bytes\_touched(s,k) = f_{amp}(s)\cdot\left(f_{in}(s)\cdot bytes_{in} + f_{out}(s)\cdot bytes_{out}\right)
+\]
+
+If memory ceiling is enabled for the template, stage memory bandwidth is shared across stage units:
+
+\[
+BW_{mem,unit}(s) = \frac{BW_{mem,stage}(s)}{U_s}
+\]
+
+\[
+T_{mem}(s,k) = \frac{bytes\_touched(s,k)}{BW_{mem,unit}(s)}
+\]
+
+Final compute-op duration:
+
+\[
+T_{stage}(s,k) = max(T_{compute}(s,k), T_{mem}(s,k))
+\]
+
+If memory ceiling is disabled for the template:
+
+\[
+T_{stage}(s,k) = T_{compute}(s,k)
+\]
+
 ## 6) Transfer duration
 
 Host-link transfer:

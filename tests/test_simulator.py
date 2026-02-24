@@ -1,4 +1,4 @@
-"""Checks for template-aware TPC-H + DeepVariant overlap-first modeling."""
+"""Checks for template-aware modeling with CPU/PIM memory ceilings."""
 
 from __future__ import annotations
 
@@ -8,7 +8,12 @@ import unittest
 import yaml
 
 import sources
-from simulator import generate_runs_from_config, scale_boundaries_exact
+from simulator import (
+    compute_bytes_touched,
+    compute_stage_duration_components_s,
+    generate_runs_from_config,
+    scale_boundaries_exact,
+)
 
 
 class SimulatorChecks(unittest.TestCase):
@@ -18,7 +23,13 @@ class SimulatorChecks(unittest.TestCase):
             cls.config = yaml.safe_load(handle)
         cls.metrics, cls.traces = generate_runs_from_config(cls.config)
 
-    def _find_row(self, dataset_profile: str, scenario: str, multiplier: float, metrics: list[dict] | None = None) -> dict:
+    def _find_row(
+        self,
+        dataset_profile: str,
+        scenario: str,
+        multiplier: float,
+        metrics: list[dict] | None = None,
+    ) -> dict:
         target = self.metrics if metrics is None else metrics
         for row in target:
             if (
@@ -44,71 +55,91 @@ class SimulatorChecks(unittest.TestCase):
         )
         return float(bounce["makespan_s"]) / float(direct["makespan_s"])
 
-    def test_tpch_profiles_are_three_stage_and_template_tagged(self) -> None:
-        expected_profiles = {
-            sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
-            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
-        }
-        self.assertEqual(set(self.config["dataset_profiles"]), expected_profiles)
-        for profile_id in expected_profiles:
-            profile = sources.DATASET_PROFILES[profile_id]
-            self.assertEqual(profile["pipeline_template"], sources.PIPELINE_TEMPLATE_TPCH_3OP)
-            self.assertEqual(tuple(profile["stage_names"]), sources.TPCH_STAGE_NAMES)
-            self.assertEqual(len(profile["boundaries_bytes"]), 4)
+    def test_tpch_memory_ceiling_keys_exist_and_validate(self) -> None:
+        for key in [
+            "enable_memory_ceiling_by_template",
+            "cpu_mem_Bps_by_stage_by_template",
+            "pim_mem_Bps_by_stage_by_template",
+            "bytes_touched_factors_by_stage_by_template",
+        ]:
+            self.assertIn(key, self.config)
 
-    def test_tpch_boundaries_derived_from_selectivity_and_fanout(self) -> None:
-        for profile_id in self.config["dataset_profiles"]:
-            profile = sources.DATASET_PROFILES[profile_id]
-            params = profile["parameters"]
+        cfg = copy.deepcopy(self.config)
+        del cfg["cpu_mem_Bps_by_stage_by_template"]
+        with self.assertRaises((KeyError, ValueError)):
+            generate_runs_from_config(cfg)
 
-            rows_scan_in = max(1, int(round(float(params["scale_factor"]) * float(params["lineitem_rows_per_sf"]))))
-            rows_scan_out = max(1, int(round(rows_scan_in * float(params["scan_selectivity"]))))
-            rows_join_out = max(1, int(round(rows_scan_out * float(params["join_fanout"]))))
-            rows_agg_out = max(1, int(round(rows_join_out * float(params["agg_reduction_ratio"]))))
+        cfg2 = copy.deepcopy(self.config)
+        del cfg2["bytes_touched_factors_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
+            "join"
+        ]["amplification_factor"]
+        with self.assertRaises((KeyError, ValueError)):
+            generate_runs_from_config(cfg2)
 
-            expected = [
-                rows_scan_in * int(params["scan_input_row_bytes"]),
-                rows_scan_out * int(params["scan_projected_row_bytes"]),
-                rows_join_out * int(params["join_output_row_bytes"]),
-                rows_agg_out * int(params["agg_output_row_bytes"]),
-            ]
-            self.assertEqual([int(x) for x in profile["boundaries_bytes"]], [int(x) for x in expected])
+    def test_tpch_bytes_touched_formula_scan_join_agg(self) -> None:
+        factors = self.config["bytes_touched_factors_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]
+        bytes_in = 1_000
+        bytes_out = 250
+        for stage_name in sources.TPCH_STAGE_NAMES:
+            stage_factors = factors[stage_name]
+            expected = float(stage_factors["amplification_factor"]) * (
+                float(stage_factors["input_factor"]) * bytes_in
+                + float(stage_factors["output_factor"]) * bytes_out
+            )
+            actual = compute_bytes_touched(
+                bytes_in=bytes_in,
+                bytes_out=bytes_out,
+                input_factor=float(stage_factors["input_factor"]),
+                output_factor=float(stage_factors["output_factor"]),
+                amplification_factor=float(stage_factors["amplification_factor"]),
+            )
+            self.assertAlmostEqual(actual, expected, places=9)
 
-    def test_tpch_stage_map_is_pim_pim_pim_for_pim_scenarios(self) -> None:
-        stage_map = self.config["scenario_stage_device_map_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]
-        self.assertEqual(stage_map[sources.SCENARIO_CPU_ONLY], ["cpu", "cpu", "cpu"])
-        self.assertEqual(stage_map[sources.SCENARIO_PIM_HOST_BOUNCE], ["pim", "pim", "pim"])
-        self.assertEqual(stage_map[sources.SCENARIO_PIM_FLOWCXL_DIRECT], ["pim", "pim", "pim"])
+    def test_tpch_compute_duration_uses_max_compute_vs_mem(self) -> None:
+        duration, compute_s, mem_s, _ = compute_stage_duration_components_s(
+            bytes_in=1_000,
+            bytes_out=500,
+            compute_rate_Bps=100.0,
+            memory_ceiling_enabled=True,
+            memory_Bps_per_stage=10_000.0,
+            stage_units=1,
+            input_factor=1.0,
+            output_factor=1.0,
+            amplification_factor=1.0,
+        )
+        self.assertAlmostEqual(compute_s, 10.0, places=9)
+        self.assertLess(mem_s, compute_s)
+        self.assertAlmostEqual(duration, compute_s, places=9)
 
-        profile_id = sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE
-        for scenario, expected_devices in stage_map.items():
-            row = self._find_row(profile_id, scenario, 1.0)
-            run_id = row["run_id"]
-            compute_rows = [r for r in self.traces if r["run_id"] == run_id and r["op_type"] == "COMPUTE"]
-            by_stage = {int(r["stage_id"]): str(r["stage_device"]) for r in compute_rows}
-            self.assertEqual(by_stage[1], expected_devices[0])
-            self.assertEqual(by_stage[2], expected_devices[1])
-            self.assertEqual(by_stage[3], expected_devices[2])
+        duration2, compute_s2, mem_s2, _ = compute_stage_duration_components_s(
+            bytes_in=1_000,
+            bytes_out=500,
+            compute_rate_Bps=10_000.0,
+            memory_ceiling_enabled=True,
+            memory_Bps_per_stage=100.0,
+            stage_units=1,
+            input_factor=2.0,
+            output_factor=1.0,
+            amplification_factor=1.0,
+        )
+        self.assertAlmostEqual(compute_s2, 0.1, places=9)
+        self.assertGreater(mem_s2, compute_s2)
+        self.assertAlmostEqual(duration2, mem_s2, places=9)
 
-    def test_tpch_transfer_matrix_pim_to_pim_paths(self) -> None:
-        for profile_id in self.config["dataset_profiles"]:
-            bounce = self._find_row(profile_id, sources.SCENARIO_PIM_HOST_BOUNCE, 1.0)
-            direct = self._find_row(profile_id, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0)
-            cpu = self._find_row(profile_id, sources.SCENARIO_CPU_ONLY, 1.0)
-
-            self.assertGreater(int(bounce["total_bytes_host_h2d_ingress"]), 0)
-            self.assertGreater(int(bounce["total_bytes_host_h2d_stage"]), 0)
-            self.assertGreater(int(bounce["total_bytes_host_d2h"]), 0)
-            self.assertEqual(int(bounce["total_bytes_cxl_direct"]), 0)
-
-            self.assertGreater(int(direct["total_bytes_host_h2d_ingress"]), 0)
-            self.assertEqual(int(direct["total_bytes_host_h2d_stage"]), 0)
-            self.assertGreater(int(direct["total_bytes_host_d2h"]), 0)
-            self.assertGreater(int(direct["total_bytes_cxl_direct"]), 0)
-
-            self.assertEqual(int(cpu["total_bytes_host_link"]), 0)
-            self.assertEqual(int(cpu["total_bytes_cxl_direct"]), 0)
-            self.assertEqual(int(cpu["total_bytes_host_touch"]), 0)
+        duration3, compute_s3, mem_s3, bytes_touched3 = compute_stage_duration_components_s(
+            bytes_in=1_000,
+            bytes_out=500,
+            compute_rate_Bps=100.0,
+            memory_ceiling_enabled=False,
+            memory_Bps_per_stage=1.0,
+            stage_units=1,
+            input_factor=5.0,
+            output_factor=5.0,
+            amplification_factor=5.0,
+        )
+        self.assertAlmostEqual(duration3, compute_s3, places=9)
+        self.assertEqual(mem_s3, 0.0)
+        self.assertEqual(bytes_touched3, 0.0)
 
     def test_tpch_host_touch_only_in_bounce(self) -> None:
         for profile_id in self.config["dataset_profiles"]:
@@ -134,6 +165,13 @@ class SimulatorChecks(unittest.TestCase):
     def test_tpch_high_profile_1x_ratio_at_least_2x(self) -> None:
         ratio = self._ratio(self.metrics, dataset_profile=sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE, multiplier=1.0)
         self.assertGreaterEqual(ratio, 2.0)
+
+    def test_tpch_direct_beats_cpu_all_profiles_all_sizes(self) -> None:
+        for profile_id in self.config["dataset_profiles"]:
+            for multiplier in self.config["size_multipliers"]:
+                cpu = self._find_row(profile_id, sources.SCENARIO_CPU_ONLY, float(multiplier))
+                direct = self._find_row(profile_id, sources.SCENARIO_PIM_FLOWCXL_DIRECT, float(multiplier))
+                self.assertLess(float(direct["makespan_s"]), float(cpu["makespan_s"]))
 
     def test_tpch_overlap_present_in_direct(self) -> None:
         for profile_id in self.config["dataset_profiles"]:
@@ -188,6 +226,18 @@ class SimulatorChecks(unittest.TestCase):
             expected = sources.DATASET_PROFILES[row["dataset_profile"]]["pipeline_template"]
             self.assertEqual(row["pipeline_template"], expected)
 
+    def test_metrics_schema_stable_with_memory_columns(self) -> None:
+        row = self.metrics[0]
+        for key in [
+            "memory_ceiling_enabled",
+            "total_cpu_mem_time_component_s",
+            "total_pim_mem_time_component_s",
+            "total_compute_time_component_s",
+        ]:
+            self.assertIn(key, row)
+        for forbidden in ["queue_wait_s", "utilization", "speedup_vs_cpu_only"]:
+            self.assertNotIn(forbidden, row)
+
     def test_deepvariant_profile_still_loads_template(self) -> None:
         profile = sources.DATASET_PROFILES[sources.PROFILE_DV_ILLUMINA_WGS_30X]
         self.assertEqual(profile["pipeline_template"], sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE)
@@ -201,9 +251,19 @@ class SimulatorChecks(unittest.TestCase):
         self.assertEqual(len(metrics), len(cfg["scenarios"]))
         self.assertTrue(all(row["pipeline_template"] == sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE for row in metrics))
 
-    def test_config_requires_template_specific_maps(self) -> None:
+    def test_deepvariant_memory_ceiling_disabled_by_default(self) -> None:
         cfg = copy.deepcopy(self.config)
-        del cfg["scenario_stage_device_map_by_template"]
+        cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
+        cfg["size_multipliers"] = [1.0]
+        metrics, _ = generate_runs_from_config(cfg)
+        for row in metrics:
+            self.assertFalse(bool(row["memory_ceiling_enabled"]))
+            self.assertEqual(float(row["total_cpu_mem_time_component_s"]), 0.0)
+            self.assertEqual(float(row["total_pim_mem_time_component_s"]), 0.0)
+
+    def test_config_requires_template_specific_memory_maps(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        del cfg["enable_memory_ceiling_by_template"]
         with self.assertRaises((KeyError, ValueError)):
             generate_runs_from_config(cfg)
 

@@ -17,12 +17,17 @@
 - Stages: `make_examples -> call_variants -> postprocess_variants`
 - Boundaries are derived from coverage, candidate density, and tensor shape.
 - CPU stage rates are calibrated from profile runtime shares.
+- Memory ceiling is disabled by default to preserve calibrated stage-time behavior.
 
 ### TPC-H (`tpch_3op`)
 
 - Stages: `scan_filter_project -> join -> groupby_agg`
 - Boundaries are derived from rows/selectivity/fanout/reduction parameters.
 - CPU stage rates come from template stage-rate defaults.
+- Memory ceiling is enabled by default.
+- Stage duration uses `max(compute_component, memory_component)`.
+- Bytes touched are derived per stage via input/output/amplification factors.
+- CPU and PIM memory ceilings are per-stage budgets shared across stage units.
 
 ## Stage-device mapping
 
@@ -84,3 +89,8 @@ Per run:
 - transfer bytes (`host_link`, `cxl_direct`, `host_touch`, path-specific bytes)
 - LB diagnostics (`lb_*`) and `dominant_lb_component`
 - `pipeline_template`
+- Memory-ceiling diagnostics:
+  - `memory_ceiling_enabled`
+  - `total_compute_time_component_s`
+  - `total_cpu_mem_time_component_s`
+  - `total_pim_mem_time_component_s`

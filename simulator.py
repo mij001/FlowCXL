@@ -110,6 +110,54 @@ def compute_duration_s(bytes_moved: int, compute_rate_Bps: float) -> float:
     return bytes_moved / compute_rate_Bps
 
 
+def compute_bytes_touched(
+    bytes_in: int,
+    bytes_out: int,
+    input_factor: float,
+    output_factor: float,
+    amplification_factor: float,
+) -> float:
+    if bytes_in < 0 or bytes_out < 0:
+        raise ValueError("bytes_in and bytes_out must be >= 0")
+    if input_factor < 0 or output_factor < 0:
+        raise ValueError("input/output factors must be >= 0")
+    if amplification_factor <= 0:
+        raise ValueError("amplification_factor must be > 0")
+    return amplification_factor * ((input_factor * float(bytes_in)) + (output_factor * float(bytes_out)))
+
+
+def compute_stage_duration_components_s(
+    bytes_in: int,
+    bytes_out: int,
+    compute_rate_Bps: float,
+    memory_ceiling_enabled: bool,
+    memory_Bps_per_stage: float,
+    stage_units: int,
+    input_factor: float,
+    output_factor: float,
+    amplification_factor: float,
+) -> Tuple[float, float, float, float]:
+    compute_component_s = compute_duration_s(bytes_moved=bytes_in, compute_rate_Bps=compute_rate_Bps)
+    if not memory_ceiling_enabled:
+        return compute_component_s, compute_component_s, 0.0, 0.0
+
+    if memory_Bps_per_stage <= 0:
+        raise ValueError("memory_Bps_per_stage must be > 0 when memory ceiling is enabled")
+    if stage_units <= 0:
+        raise ValueError("stage_units must be > 0 when memory ceiling is enabled")
+
+    bytes_touched = compute_bytes_touched(
+        bytes_in=bytes_in,
+        bytes_out=bytes_out,
+        input_factor=input_factor,
+        output_factor=output_factor,
+        amplification_factor=amplification_factor,
+    )
+    effective_memory_Bps_per_unit = memory_Bps_per_stage / float(stage_units)
+    memory_component_s = bytes_touched / effective_memory_Bps_per_unit
+    return max(compute_component_s, memory_component_s), compute_component_s, memory_component_s, bytes_touched
+
+
 def host_touch_duration_s(bytes_moved: int, touch_Bps: float, touch_fixed_s: float) -> float:
     if touch_Bps <= 0:
         raise ValueError("host touch bandwidth must be > 0")
@@ -412,6 +460,10 @@ def _validate_config(config: Dict[str, object]) -> None:
         "scenario_stage_device_map_by_template",
         "pim_speedup_vs_cpu_by_stage_by_template",
         "cpu_stage_unit_compute_Bps_by_template",
+        "enable_memory_ceiling_by_template",
+        "cpu_mem_Bps_by_stage_by_template",
+        "pim_mem_Bps_by_stage_by_template",
+        "bytes_touched_factors_by_stage_by_template",
     ]
     missing = [key for key in required_top_level if key not in config]
     if missing:
@@ -504,10 +556,18 @@ def _validate_config(config: Dict[str, object]) -> None:
     scenario_stage_device_map_by_template = config["scenario_stage_device_map_by_template"]
     pim_speedup_by_template = config["pim_speedup_vs_cpu_by_stage_by_template"]
     cpu_stage_rates_by_template = config["cpu_stage_unit_compute_Bps_by_template"]
+    enable_memory_ceiling_by_template = config["enable_memory_ceiling_by_template"]
+    cpu_mem_Bps_by_stage_by_template = config["cpu_mem_Bps_by_stage_by_template"]
+    pim_mem_Bps_by_stage_by_template = config["pim_mem_Bps_by_stage_by_template"]
+    bytes_touched_factors_by_stage_by_template = config["bytes_touched_factors_by_stage_by_template"]
     for mapping_name, mapping in [
         ("scenario_stage_device_map_by_template", scenario_stage_device_map_by_template),
         ("pim_speedup_vs_cpu_by_stage_by_template", pim_speedup_by_template),
         ("cpu_stage_unit_compute_Bps_by_template", cpu_stage_rates_by_template),
+        ("enable_memory_ceiling_by_template", enable_memory_ceiling_by_template),
+        ("cpu_mem_Bps_by_stage_by_template", cpu_mem_Bps_by_stage_by_template),
+        ("pim_mem_Bps_by_stage_by_template", pim_mem_Bps_by_stage_by_template),
+        ("bytes_touched_factors_by_stage_by_template", bytes_touched_factors_by_stage_by_template),
     ]:
         if not isinstance(mapping, Mapping):
             raise ValueError(f"{mapping_name} must be a map")
@@ -519,6 +579,14 @@ def _validate_config(config: Dict[str, object]) -> None:
             raise KeyError(f"pim_speedup_vs_cpu_by_stage_by_template missing template {template}")
         if template not in cpu_stage_rates_by_template:
             raise KeyError(f"cpu_stage_unit_compute_Bps_by_template missing template {template}")
+        if template not in enable_memory_ceiling_by_template:
+            raise KeyError(f"enable_memory_ceiling_by_template missing template {template}")
+        if template not in cpu_mem_Bps_by_stage_by_template:
+            raise KeyError(f"cpu_mem_Bps_by_stage_by_template missing template {template}")
+        if template not in pim_mem_Bps_by_stage_by_template:
+            raise KeyError(f"pim_mem_Bps_by_stage_by_template missing template {template}")
+        if template not in bytes_touched_factors_by_stage_by_template:
+            raise KeyError(f"bytes_touched_factors_by_stage_by_template missing template {template}")
 
         scenario_map = scenario_stage_device_map_by_template[template]
         if not isinstance(scenario_map, Mapping):
@@ -537,10 +605,26 @@ def _validate_config(config: Dict[str, object]) -> None:
 
         speedup_map = pim_speedup_by_template[template]
         rate_map = cpu_stage_rates_by_template[template]
+        cpu_mem_map = cpu_mem_Bps_by_stage_by_template[template]
+        pim_mem_map = pim_mem_Bps_by_stage_by_template[template]
+        bytes_touched_map = bytes_touched_factors_by_stage_by_template[template]
         if not isinstance(speedup_map, Mapping):
             raise ValueError(f"pim speedup map for template {template} must be a map")
         if not isinstance(rate_map, Mapping):
             raise ValueError(f"cpu stage rate map for template {template} must be a map")
+        if not isinstance(cpu_mem_map, Mapping):
+            raise ValueError(f"cpu memory map for template {template} must be a map")
+        if not isinstance(pim_mem_map, Mapping):
+            raise ValueError(f"pim memory map for template {template} must be a map")
+        if not isinstance(bytes_touched_map, Mapping):
+            raise ValueError(f"bytes touched map for template {template} must be a map")
+
+        memory_flag = enable_memory_ceiling_by_template[template]
+        if not isinstance(memory_flag, bool):
+            raise ValueError(
+                f"enable_memory_ceiling_by_template[{template}] must be bool, got {type(memory_flag).__name__}"
+            )
+
         for stage_name in stage_names:
             if stage_name not in speedup_map:
                 raise KeyError(f"template {template} speedup map missing stage {stage_name}")
@@ -550,6 +634,30 @@ def _validate_config(config: Dict[str, object]) -> None:
                 raise KeyError(f"template {template} cpu stage rate map missing stage {stage_name}")
             if float(rate_map[stage_name]) <= 0:
                 raise ValueError(f"template {template} cpu stage rate for {stage_name} must be > 0")
+            if stage_name not in cpu_mem_map:
+                raise KeyError(f"template {template} cpu memory map missing stage {stage_name}")
+            if float(cpu_mem_map[stage_name]) <= 0:
+                raise ValueError(f"template {template} cpu memory Bps for {stage_name} must be > 0")
+            if stage_name not in pim_mem_map:
+                raise KeyError(f"template {template} pim memory map missing stage {stage_name}")
+            if float(pim_mem_map[stage_name]) <= 0:
+                raise ValueError(f"template {template} pim memory Bps for {stage_name} must be > 0")
+            if stage_name not in bytes_touched_map:
+                raise KeyError(f"template {template} bytes_touched map missing stage {stage_name}")
+            factors = bytes_touched_map[stage_name]
+            if not isinstance(factors, Mapping):
+                raise ValueError(f"bytes_touched factors for {template}:{stage_name} must be a map")
+            for factor_key in ["input_factor", "output_factor", "amplification_factor"]:
+                if factor_key not in factors:
+                    raise KeyError(f"bytes_touched factors for {template}:{stage_name} missing {factor_key}")
+            if float(factors["input_factor"]) < 0 or float(factors["output_factor"]) < 0:
+                raise ValueError(
+                    f"bytes_touched input/output factors must be >= 0 for {template}:{stage_name}"
+                )
+            if float(factors["amplification_factor"]) <= 0:
+                raise ValueError(
+                    f"bytes_touched amplification_factor must be > 0 for {template}:{stage_name}"
+                )
 
     if int(config["tile_size_bytes"]) <= 0:
         raise ValueError("tile_size_bytes must be > 0")
@@ -596,6 +704,10 @@ def simulate_configuration(
     scenario_stage_device_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
     pim_speedup_vs_cpu_by_stage_by_template: Mapping[str, Mapping[str, object]],
     cpu_stage_unit_compute_Bps_by_template: Mapping[str, Mapping[str, object]],
+    enable_memory_ceiling_by_template: Mapping[str, bool],
+    cpu_mem_Bps_by_stage_by_template: Mapping[str, Mapping[str, object]],
+    pim_mem_Bps_by_stage_by_template: Mapping[str, Mapping[str, object]],
+    bytes_touched_factors_by_stage_by_template: Mapping[str, Mapping[str, Mapping[str, object]]],
     trace_max_tiles: int | None = None,
 ) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
     if scenario not in sources.SCENARIOS:
@@ -616,6 +728,14 @@ def simulate_configuration(
         raise KeyError(f"missing pim speedup map for template {pipeline_template}")
     if pipeline_template not in cpu_stage_unit_compute_Bps_by_template:
         raise KeyError(f"missing cpu stage rate map for template {pipeline_template}")
+    if pipeline_template not in enable_memory_ceiling_by_template:
+        raise KeyError(f"missing memory-ceiling flag map for template {pipeline_template}")
+    if pipeline_template not in cpu_mem_Bps_by_stage_by_template:
+        raise KeyError(f"missing cpu memory map for template {pipeline_template}")
+    if pipeline_template not in pim_mem_Bps_by_stage_by_template:
+        raise KeyError(f"missing pim memory map for template {pipeline_template}")
+    if pipeline_template not in bytes_touched_factors_by_stage_by_template:
+        raise KeyError(f"missing bytes_touched map for template {pipeline_template}")
 
     stage_devices = _stage_device_map_for_scenario(
         scenario_stage_device_map=scenario_stage_device_map_by_template[pipeline_template],
@@ -639,6 +759,10 @@ def simulate_configuration(
         pim_speedup_vs_cpu_by_stage=pim_speedup_vs_cpu_by_stage_by_template[pipeline_template],
         cpu_stage_unit_compute_Bps=cpu_stage_unit_compute_Bps_by_template[pipeline_template],
     )
+    memory_ceiling_enabled = bool(enable_memory_ceiling_by_template[pipeline_template])
+    cpu_mem_Bps_by_stage = cpu_mem_Bps_by_stage_by_template[pipeline_template]
+    pim_mem_Bps_by_stage = pim_mem_Bps_by_stage_by_template[pipeline_template]
+    bytes_touched_factors_by_stage = bytes_touched_factors_by_stage_by_template[pipeline_template]
 
     host_h2d_ingress_pool = ResourcePool(
         name="host_h2d_ingress",
@@ -704,6 +828,9 @@ def simulate_configuration(
     total_bytes_host_h2d_ingress = 0
     total_bytes_host_h2d_stage = 0
     total_bytes_host_d2h = 0
+    total_compute_time_component_s = 0.0
+    total_cpu_mem_time_component_s = 0.0
+    total_pim_mem_time_component_s = 0.0
 
     while request_heap:
         t_req, tile_id = heapq.heappop(request_heap)
@@ -715,13 +842,41 @@ def simulate_configuration(
         stage_cfg = stage_configs[operation.stage_id - 1]
         stage_device = stage_devices[operation.stage_id - 1]
         bytes_moved = int(tiled_boundaries[operation.boundary_index][tile_id])
+        compute_component_s = 0.0
+        memory_component_s = 0.0
+        bytes_touched = 0.0
 
         if operation.op_type == "COMPUTE":
+            stage_name = stage_names[operation.stage_id - 1]
+            bytes_in = bytes_moved
+            bytes_out = int(tiled_boundaries[operation.stage_id][tile_id])
             if stage_device == sources.DEVICE_CPU:
                 compute_rate = stage_cfg.cpu_unit_compute_Bps
+                stage_units = stage_cfg.cpu_units
+                memory_Bps_per_stage = float(cpu_mem_Bps_by_stage[stage_name])
             else:
                 compute_rate = stage_cfg.pim_unit_compute_Bps
-            duration_s = compute_duration_s(bytes_moved=bytes_moved, compute_rate_Bps=compute_rate)
+                stage_units = stage_cfg.pim_units
+                memory_Bps_per_stage = float(pim_mem_Bps_by_stage[stage_name])
+
+            factors = bytes_touched_factors_by_stage[stage_name]
+            duration_s, compute_component_s, memory_component_s, bytes_touched = compute_stage_duration_components_s(
+                bytes_in=bytes_in,
+                bytes_out=bytes_out,
+                compute_rate_Bps=compute_rate,
+                memory_ceiling_enabled=memory_ceiling_enabled,
+                memory_Bps_per_stage=memory_Bps_per_stage,
+                stage_units=stage_units,
+                input_factor=float(factors["input_factor"]),
+                output_factor=float(factors["output_factor"]),
+                amplification_factor=float(factors["amplification_factor"]),
+            )
+            total_compute_time_component_s += compute_component_s
+            if memory_ceiling_enabled:
+                if stage_device == sources.DEVICE_CPU:
+                    total_cpu_mem_time_component_s += memory_component_s
+                else:
+                    total_pim_mem_time_component_s += memory_component_s
             pool = compute_pools[operation.stage_id - 1]
             link_used = ""
             transfer_path = ""
@@ -785,6 +940,10 @@ def simulate_configuration(
                     "t_end": t_end,
                     "duration_s": duration_s,
                     "wait_s": wait_s,
+                    "compute_component_s": compute_component_s,
+                    "memory_component_s": memory_component_s,
+                    "bytes_touched": bytes_touched,
+                    "memory_ceiling_enabled": memory_ceiling_enabled,
                 }
             )
 
@@ -853,6 +1012,10 @@ def simulate_configuration(
         "lb_cxl_direct_s": lb_cxl_direct_s,
         "dominant_lb_component": dominant_lb_component,
         "pipeline_template": pipeline_template,
+        "memory_ceiling_enabled": memory_ceiling_enabled,
+        "total_cpu_mem_time_component_s": total_cpu_mem_time_component_s,
+        "total_pim_mem_time_component_s": total_pim_mem_time_component_s,
+        "total_compute_time_component_s": total_compute_time_component_s,
     }
     return metrics_row, traces
 
@@ -876,6 +1039,10 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
     scenario_stage_device_map_by_template = config["scenario_stage_device_map_by_template"]
     pim_speedup_vs_cpu_by_stage_by_template = config["pim_speedup_vs_cpu_by_stage_by_template"]
     cpu_stage_unit_compute_Bps_by_template = config["cpu_stage_unit_compute_Bps_by_template"]
+    enable_memory_ceiling_by_template = config["enable_memory_ceiling_by_template"]
+    cpu_mem_Bps_by_stage_by_template = config["cpu_mem_Bps_by_stage_by_template"]
+    pim_mem_Bps_by_stage_by_template = config["pim_mem_Bps_by_stage_by_template"]
+    bytes_touched_factors_by_stage_by_template = config["bytes_touched_factors_by_stage_by_template"]
     stage_overrides = config.get("stage_overrides", {})
     trace_max_tiles_raw = config.get("trace_max_tiles", 512)
     trace_max_tiles: int | None
@@ -922,6 +1089,10 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                     scenario_stage_device_map_by_template=scenario_stage_device_map_by_template,
                     pim_speedup_vs_cpu_by_stage_by_template=pim_speedup_vs_cpu_by_stage_by_template,
                     cpu_stage_unit_compute_Bps_by_template=cpu_stage_unit_compute_Bps_by_template,
+                    enable_memory_ceiling_by_template=enable_memory_ceiling_by_template,
+                    cpu_mem_Bps_by_stage_by_template=cpu_mem_Bps_by_stage_by_template,
+                    pim_mem_Bps_by_stage_by_template=pim_mem_Bps_by_stage_by_template,
+                    bytes_touched_factors_by_stage_by_template=bytes_touched_factors_by_stage_by_template,
                     trace_max_tiles=trace_max_tiles,
                 )
                 metrics.append(row)

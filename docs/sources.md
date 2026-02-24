@@ -21,6 +21,7 @@ These constants are used directly in transfer duration equations.
 - TPC-H benchmark context for scan/join/aggregation pipeline modeling
 - Host-bounce vs direct-copy context from direct-data-path literature/blogs
 - PIM-operator context references for scan, join, and analytics aggregation
+- OLAP memory-pressure context used to justify stage memory-ceiling modeling
 
 ## Configurable modeling assumptions (not fixed hardware truth)
 
@@ -32,6 +33,11 @@ These are explicit knobs in `sources.py`/`configs/runs.yaml`:
 - Stage compute rates/speedups:
   - `cpu_stage_unit_compute_Bps_by_template`
   - `pim_speedup_vs_cpu_by_stage_by_template`
+- Stage memory-ceiling knobs:
+  - `enable_memory_ceiling_by_template`
+  - `cpu_mem_Bps_by_stage_by_template`
+  - `pim_mem_Bps_by_stage_by_template`
+  - `bytes_touched_factors_by_stage_by_template`
 - Scenario stage maps:
   - `scenario_stage_device_map_by_template`
 - Transfer-channel counts and per-channel power

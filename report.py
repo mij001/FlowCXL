@@ -79,6 +79,9 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
         "makespan_s",
         "total_energy_J",
         "host_touch_energy_J",
+        "total_compute_time_component_s",
+        "total_cpu_mem_time_component_s",
+        "total_pim_mem_time_component_s",
         "lb_compute_stage_max_s",
         "lb_host_h2d_ingress_s",
         "lb_host_h2d_stage_s",
@@ -112,6 +115,22 @@ def _dataset_diagnostic_table(metrics_df: pd.DataFrame, dataset_profile: str) ->
         "lb_host_link_s",
         "lb_host_touch_s",
         "lb_cxl_direct_s",
+    ]
+    subset = subset[cols]
+    return _format_metric_fields(subset)
+
+
+def _memory_ceiling_diagnostic_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    subset = metrics_df[metrics_df["stage_size_multiplier"] == 1.0].copy()
+    subset = subset.sort_values(["dataset_profile", "scenario"])
+    subset["scenario"] = subset["scenario"].map(SCENARIO_LABELS)
+    cols = [
+        "dataset_profile",
+        "scenario",
+        "memory_ceiling_enabled",
+        "total_compute_time_component_s",
+        "total_cpu_mem_time_component_s",
+        "total_pim_mem_time_component_s",
     ]
     subset = subset[cols]
     return _format_metric_fields(subset)
@@ -242,6 +261,7 @@ def main() -> None:
     for dataset_profile in profiles:
         diag_df = _dataset_diagnostic_table(metrics_df=metrics_df, dataset_profile=dataset_profile)
         diagnostic_tables.append(f"### {dataset_profile}\n\n{_build_markdown_table(diag_df)}")
+    memory_diag_table = _memory_ceiling_diagnostic_table(metrics_df=metrics_df)
 
     plot_lines: List[str] = []
     for dataset_profile in profiles:
@@ -267,6 +287,8 @@ def main() -> None:
         "- In `tpch_3op`, large S1->S2 and S2->S3 intermediates make host-bounce pay double link traversal + touch, "
         "while FlowCXL direct pays a single inter-device transfer.\n"
         f"{_tpch_target_narrative(metrics_df)}\n\n"
+        "## CPU Memory Ceiling Diagnostics (1x)\n"
+        f"{_build_markdown_table(memory_diag_table)}\n\n"
         "## Plot Artifacts\n"
         f"{chr(10).join(plot_lines)}\n\n"
         "## Results Table\n"

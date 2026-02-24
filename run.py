@@ -38,6 +38,10 @@ BASE_METRICS_COLUMNS = [
     "lb_cxl_direct_s",
     "dominant_lb_component",
     "pipeline_template",
+    "memory_ceiling_enabled",
+    "total_cpu_mem_time_component_s",
+    "total_pim_mem_time_component_s",
+    "total_compute_time_component_s",
 ]
 TRACE_YAML_MAX_EVENTS = 2000
 

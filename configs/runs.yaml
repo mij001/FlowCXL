@@ -68,6 +68,58 @@ cpu_stage_unit_compute_Bps_by_template:
     join: 900000000.0
     groupby_agg: 1500000000.0
 
+enable_memory_ceiling_by_template:
+  deepvariant_3stage: false
+  tpch_3op: true
+
+cpu_mem_Bps_by_stage_by_template:
+  deepvariant_3stage:
+    make_examples: 120000000000.0
+    call_variants: 120000000000.0
+    postprocess_variants: 120000000000.0
+  tpch_3op:
+    scan_filter_project: 120000000000.0
+    join: 120000000000.0
+    groupby_agg: 120000000000.0
+
+pim_mem_Bps_by_stage_by_template:
+  deepvariant_3stage:
+    make_examples: 240000000000.0
+    call_variants: 240000000000.0
+    postprocess_variants: 240000000000.0
+  tpch_3op:
+    scan_filter_project: 240000000000.0
+    join: 240000000000.0
+    groupby_agg: 240000000000.0
+
+bytes_touched_factors_by_stage_by_template:
+  deepvariant_3stage:
+    make_examples:
+      input_factor: 1.0
+      output_factor: 1.0
+      amplification_factor: 1.0
+    call_variants:
+      input_factor: 1.0
+      output_factor: 1.0
+      amplification_factor: 1.0
+    postprocess_variants:
+      input_factor: 1.0
+      output_factor: 1.0
+      amplification_factor: 1.0
+  tpch_3op:
+    scan_filter_project:
+      input_factor: 4.5
+      output_factor: 1.0
+      amplification_factor: 1.0
+    join:
+      input_factor: 1.0
+      output_factor: 1.0
+      amplification_factor: 1.6
+    groupby_agg:
+      input_factor: 1.0
+      output_factor: 1.0
+      amplification_factor: 1.0
+
 transfer_power_W:
   host_h2d_ingress_channel: 20.0
   host_h2d_stage_channel: 20.0

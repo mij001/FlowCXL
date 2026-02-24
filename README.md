@@ -29,6 +29,10 @@ The high-intermediate profile is configured to expose host-bounce penalties and 
 ## What is modeled
 
 - Stage-limited compute pools (CPU/PIM)
+- Template-scoped memory ceilings (`tpch_3op` enabled by default, DeepVariant disabled by default):
+  - `T_stage = max(T_compute, T_mem)`
+  - CPU/PIM memory ceilings are configurable per stage and template
+  - bytes-touched factors model scan/join/group-by read/write pressure
 - Per-template scenario stage-device maps
 - Tile overlap with bounded in-flight window (`max_inflight_tiles`)
 - Transition-aware transfer graph:
@@ -41,6 +45,11 @@ The high-intermediate profile is configured to expose host-bounce penalties and 
 - Split host H2D topology: ingress vs stage channels
 - Makespan and energy accounting
 - Lower-bound bottleneck diagnostics (`lb_*`, `dominant_lb_component`)
+- Memory-ceiling diagnostics:
+  - `memory_ceiling_enabled`
+  - `total_compute_time_component_s`
+  - `total_cpu_mem_time_component_s`
+  - `total_pim_mem_time_component_s`
 
 ## Repo layout
 

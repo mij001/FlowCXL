@@ -353,6 +353,12 @@ CITED_VALUES = {
         "quote": "Transfers can dominate accelerator query pipelines.",
         "how_used": "Context for transfer bottlenecks in analytical pipelines.",
     },
+    "OLAP_MEMORY_BOUND_CONTEXT": {
+        "value": "qualitative",
+        "url": "https://www.microsoft.com/en-us/research/publication/relational-query-processing-on-opencl-based-fpgas/",
+        "quote": "Operator placement is sensitive to host-device transfer overhead.",
+        "how_used": "Supports memory/transfer bottleneck framing for OLAP stage modeling.",
+    },
     "UPMEM_SCAN_CONTEXT": {
         "value": "qualitative",
         "url": "https://link.springer.com/article/10.1007/s11227-024-06378-8",
@@ -370,6 +376,18 @@ CITED_VALUES = {
         "url": "https://pure.kaist.ac.kr/en/publications/darwin-a-dram-based-adaptive-in-memory-computing-architecture-for",
         "quote": "In-memory analytics architecture targets data analytics operators.",
         "how_used": "PIM counterpart context for aggregation stage.",
+    },
+    "DARWIN_OPERATOR_GAIN_CONTEXT": {
+        "value": "qualitative",
+        "url": "https://pure.kaist.ac.kr/en/publications/darwin-a-dram-based-adaptive-in-memory-computing-architecture-for",
+        "quote": "Reports large operator-level throughput gains versus CPU baselines.",
+        "how_used": "Context for using higher effective PIM throughput in OLAP stages.",
+    },
+    "PID_JOIN_REAL_DIMM_CONTEXT": {
+        "value": "qualitative",
+        "url": "https://arxiv.org/abs/2303.07591",
+        "quote": "Join design and evaluation target real UPMEM DIMM constraints.",
+        "how_used": "Context for join-stage PIM acceleration assumptions.",
     },
 }
 

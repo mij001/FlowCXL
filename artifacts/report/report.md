@@ -13,13 +13,23 @@ Template-aware stage modeling with true host bounce and direct CXL movement show
 - Lower-bound bottleneck diagnostics by resource family
 
 ## Directional Check
-- PROFILE_TPCH_SF100_HIGH_INTERMEDIATE (`tpch_3op`): directional `true`, strictly-better points `4`, 1x bounce/direct ratio `2.051986`, ratio range `2.025090` to `2.073252`, 1x dominants bounce `host_touch`, direct `cxl_direct`.
-- PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE (`tpch_3op`): directional `true`, strictly-better points `4`, 1x bounce/direct ratio `1.013683`, ratio range `1.006226` to `1.026667`, 1x dominants bounce `host_link`, direct `host_link`.
+- PROFILE_TPCH_SF100_HIGH_INTERMEDIATE (`tpch_3op`): directional `true`, strictly-better points `4`, 1x bounce/direct ratio `2.038663`, ratio range `1.988558` to `2.069109`, 1x dominants bounce `host_touch`, direct `cxl_direct`.
+- PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE (`tpch_3op`): directional `true`, strictly-better points `4`, 1x bounce/direct ratio `1.018702`, ratio range `1.002911` to `1.026181`, 1x dominants bounce `host_link`, direct `host_link`.
 - Directional condition checks `direct <= bounce`; ratio range captures sensitivity across stage-size multipliers.
 
 ## TPC-H Target Check
 - In `tpch_3op`, large S1->S2 and S2->S3 intermediates make host-bounce pay double link traversal + touch, while FlowCXL direct pays a single inter-device transfer.
-- `PROFILE_TPCH_SF100_HIGH_INTERMEDIATE` at `1x`: bounce/direct ratio `2.051986` (105.199% gain) -> `PASS` (target `>=2.0`).
+- `PROFILE_TPCH_SF100_HIGH_INTERMEDIATE` at `1x`: bounce/direct ratio `2.038663` (103.866% gain) -> `PASS` (target `>=2.0`).
+
+## CPU Memory Ceiling Diagnostics (1x)
+| dataset_profile | scenario | memory_ceiling_enabled | total_compute_time_component_s | total_cpu_mem_time_component_s | total_pim_mem_time_component_s |
+| --- | --- | --- | --- | --- | --- |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | CPU only | True | 167.360000 | 186.393600 | 0.000000 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | PIM FlowCXL direct | True | 78.080000 | 0.000000 | 93.196800 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | PIM host bounce | True | 78.080000 | 0.000000 | 93.196800 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | CPU only | True | 49.696000 | 62.638080 | 0.000000 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | PIM FlowCXL direct | True | 20.714667 | 0.000000 | 31.319040 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | PIM host bounce | True | 20.714667 | 0.000000 | 31.319040 |
 
 ## Plot Artifacts
 - plot_makespan_grouped_PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE.png
@@ -30,64 +40,64 @@ Template-aware stage modeling with true host bounce and direct CXL movement show
 ## Results Table
 | dataset_profile | pipeline_template | stage_size_multiplier | scenario | makespan_s | total_energy_J | host_touch_energy_J | total_bytes_host_touch | dominant_lb_component |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | CPU only | 0.789556 | 372.720000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | PIM host bounce | 0.767953 | 118.734664 | 13.919040 | 11592000000 | host_link |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | PIM FlowCXL direct | 0.748006 | 93.840470 | 0.000000 | 0 | host_link |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | CPU only | 1.234000 | 745.440000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | PIM host bounce | 1.367116 | 237.469328 | 27.838080 | 23184000000 | host_link |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | PIM FlowCXL direct | 1.348662 | 187.680941 | 0.000000 | 0 | host_link |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | CPU only | 2.130286 | 1490.880000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | PIM host bounce | 2.572798 | 474.937444 | 55.676040 | 46368000000 | host_link |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | PIM FlowCXL direct | 2.550476 | 375.361510 | 0.000000 | 0 | host_link |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | CPU only | 4.144475 | 2981.760000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | PIM host bounce | 4.984175 | 949.873676 | 111.351960 | 92736000000 | host_link |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | PIM FlowCXL direct | 4.953337 | 750.722650 | 0.000000 | 0 | host_link |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | CPU only | 2.036923 | 1255.200000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | PIM host bounce | 4.022216 | 549.829656 | 116.680560 | 97200000000 | host_touch |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | PIM FlowCXL direct | 1.986191 | 341.313039 | 0.000000 | 0 | cxl_direct |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | CPU only | 4.005207 | 2510.400000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | PIM host bounce | 7.911568 | 1099.659312 | 233.361120 | 194400000000 | host_touch |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | PIM FlowCXL direct | 3.855567 | 682.626078 | 0.000000 | 0 | cxl_direct |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | CPU only | 7.762840 | 5020.800000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | PIM host bounce | 15.690272 | 2199.318624 | 466.722240 | 388800000000 | host_touch |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | PIM FlowCXL direct | 7.594317 | 1365.252156 | 0.000000 | 0 | cxl_direct |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | CPU only | 15.278107 | 10041.600000 | 0.000000 | 0 | compute_stage_max |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | PIM host bounce | 31.247680 | 4398.637248 | 933.444480 | 777600000000 | host_touch |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | PIM FlowCXL direct | 15.071819 | 2730.504311 | 0.000000 | 0 | cxl_direct |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | CPU only | 1.140693 | 520.588800 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | PIM host bounce | 0.867295 | 171.201864 | 13.919040 | 11592000000 | host_link |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | PIM FlowCXL direct | 0.845168 | 146.307670 | 0.000000 | 0 | host_link |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | CPU only | 1.799360 | 1041.177600 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | PIM host bounce | 1.472863 | 342.403728 | 27.838080 | 23184000000 | host_link |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | PIM FlowCXL direct | 1.445823 | 292.615341 | 0.000000 | 0 | host_link |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | CPU only | 3.127553 | 2082.355200 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | PIM host bounce | 2.667308 | 684.806244 | 55.676040 | 46368000000 | host_link |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | PIM FlowCXL direct | 2.647976 | 585.230310 | 0.000000 | 0 | host_link |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | CPU only | 6.112529 | 4164.710400 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | PIM host bounce | 5.065711 | 1369.611276 | 111.351960 | 92736000000 | host_link |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | PIM FlowCXL direct | 5.051007 | 1170.460250 | 0.000000 | 0 | host_link |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | CPU only | 2.164260 | 1900.800000 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | PIM host bounce | 4.070659 | 732.229656 | 116.680560 | 97200000000 | host_touch |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | PIM FlowCXL direct | 2.047040 | 523.713039 | 0.000000 | 0 | cxl_direct |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | CPU only | 4.132544 | 3801.600000 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | PIM host bounce | 7.984250 | 1464.459312 | 233.361120 | 194400000000 | host_touch |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | PIM FlowCXL direct | 3.916416 | 1047.426078 | 0.000000 | 0 | cxl_direct |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | CPU only | 7.890178 | 7603.200000 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | PIM host bounce | 15.738715 | 2928.918624 | 466.722240 | 388800000000 | host_touch |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | PIM FlowCXL direct | 7.655167 | 2094.852156 | 0.000000 | 0 | cxl_direct |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | CPU only | 15.405444 | 15206.400000 | 0.000000 | 0 | compute_stage_max |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | PIM host bounce | 31.311136 | 5857.837248 | 933.444480 | 777600000000 | host_touch |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | PIM FlowCXL direct | 15.132668 | 4189.704311 | 0.000000 | 0 | cxl_direct |
 
 ## Bottleneck Diagnostics
 ### PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE
 
 | dataset_profile | pipeline_template | stage_size_multiplier | scenario | makespan_s | total_energy_J | dominant_lb_component | lb_compute_stage_max_s | lb_host_h2d_ingress_s | lb_host_h2d_stage_s | lb_host_d2h_s | lb_host_link_s | lb_host_touch_s | lb_cxl_direct_s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | CPU only | 0.789556 | 372.720000 | compute_stage_max | 0.500000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | PIM FlowCXL direct | 0.748006 | 93.840470 | host_link | 0.200000 | 0.600655 | 0.000000 | 0.029005 | 0.600655 | 0.000000 | 0.222954 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | PIM host bounce | 0.767953 | 118.734664 | host_link | 0.200000 | 0.600655 | 0.363560 | 0.392566 | 0.600655 | 0.463968 | 0.000000 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | CPU only | 1.234000 | 745.440000 | compute_stage_max | 1.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | PIM FlowCXL direct | 1.348662 | 187.680941 | host_link | 0.400000 | 1.201310 | 0.000000 | 0.058010 | 1.201310 | 0.000000 | 0.445908 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | PIM host bounce | 1.367116 | 237.469328 | host_link | 0.400000 | 1.201310 | 0.727121 | 0.785131 | 1.201310 | 0.927936 | 0.000000 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | CPU only | 2.130286 | 1490.880000 | compute_stage_max | 2.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | PIM FlowCXL direct | 2.550476 | 375.361510 | host_link | 0.800000 | 2.402612 | 0.000000 | 0.116012 | 2.402612 | 0.000000 | 0.891815 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | PIM host bounce | 2.572798 | 474.937444 | host_link | 0.800000 | 2.402612 | 1.454223 | 1.570235 | 2.402612 | 1.855868 | 0.000000 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | CPU only | 4.144475 | 2981.760000 | compute_stage_max | 4.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | PIM FlowCXL direct | 4.953337 | 750.722650 | host_link | 1.600000 | 4.805214 | 0.000000 | 0.232014 | 4.805214 | 0.000000 | 1.783630 |
-| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | PIM host bounce | 4.984175 | 949.873676 | host_link | 1.600000 | 4.805214 | 2.908429 | 3.140443 | 4.805214 | 3.711732 | 0.000000 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | CPU only | 1.140693 | 520.588800 | compute_stage_max | 0.741000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | PIM FlowCXL direct | 0.845168 | 146.307670 | host_link | 0.370500 | 0.600655 | 0.000000 | 0.029005 | 0.600655 | 0.000000 | 0.222954 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 0.5x | PIM host bounce | 0.867295 | 171.201864 | host_link | 0.370500 | 0.600655 | 0.363560 | 0.392566 | 0.600655 | 0.463968 | 0.000000 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | CPU only | 1.799360 | 1041.177600 | compute_stage_max | 1.482000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | PIM FlowCXL direct | 1.445823 | 292.615341 | host_link | 0.741000 | 1.201310 | 0.000000 | 0.058010 | 1.201310 | 0.000000 | 0.445908 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 1x | PIM host bounce | 1.472863 | 342.403728 | host_link | 0.741000 | 1.201310 | 0.727121 | 0.785131 | 1.201310 | 0.927936 | 0.000000 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | CPU only | 3.127553 | 2082.355200 | compute_stage_max | 2.964000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | PIM FlowCXL direct | 2.647976 | 585.230310 | host_link | 1.482000 | 2.402612 | 0.000000 | 0.116012 | 2.402612 | 0.000000 | 0.891815 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 2x | PIM host bounce | 2.667308 | 684.806244 | host_link | 1.482000 | 2.402612 | 1.454223 | 1.570235 | 2.402612 | 1.855868 | 0.000000 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | CPU only | 6.112529 | 4164.710400 | compute_stage_max | 5.928000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | PIM FlowCXL direct | 5.051007 | 1170.460250 | host_link | 2.964000 | 4.805214 | 0.000000 | 0.232014 | 4.805214 | 0.000000 | 1.783630 |
+| PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE | tpch_3op | 4x | PIM host bounce | 5.065711 | 1369.611276 | host_link | 2.964000 | 4.805214 | 2.908429 | 3.140443 | 4.805214 | 3.711732 | 0.000000 |
 ### PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
 
 | dataset_profile | pipeline_template | stage_size_multiplier | scenario | makespan_s | total_energy_J | dominant_lb_component | lb_compute_stage_max_s | lb_host_h2d_ingress_s | lb_host_h2d_stage_s | lb_host_d2h_s | lb_host_link_s | lb_host_touch_s | lb_cxl_direct_s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | CPU only | 2.036923 | 1255.200000 | compute_stage_max | 1.890000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | PIM FlowCXL direct | 1.986191 | 341.313039 | cxl_direct | 0.945000 | 0.603076 | 0.000000 | 0.327076 | 0.603076 | 0.000000 | 1.869375 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | PIM host bounce | 4.022216 | 549.829656 | host_touch | 0.945000 | 0.603076 | 3.043652 | 3.370727 | 3.370727 | 3.889352 | 0.000000 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | CPU only | 4.005207 | 2510.400000 | compute_stage_max | 3.780000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | PIM FlowCXL direct | 3.855567 | 682.626078 | cxl_direct | 1.890000 | 1.206152 | 0.000000 | 0.654152 | 1.206152 | 0.000000 | 3.738751 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | PIM host bounce | 7.911568 | 1099.659312 | host_touch | 1.890000 | 1.206152 | 6.087303 | 6.741455 | 6.741455 | 7.778704 | 0.000000 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | CPU only | 7.762840 | 5020.800000 | compute_stage_max | 7.560000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | PIM FlowCXL direct | 7.594317 | 1365.252156 | cxl_direct | 3.780000 | 2.412303 | 0.000000 | 1.308303 | 2.412303 | 0.000000 | 7.477502 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | PIM host bounce | 15.690272 | 2199.318624 | host_touch | 3.780000 | 2.412303 | 12.174606 | 13.482910 | 13.482910 | 15.557408 | 0.000000 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | CPU only | 15.278107 | 10041.600000 | compute_stage_max | 15.120000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | PIM FlowCXL direct | 15.071819 | 2730.504311 | cxl_direct | 7.560000 | 4.824606 | 0.000000 | 2.616606 | 4.824606 | 0.000000 | 14.955003 |
-| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | PIM host bounce | 31.247680 | 4398.637248 | host_touch | 7.560000 | 4.824606 | 24.349213 | 26.965819 | 26.965819 | 31.114816 | 0.000000 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | CPU only | 2.164260 | 1900.800000 | compute_stage_max | 1.890000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | PIM FlowCXL direct | 2.047040 | 523.713039 | cxl_direct | 0.945000 | 0.603076 | 0.000000 | 0.327076 | 0.603076 | 0.000000 | 1.869375 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 0.5x | PIM host bounce | 4.070659 | 732.229656 | host_touch | 0.945000 | 0.603076 | 3.043652 | 3.370727 | 3.370727 | 3.889352 | 0.000000 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | CPU only | 4.132544 | 3801.600000 | compute_stage_max | 3.780000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | PIM FlowCXL direct | 3.916416 | 1047.426078 | cxl_direct | 1.890000 | 1.206152 | 0.000000 | 0.654152 | 1.206152 | 0.000000 | 3.738751 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 1x | PIM host bounce | 7.984250 | 1464.459312 | host_touch | 1.890000 | 1.206152 | 6.087303 | 6.741455 | 6.741455 | 7.778704 | 0.000000 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | CPU only | 7.890178 | 7603.200000 | compute_stage_max | 7.560000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | PIM FlowCXL direct | 7.655167 | 2094.852156 | cxl_direct | 3.780000 | 2.412303 | 0.000000 | 1.308303 | 2.412303 | 0.000000 | 7.477502 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 2x | PIM host bounce | 15.738715 | 2928.918624 | host_touch | 3.780000 | 2.412303 | 12.174606 | 13.482910 | 13.482910 | 15.557408 | 0.000000 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | CPU only | 15.405444 | 15206.400000 | compute_stage_max | 15.120000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | PIM FlowCXL direct | 15.132668 | 4189.704311 | cxl_direct | 7.560000 | 4.824606 | 0.000000 | 2.616606 | 4.824606 | 0.000000 | 14.955003 |
+| PROFILE_TPCH_SF100_HIGH_INTERMEDIATE | tpch_3op | 4x | PIM host bounce | 31.311136 | 5857.837248 | host_touch | 7.560000 | 4.824606 | 24.349213 | 26.965819 | 26.965819 | 31.114816 | 0.000000 |
 
 ## Citations
 - `PCIE4_X16_BW_Bps`: https://ww1.microchip.com/downloads/en/DeviceDoc/00003818.pdf
@@ -129,6 +139,9 @@ Template-aware stage modeling with true host bounce and direct CXL movement show
 - `HYBRID_GPU_DB_CONTEXT`: https://www.microsoft.com/en-us/research/publication/relational-query-processing-on-opencl-based-fpgas/
   Quote: "Transfers can dominate accelerator query pipelines."
   Used as: Context for transfer bottlenecks in analytical pipelines.
+- `OLAP_MEMORY_BOUND_CONTEXT`: https://www.microsoft.com/en-us/research/publication/relational-query-processing-on-opencl-based-fpgas/
+  Quote: "Operator placement is sensitive to host-device transfer overhead."
+  Used as: Supports memory/transfer bottleneck framing for OLAP stage modeling.
 - `UPMEM_SCAN_CONTEXT`: https://link.springer.com/article/10.1007/s11227-024-06378-8
   Quote: "PIM scan performance is sensitive to data movement."
   Used as: PIM counterpart context for scan/filter stage.
@@ -138,3 +151,9 @@ Template-aware stage modeling with true host bounce and direct CXL movement show
 - `DARWIN_ANALYTICS_CONTEXT`: https://pure.kaist.ac.kr/en/publications/darwin-a-dram-based-adaptive-in-memory-computing-architecture-for
   Quote: "In-memory analytics architecture targets data analytics operators."
   Used as: PIM counterpart context for aggregation stage.
+- `DARWIN_OPERATOR_GAIN_CONTEXT`: https://pure.kaist.ac.kr/en/publications/darwin-a-dram-based-adaptive-in-memory-computing-architecture-for
+  Quote: "Reports large operator-level throughput gains versus CPU baselines."
+  Used as: Context for using higher effective PIM throughput in OLAP stages.
+- `PID_JOIN_REAL_DIMM_CONTEXT`: https://arxiv.org/abs/2303.07591
+  Quote: "Join design and evaluation target real UPMEM DIMM constraints."
+  Used as: Context for join-stage PIM acceleration assumptions.
