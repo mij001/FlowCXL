@@ -28,7 +28,11 @@
 - Stage duration uses `max(compute_component, memory_component)`.
 - Bytes touched are derived per stage via input/output/amplification factors.
 - CPU and PIM memory ceilings are per-stage budgets shared across stage units.
-- CPU random-access penalties are applied for join/group-by memory components.
+- CPU stages use access-pattern DRAM-service descriptors:
+  - `access_pattern`, `row_hit_rate`, `mlp`, `avg_miss_latency_ns`
+  - sequential scan uses peak streaming cap
+  - hash/group-by patterns can become latency-limited (`mlp * cacheline / latency / miss_fraction`)
+- Legacy CPU random-access penalties remain as multiplicative compatibility factors after access-pattern service selection.
 - CPU-only pipeline breakers can inject explicit `MATERIALIZE` operations (default boundaries: `S1->S2`, `S2->S3`).
 
 ## Stage-device mapping
@@ -101,6 +105,8 @@ Per run:
   - `memory_ceiling_enabled`
   - `total_compute_time_component_s`
   - `total_cpu_mem_time_component_s`
+  - `total_cpu_mem_latency_bound_time_component_s`
+  - `total_cpu_mem_peak_bound_time_component_s`
   - `total_pim_mem_time_component_s`
 - CPU materialization diagnostics:
   - `total_cpu_materialize_bytes`

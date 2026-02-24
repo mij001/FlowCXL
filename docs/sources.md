@@ -36,10 +36,12 @@ These are explicit knobs in `sources.py`/`configs/runs.yaml`:
   - `pim_speedup_vs_cpu_by_stage_by_template`
 - Stage memory-ceiling knobs:
   - `enable_memory_ceiling_by_template`
+  - `dram_service_defaults`
   - `cpu_mem_Bps_by_stage_by_template`
   - `pim_mem_Bps_by_stage_by_template`
   - `bytes_touched_factors_by_stage_by_template`
   - `cpu_random_access_penalty_by_stage_by_template`
+  - `cpu_access_pattern_by_stage_by_template`
 - CPU pipeline-break materialization knobs:
   - `cpu_materialization_by_template`
   - `resource_capacity.cpu_materialize_channels`

@@ -33,7 +33,9 @@ The high-intermediate profile is configured to expose host-bounce penalties and 
   - `T_stage = max(T_compute, T_mem)`
   - CPU/PIM memory ceilings are configurable per stage and template
   - bytes-touched factors model scan/join/group-by read/write pressure
-  - CPU random-access penalties model join/group-by cache-miss pressure
+  - CPU access-pattern DRAM-service descriptors (`access_pattern`, `row_hit_rate`, `mlp`, `avg_miss_latency_ns`)
+    model peak-streaming vs latency-limited memory service
+  - CPU random-access penalties remain as compatibility multipliers on top of access-pattern service
 - Per-template scenario stage-device maps
 - Tile overlap with bounded in-flight window (`max_inflight_tiles`)
 - Transition-aware transfer graph:
@@ -53,6 +55,8 @@ The high-intermediate profile is configured to expose host-bounce penalties and 
   - `memory_ceiling_enabled`
   - `total_compute_time_component_s`
   - `total_cpu_mem_time_component_s`
+  - `total_cpu_mem_latency_bound_time_component_s`
+  - `total_cpu_mem_peak_bound_time_component_s`
   - `total_pim_mem_time_component_s`
   - `total_cpu_materialize_time_component_s`
 
