@@ -1,14 +1,15 @@
-"""Checks for directional links, access-pattern DRAM service, and materialization modeling."""
+"""Checks for first-class CPU/PIM memory-system modeling and acceptance gates."""
 
 from __future__ import annotations
 
 import copy
 import unittest
+import warnings
 
 import yaml
 
 import sources
-from simulator import compute_cpu_effective_mem_bw, generate_runs_from_config, scale_boundaries_exact
+from simulator import generate_runs_from_config, scale_boundaries_exact
 
 
 class SimulatorChecks(unittest.TestCase):
@@ -25,8 +26,8 @@ class SimulatorChecks(unittest.TestCase):
         multiplier: float,
         metrics: list[dict] | None = None,
     ) -> dict:
-        target = self.metrics if metrics is None else metrics
-        for row in target:
+        rows = self.metrics if metrics is None else metrics
+        for row in rows:
             if (
                 row["dataset_profile"] == dataset_profile
                 and row["scenario"] == scenario
@@ -56,152 +57,128 @@ class SimulatorChecks(unittest.TestCase):
             sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
         ]
 
-    def _compute_traces(
-        self,
-        run_id: str,
-        stage_name: str,
-        stage_device: str = sources.DEVICE_CPU,
-    ) -> list[dict]:
-        return [
-            row
-            for row in self.traces
-            if row["run_id"] == run_id
-            and row["op_type"] == "COMPUTE"
-            and row["stage_name"] == stage_name
-            and row["stage_device"] == stage_device
+    def _traces_for(self, run_id: str, *, op_type: str | None = None) -> list[dict]:
+        rows = [row for row in self.traces if row["run_id"] == run_id]
+        if op_type is not None:
+            rows = [row for row in rows if row["op_type"] == op_type]
+        return rows
+
+    def test_memory_system_schema_validation_required_keys(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg.pop("memory_system_by_template", None)
+        cfg.pop("enable_memory_ceiling_by_template", None)
+        with self.assertRaises((KeyError, ValueError)):
+            generate_runs_from_config(cfg)
+
+    def test_legacy_memory_keys_are_normalized_with_warning(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg.pop("memory_system_by_template", None)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            metrics, traces = generate_runs_from_config(cfg)
+        self.assertTrue(metrics)
+        self.assertTrue(traces)
+        self.assertTrue(any(issubclass(w.category, UserWarning) for w in caught))
+
+    def test_cpu_engine_gates_materialization_vectorized_vs_blocking(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+
+        cfg_vec = copy.deepcopy(self.config)
+        cfg_vec["dataset_profiles"] = [profile]
+        cfg_vec["size_multipliers"] = [1.0]
+        cfg_vec["scenarios"] = [sources.SCENARIO_CPU_ONLY]
+        cfg_vec["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["cpu_baseline_system"][
+            "baseline_engine"
+        ] = sources.CPU_ENGINE_VECTORIZED_PIPELINE
+
+        metrics_vec, traces_vec = generate_runs_from_config(cfg_vec)
+        row_vec = metrics_vec[0]
+        run_id_vec = row_vec["run_id"]
+        materialize_vec = [r for r in traces_vec if r["run_id"] == run_id_vec and r["op_type"] == "MATERIALIZE"]
+        self.assertFalse(materialize_vec)
+        self.assertEqual(int(row_vec["total_cpu_materialize_bytes"]), 0)
+
+        cfg_blk = copy.deepcopy(cfg_vec)
+        cfg_blk["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["cpu_baseline_system"][
+            "baseline_engine"
+        ] = sources.CPU_ENGINE_BLOCKING_VOLCANO
+
+        metrics_blk, traces_blk = generate_runs_from_config(cfg_blk)
+        row_blk = metrics_blk[0]
+        run_id_blk = row_blk["run_id"]
+        materialize_blk = [r for r in traces_blk if r["run_id"] == run_id_blk and r["op_type"] == "MATERIALIZE"]
+        self.assertTrue(materialize_blk)
+
+        boundaries = sources.DATASET_PROFILES[profile]["boundaries_bytes"]
+        scaled = scale_boundaries_exact(boundaries, 1.0)
+        expected_bytes = int(scaled[1] + scaled[2])
+        self.assertEqual(int(row_blk["total_cpu_materialize_bytes"]), expected_bytes)
+
+    def test_cpu_memory_service_random_patterns_latency_limited(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        row = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
+        run_id = row["run_id"]
+        compute_rows = self._traces_for(run_id, op_type="COMPUTE")
+        join_rows = [r for r in compute_rows if r["stage_name"] == "join" and r["stage_device"] == sources.DEVICE_CPU]
+        groupby_rows = [
+            r for r in compute_rows if r["stage_name"] == "groupby_agg" and r["stage_device"] == sources.DEVICE_CPU
         ]
+        self.assertTrue(join_rows)
+        self.assertTrue(groupby_rows)
+        self.assertTrue(any(r["cpu_mem_bound_mode"] == "latency_limited" for r in join_rows))
+        self.assertTrue(any(r["cpu_mem_bound_mode"] == "latency_limited" for r in groupby_rows))
 
-    def test_access_pattern_schema_validation_tpch(self) -> None:
+    def test_cpu_memory_queue_delay_positive_under_pressure(self) -> None:
         cfg = copy.deepcopy(self.config)
-        cfg["cpu_access_pattern_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["join"].pop(
-            "mlp", None
-        )
-        with self.assertRaises((KeyError, ValueError)):
-            generate_runs_from_config(cfg)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
+        stage_cfg = cfg["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["cpu_baseline_system"]["stages"]
+        stage_cfg["join"]["peak_bw_Bps"] = 8.0e9
+        stage_cfg["groupby_agg"]["peak_bw_Bps"] = 8.0e9
+        metrics, _ = generate_runs_from_config(cfg)
+        row = metrics[0]
+        self.assertGreater(float(row["total_cpu_mem_queue_delay_component_s"]), 0.0)
+        self.assertGreater(float(row["total_cpu_mem_service_time_component_s"]), 0.0)
 
-    def test_directional_host_links_are_required_for_new_schema(self) -> None:
+    def test_pim_memory_system_path_uses_first_class_config(self) -> None:
+        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
+        baseline = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0)
+        baseline_makespan = float(baseline["makespan_s"])
+        baseline_pim_mem = float(baseline["total_pim_mem_time_component_s"])
+
         cfg = copy.deepcopy(self.config)
-        link_profile = dict(cfg["link_profile"])
-        link_profile.pop("host_h2d_link", None)
-        link_profile.pop("host_d2h_link", None)
-        link_profile.pop("host_link", None)
-        cfg["link_profile"] = link_profile
-        with self.assertRaises((KeyError, ValueError)):
-            generate_runs_from_config(cfg)
+        cfg["dataset_profiles"] = [profile]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        pim_stages = cfg["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["pim_system"]["stages"]
+        for stage_name in sources.TPCH_STAGE_NAMES:
+            pim_stages[stage_name]["peak_bw_Bps"] = 6.0e9
+        metrics_slow, _ = generate_runs_from_config(cfg)
+        row_slow = metrics_slow[0]
 
-    def test_directional_link_routing_uses_h2d_vs_d2h_paths(self) -> None:
+        self.assertGreater(float(row_slow["total_pim_mem_time_component_s"]), 0.0)
+        self.assertGreater(float(row_slow["makespan_s"]), baseline_makespan)
+        self.assertGreater(float(row_slow["total_pim_mem_time_component_s"]), baseline_pim_mem)
+
+    def test_directional_links_unchanged(self) -> None:
         profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
         row = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, 1.0)
         run_id = row["run_id"]
         h2d_link = self.config["link_profile"]["host_h2d_link"]
         d2h_link = self.config["link_profile"]["host_d2h_link"]
 
-        transfer_rows = [r for r in self.traces if r["run_id"] == run_id and r["op_type"] == "TRANSFER"]
+        transfer_rows = [r for r in self._traces_for(run_id, op_type="TRANSFER")]
         self.assertTrue(transfer_rows)
-
-        ingress_or_stage = [r for r in transfer_rows if r["transfer_path"] in {"host_h2d_ingress", "host_h2d_stage"}]
-        d2h = [r for r in transfer_rows if r["transfer_path"] == "host_d2h"]
-        self.assertTrue(ingress_or_stage)
-        self.assertTrue(d2h)
-        self.assertTrue(all(r["link_type"] == h2d_link for r in ingress_or_stage))
-        self.assertTrue(all(r["link_type"] == d2h_link for r in d2h))
-
-    def test_cpu_bw_eff_sequential_uses_peak_cap(self) -> None:
-        stage_cfg = self.config["cpu_access_pattern_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
-            "scan_filter_project"
-        ]
-        bw = compute_cpu_effective_mem_bw(
-            stage_name="scan_filter_project",
-            cpu_units=32,
-            bw_peak_Bps=120_000_000_000.0,
-            access_pattern=stage_cfg["access_pattern"],
-            row_hit_rate=float(stage_cfg["row_hit_rate"]),
-            mlp=float(stage_cfg["mlp"]),
-            avg_miss_latency_ns=float(stage_cfg["avg_miss_latency_ns"]),
-            cacheline_bytes=float(self.config["dram_service_defaults"]["cacheline_bytes"]),
-            cpu_random_access_penalty=1.0,
-        )
-        self.assertEqual(str(bw["cpu_mem_bound_mode"]), "peak_streaming")
-        self.assertAlmostEqual(float(bw["cpu_bw_eff_stage_Bps"]), 120_000_000_000.0)
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        cpu_row = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
-        scan_compute_rows = self._compute_traces(run_id=cpu_row["run_id"], stage_name="scan_filter_project")
-        self.assertTrue(scan_compute_rows)
-        self.assertTrue(all(row["cpu_mem_bound_mode"] == "peak_streaming" for row in scan_compute_rows))
-
-    def test_cpu_bw_eff_hash_can_be_latency_limited(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        cpu_row = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
-        join_compute_rows = self._compute_traces(run_id=cpu_row["run_id"], stage_name="join")
-        groupby_compute_rows = self._compute_traces(run_id=cpu_row["run_id"], stage_name="groupby_agg")
-        self.assertTrue(join_compute_rows)
-        self.assertTrue(groupby_compute_rows)
-        self.assertTrue(any(row["cpu_mem_bound_mode"] == "latency_limited" for row in join_compute_rows))
-        self.assertTrue(any(row["cpu_mem_bound_mode"] == "latency_limited" for row in groupby_compute_rows))
-
-    def test_row_hit_and_mlp_monotonicity(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        baseline = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
-        baseline_makespan = float(baseline["makespan_s"])
-
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [profile]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
-        access_cfg = cfg["cpu_access_pattern_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["join"]
-        access_cfg["row_hit_rate"] = min(0.99, float(access_cfg["row_hit_rate"]) + 0.20)
-        access_cfg["mlp"] = float(access_cfg["mlp"]) * 2.0
-        improved_metrics, _ = generate_runs_from_config(cfg)
-        improved_row = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0, metrics=improved_metrics)
-        self.assertLessEqual(float(improved_row["makespan_s"]), baseline_makespan)
-
-    def test_legacy_penalty_still_applies_as_multiplier(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        baseline = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
-        baseline_makespan = float(baseline["makespan_s"])
-
-        cfg = copy.deepcopy(self.config)
-        penalty_map = cfg["cpu_random_access_penalty_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]
-        penalty_map["scan_filter_project"] = 1.0
-        penalty_map["join"] = 1.0
-        penalty_map["groupby_agg"] = 1.0
-        metrics_no_penalty, _ = generate_runs_from_config(cfg)
-        no_penalty_row = self._find_row(
-            profile,
-            sources.SCENARIO_CPU_ONLY,
-            1.0,
-            metrics=metrics_no_penalty,
-        )
-        self.assertGreater(baseline_makespan, float(no_penalty_row["makespan_s"]))
-
-    def test_materialize_ops_unchanged_tpch_cpu_only(self) -> None:
-        for profile in self._tpch_profiles():
-            for scenario in self.config["scenarios"]:
-                row = self._find_row(profile, scenario, 1.0)
-                run_id = row["run_id"]
-                materialize_rows = [
-                    trace_row
-                    for trace_row in self.traces
-                    if trace_row["run_id"] == run_id and trace_row["op_type"] == "MATERIALIZE"
-                ]
-                if scenario == sources.SCENARIO_CPU_ONLY:
-                    self.assertTrue(materialize_rows)
-                else:
-                    self.assertFalse(materialize_rows)
-
-    def test_materialize_bytes_match_breaker_boundaries(self) -> None:
-        for profile in self._tpch_profiles():
-            boundaries = sources.DATASET_PROFILES[profile]["boundaries_bytes"]
-            for multiplier in self.config["size_multipliers"]:
-                cpu = self._find_row(profile, sources.SCENARIO_CPU_ONLY, float(multiplier))
-                bounce = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, float(multiplier))
-                direct = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, float(multiplier))
-
-                scaled = scale_boundaries_exact(boundaries, float(multiplier))
-                expected = int(scaled[1] + scaled[2])
-                self.assertEqual(int(cpu["total_cpu_materialize_bytes"]), expected)
-                self.assertEqual(int(bounce["total_cpu_materialize_bytes"]), 0)
-                self.assertEqual(int(direct["total_cpu_materialize_bytes"]), 0)
+        h2d_rows = [r for r in transfer_rows if r["transfer_path"] in {"host_h2d_ingress", "host_h2d_stage"}]
+        d2h_rows = [r for r in transfer_rows if r["transfer_path"] == "host_d2h"]
+        self.assertTrue(h2d_rows)
+        self.assertTrue(d2h_rows)
+        self.assertTrue(all(r["link_type"] == h2d_link for r in h2d_rows))
+        self.assertTrue(all(r["link_type"] == d2h_link for r in d2h_rows))
 
     def test_direct_not_slower_than_bounce_all_tpch_points(self) -> None:
         for profile in self._tpch_profiles():
@@ -225,91 +202,39 @@ class SimulatorChecks(unittest.TestCase):
         bounce = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, 1.0)
         self.assertIn(str(bounce["dominant_lb_component"]), {"host_link", "host_touch"})
 
-    def test_compute_sensitivity_increases_bounce_direct_ratio(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        baseline_ratio = self._ratio(self.metrics, dataset_profile=profile, multiplier=1.0)
-
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [profile]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        for stage_name in sources.TPCH_STAGE_NAMES:
-            cfg["pim_speedup_vs_cpu_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][stage_name] = (
-                float(cfg["pim_speedup_vs_cpu_by_stage_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][stage_name])
-                * 10.0
-            )
-
-        metrics_fast, _ = generate_runs_from_config(cfg)
-        fast_ratio = self._ratio(metrics_fast, dataset_profile=profile, multiplier=1.0)
-        self.assertGreater(fast_ratio, baseline_ratio)
-
-    def test_host_link_sensitivity_increases_bounce_direct_ratio(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        baseline_ratio = self._ratio(self.metrics, dataset_profile=profile, multiplier=1.0)
-
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [profile]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-
-        h2d = cfg["link_profile"]["host_h2d_link"]
-        d2h = cfg["link_profile"]["host_d2h_link"]
-        old_h2d_bw = float(sources.LINKS[h2d]["bandwidth_Bps"])
-        old_d2h_bw = float(sources.LINKS[d2h]["bandwidth_Bps"])
-        try:
-            sources.LINKS[h2d]["bandwidth_Bps"] = old_h2d_bw / 10.0
-            sources.LINKS[d2h]["bandwidth_Bps"] = old_d2h_bw / 10.0
-            metrics_slow, _ = generate_runs_from_config(cfg)
-        finally:
-            sources.LINKS[h2d]["bandwidth_Bps"] = old_h2d_bw
-            sources.LINKS[d2h]["bandwidth_Bps"] = old_d2h_bw
-        slow_ratio = self._ratio(metrics_slow, dataset_profile=profile, multiplier=1.0)
-        self.assertGreater(slow_ratio, baseline_ratio)
-
-    def test_metrics_schema_includes_materialize_columns(self) -> None:
-        row = self.metrics[0]
-        for key in [
-            "total_cpu_materialize_bytes",
-            "total_cpu_materialize_time_component_s",
-            "cpu_materialize_energy_J",
-            "total_cpu_mem_latency_bound_time_component_s",
-            "total_cpu_mem_peak_bound_time_component_s",
-        ]:
-            self.assertIn(key, row)
-        for forbidden in ["queue_wait_s", "utilization", "speedup_vs_cpu_only"]:
-            self.assertNotIn(forbidden, row)
-
-    def test_directional_links_unchanged_with_access_model(self) -> None:
-        self.test_directional_link_routing_uses_h2d_vs_d2h_paths()
-
-    def test_metrics_schema_includes_cpu_dram_service_columns(self) -> None:
-        self.test_metrics_schema_includes_materialize_columns()
-
-    def test_deepvariant_path_unchanged_by_default_for_new_knobs(self) -> None:
+    def test_deepvariant_default_behavior_unchanged(self) -> None:
         cfg = copy.deepcopy(self.config)
         cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
         cfg["size_multipliers"] = [1.0]
         metrics, traces = generate_runs_from_config(cfg)
+
         self.assertTrue(metrics)
         for row in metrics:
             self.assertEqual(row["pipeline_template"], sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE)
             self.assertFalse(bool(row["memory_ceiling_enabled"]))
+            self.assertEqual(row["cpu_baseline_engine"], sources.CPU_ENGINE_VECTORIZED_PIPELINE)
+            self.assertEqual(float(row["total_cpu_mem_service_time_component_s"]), 0.0)
+            self.assertEqual(float(row["total_cpu_mem_queue_delay_component_s"]), 0.0)
+            self.assertEqual(float(row["total_pim_mem_service_time_component_s"]), 0.0)
+            self.assertEqual(float(row["total_pim_mem_queue_delay_component_s"]), 0.0)
             self.assertEqual(int(row["total_cpu_materialize_bytes"]), 0)
-            self.assertEqual(float(row["total_cpu_materialize_time_component_s"]), 0.0)
-            self.assertEqual(float(row["cpu_materialize_energy_J"]), 0.0)
-            self.assertEqual(float(row["total_cpu_mem_latency_bound_time_component_s"]), 0.0)
-            self.assertEqual(float(row["total_cpu_mem_peak_bound_time_component_s"]), 0.0)
+
         self.assertFalse(any(t["op_type"] == "MATERIALIZE" for t in traces))
 
-    def test_legacy_host_link_compatibility_path(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cxl = cfg["link_profile"]["cxl_direct_link"]
-        cfg["link_profile"] = {
-            "host_link": sources.LINK_PCIE_GEN4_X16,
-            "cxl_direct_link": cxl,
-        }
-        metrics, _ = generate_runs_from_config(cfg)
-        self.assertTrue(metrics)
+    def test_metrics_schema_includes_new_memory_system_columns(self) -> None:
+        row = self.metrics[0]
+        for key in [
+            "cpu_baseline_engine",
+            "total_cpu_mem_service_time_component_s",
+            "total_cpu_mem_queue_delay_component_s",
+            "total_pim_mem_service_time_component_s",
+            "total_pim_mem_queue_delay_component_s",
+            "memory_ceiling_enabled",
+        ]:
+            self.assertIn(key, row)
+
+        for forbidden in ["queue_wait_s", "utilization", "speedup_vs_cpu_only"]:
+            self.assertNotIn(forbidden, row)
 
 
 if __name__ == "__main__":

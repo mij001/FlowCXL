@@ -147,7 +147,7 @@ Tile compute duration:
 T_{compute}(s,k) = \frac{X_{s-1,k}}{R_s}
 \]
 
-## 5b) Bytes touched and memory ceiling
+## 5b) Bytes touched and first-class memory service
 
 For tile `k` at stage `s`:
 
@@ -159,19 +159,21 @@ For tile `k` at stage `s`:
 bytes\_touched(s,k) = f_{amp}(s)\cdot\left(f_{in}(s)\cdot bytes_{in} + f_{out}(s)\cdot bytes_{out}\right)
 \]
 
-If memory ceiling is enabled for the template, stage memory bandwidth is shared across stage units:
+When `memory_system_by_template[template].enabled = true`, CPU and PIM stages use their own system configs:
 
-\[
-BW_{mem,unit}(s) = \frac{BW_{mem,stage}(s)}{U_s}
-\]
+- `cpu_baseline_system.stages[s]`
+- `pim_system.stages[s]`
 
-For CPU stages, access-pattern DRAM-service modeling is used:
+Inputs per stage:
 
 - `a_s`: access pattern in `{sequential_scan, hash_probe, hash_build, groupby_update}`
-- `h_s`: row-hit proxy in `[0,1]`
-- `m_s`: memory-level parallelism (MLP), `> 0`
-- `L_s`: average miss latency in ns, `> 0`
-- `CL`: cacheline bytes
+- `h_s`: row-hit rate proxy
+- `m_s`: memory-level parallelism
+- `L_s`: average miss latency (ns)
+- `BW_peak(s)`: stage peak memory service bandwidth
+- `p_s`: penalty multiplier (CPU compatibility path, default `1.0`; PIM uses `1.0`)
+- `U_s`: stage units
+- queue model parameters: `queue_alpha`, `rho_cap`
 
 \[
 miss_s = max(10^{-6}, 1-h_s)
@@ -180,7 +182,7 @@ miss_s = max(10^{-6}, 1-h_s)
 BW_{lat}(s) = \frac{m_s \cdot CL}{(L_s \cdot 10^{-9}) \cdot miss_s}
 \]
 
-Pattern service cap:
+Pattern-limited service:
 
 \[
 BW_{service}(s) =
@@ -190,17 +192,33 @@ min(BW_{peak}(s), BW_{lat}(s)), & \text{otherwise}
 \end{cases}
 \]
 
-Legacy stage penalty multiplier `p_{cpu}(s) >= 1` is then applied:
+Penalty-adjusted service:
 
 \[
-BW_{cpu,eff}(s) = \frac{BW_{service}(s)}{p_{cpu}(s)}
+BW_{service,adj}(s) = \frac{BW_{service}(s)}{p_s}
+\]
+
+Offered load estimate:
+
+\[
+BW_{offered}(s,k) = \frac{bytes\_touched(s,k)}{max(T_{compute}(s,k), \epsilon)}
 \]
 
 \[
-T_{mem}(s,k) = \frac{bytes\_touched(s,k)}{BW_{mem,unit}(s)}
+\rho(s,k) = min\left(\rho_{cap}, \frac{BW_{offered}(s,k)}{BW_{service,adj}(s)}\right)
 \]
-
-with `BW_mem,unit` taken from `BW_cpu,eff/U_cpu` for CPU stages and `BW_pim/U_pim` for PIM stages.
+\[
+Q(s,k) = 1 + queue_{\alpha}\cdot\frac{\rho(s,k)}{1-\rho(s,k)}
+\]
+\[
+BW_{eff,stage}(s,k) = \frac{BW_{service,adj}(s)}{Q(s,k)}
+\]
+\[
+BW_{eff,unit}(s,k) = \frac{BW_{eff,stage}(s,k)}{U_s}
+\]
+\[
+T_{mem}(s,k) = \frac{bytes\_touched(s,k)}{BW_{eff,unit}(s,k)}
+\]
 
 Final compute-op duration:
 
@@ -212,6 +230,15 @@ If memory ceiling is disabled for the template:
 
 \[
 T_{stage}(s,k) = T_{compute}(s,k)
+\]
+
+Service-vs-queue diagnostics:
+
+\[
+T_{mem,service}(s,k) = \frac{bytes\_touched(s,k)}{BW_{service,adj}(s)/U_s}
+\]
+\[
+T_{mem,queue}(s,k) = max(0, T_{mem}(s,k)-T_{mem,service}(s,k))
 \]
 
 ## 6) Transfer duration
@@ -255,7 +282,8 @@ For stage transition `s -> s+1`:
 - `pim -> cpu`: `host_d2h`
 - `pim -> pim` in bounce: `host_d2h -> HOST_TOUCH -> host_h2d_stage`
 - `pim -> pim` in direct: `cxl_direct`
-- `cpu_only` pipeline-break boundaries in `tpch_3op`: `MATERIALIZE`
+- `MATERIALIZE` boundaries for CPU-only runs come from
+  `cpu_baseline_system.materialization_policy.boundaries_by_engine[baseline_engine]`
 
 Ingress `host_h2d_ingress` is added only when stage 1 is on PIM.
 Egress `host_d2h` is added only when final stage is on PIM.

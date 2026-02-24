@@ -70,33 +70,6 @@ cpu_stage_unit_compute_Bps_by_template:
     join: 900000000.0
     groupby_agg: 1500000000.0
 
-enable_memory_ceiling_by_template:
-  deepvariant_3stage: false
-  tpch_3op: true
-
-dram_service_defaults:
-  cacheline_bytes: 64
-
-cpu_mem_Bps_by_stage_by_template:
-  deepvariant_3stage:
-    make_examples: 120000000000.0
-    call_variants: 120000000000.0
-    postprocess_variants: 120000000000.0
-  tpch_3op:
-    scan_filter_project: 120000000000.0
-    join: 120000000000.0
-    groupby_agg: 120000000000.0
-
-pim_mem_Bps_by_stage_by_template:
-  deepvariant_3stage:
-    make_examples: 240000000000.0
-    call_variants: 240000000000.0
-    postprocess_variants: 240000000000.0
-  tpch_3op:
-    scan_filter_project: 240000000000.0
-    join: 240000000000.0
-    groupby_agg: 240000000000.0
-
 bytes_touched_factors_by_stage_by_template:
   deepvariant_3stage:
     make_examples:
@@ -124,6 +97,108 @@ bytes_touched_factors_by_stage_by_template:
       input_factor: 1.0
       output_factor: 1.0
       amplification_factor: 1.0
+
+memory_system_by_template:
+  deepvariant_3stage:
+    enabled: false
+    cpu_baseline_system:
+      baseline_engine: vectorized_pipeline
+    pim_system:
+      enabled: false
+  tpch_3op:
+    enabled: true
+    cpu_baseline_system:
+      baseline_engine: vectorized_pipeline
+      dram_channels: 8
+      banks_per_channel: 16
+      cacheline_bytes: 64
+      queueing_model: utilization_penalty
+      queue_alpha: 0.35
+      rho_cap: 0.95
+      stages:
+        scan_filter_project:
+          access_pattern: sequential_scan
+          row_hit_rate: 0.92
+          mlp: 32
+          avg_miss_latency_ns: 95.0
+          peak_bw_Bps: 120000000000.0
+          penalty_multiplier: 1.0
+        join:
+          access_pattern: hash_probe
+          row_hit_rate: 0.18
+          mlp: 8
+          avg_miss_latency_ns: 130.0
+          peak_bw_Bps: 120000000000.0
+          penalty_multiplier: 3.0
+        groupby_agg:
+          access_pattern: groupby_update
+          row_hit_rate: 0.28
+          mlp: 10
+          avg_miss_latency_ns: 125.0
+          peak_bw_Bps: 120000000000.0
+          penalty_multiplier: 2.0
+      materialization_policy:
+        boundaries_by_engine:
+          vectorized_pipeline: []
+          blocking_volcano: [1, 2]
+        materialize_Bps: 80000000000.0
+        fixed_s: 0.000002
+        scenarios: [cpu_only]
+    pim_system:
+      enabled: true
+      dram_channels: 16
+      banks_per_channel: 16
+      cacheline_bytes: 64
+      queueing_model: utilization_penalty
+      queue_alpha: 0.20
+      rho_cap: 0.95
+      stages:
+        scan_filter_project:
+          access_pattern: sequential_scan
+          row_hit_rate: 0.95
+          mlp: 64
+          avg_miss_latency_ns: 80.0
+          peak_bw_Bps: 240000000000.0
+        join:
+          access_pattern: hash_probe
+          row_hit_rate: 0.70
+          mlp: 32
+          avg_miss_latency_ns: 100.0
+          peak_bw_Bps: 240000000000.0
+        groupby_agg:
+          access_pattern: groupby_update
+          row_hit_rate: 0.70
+          mlp: 32
+          avg_miss_latency_ns: 100.0
+          peak_bw_Bps: 240000000000.0
+
+# Deprecated compatibility keys (used only if memory_system_by_template is absent)
+enable_memory_ceiling_by_template:
+  deepvariant_3stage: false
+  tpch_3op: true
+
+dram_service_defaults:
+  cacheline_bytes: 64
+
+cpu_mem_Bps_by_stage_by_template:
+  deepvariant_3stage:
+    make_examples: 120000000000.0
+    call_variants: 120000000000.0
+    postprocess_variants: 120000000000.0
+  tpch_3op:
+    scan_filter_project: 120000000000.0
+    join: 120000000000.0
+    groupby_agg: 120000000000.0
+
+pim_mem_Bps_by_stage_by_template:
+  deepvariant_3stage:
+    make_examples: 240000000000.0
+    call_variants: 240000000000.0
+    postprocess_variants: 240000000000.0
+  tpch_3op:
+    scan_filter_project: 240000000000.0
+    join: 240000000000.0
+    groupby_agg: 240000000000.0
 
 cpu_random_access_penalty_by_stage_by_template:
   deepvariant_3stage:

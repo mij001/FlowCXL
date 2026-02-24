@@ -34,16 +34,22 @@ These are explicit knobs in `sources.py`/`configs/runs.yaml`:
 - Stage compute rates/speedups:
   - `cpu_stage_unit_compute_Bps_by_template`
   - `pim_speedup_vs_cpu_by_stage_by_template`
-- Stage memory-ceiling knobs:
+- First-class memory-system knobs:
+  - `memory_system_by_template`
+  - `memory_system_by_template.<template>.cpu_baseline_system`
+  - `memory_system_by_template.<template>.pim_system`
+  - `memory_system_by_template.<template>.cpu_baseline_system.baseline_engine`
+  - `memory_system_by_template.<template>.cpu_baseline_system.materialization_policy`
+  - `bytes_touched_factors_by_stage_by_template`
+- Deprecated compatibility knobs (used only when `memory_system_by_template` is absent):
   - `enable_memory_ceiling_by_template`
   - `dram_service_defaults`
   - `cpu_mem_Bps_by_stage_by_template`
   - `pim_mem_Bps_by_stage_by_template`
-  - `bytes_touched_factors_by_stage_by_template`
   - `cpu_random_access_penalty_by_stage_by_template`
   - `cpu_access_pattern_by_stage_by_template`
-- CPU pipeline-break materialization knobs:
   - `cpu_materialization_by_template`
+- CPU pipeline-break materialization knobs:
   - `resource_capacity.cpu_materialize_channels`
   - `transfer_power_W.cpu_materialize_channel`
 - Scenario stage maps:

@@ -24,16 +24,24 @@
 - Stages: `scan_filter_project -> join -> groupby_agg`
 - Boundaries are derived from rows/selectivity/fanout/reduction parameters.
 - CPU stage rates come from template stage-rate defaults.
-- Memory ceiling is enabled by default.
+- First-class memory systems are enabled by default for this template (`memory_system_by_template.tpch_3op.enabled=true`).
 - Stage duration uses `max(compute_component, memory_component)`.
 - Bytes touched are derived per stage via input/output/amplification factors.
-- CPU and PIM memory ceilings are per-stage budgets shared across stage units.
+- CPU and PIM memory service each use their own system config objects:
+  - `cpu_baseline_system`
+  - `pim_system`
+- Both systems use the same service+queue path:
+  - access-pattern service cap
+  - utilization-penalty queue multiplier
 - CPU stages use access-pattern DRAM-service descriptors:
   - `access_pattern`, `row_hit_rate`, `mlp`, `avg_miss_latency_ns`
   - sequential scan uses peak streaming cap
   - hash/group-by patterns can become latency-limited (`mlp * cacheline / latency / miss_fraction`)
-- Legacy CPU random-access penalties remain as multiplicative compatibility factors after access-pattern service selection.
-- CPU-only pipeline breakers can inject explicit `MATERIALIZE` operations (default boundaries: `S1->S2`, `S2->S3`).
+- CPU penalty multipliers remain as compatibility terms inside CPU stage service configs.
+- CPU materialization is baseline-engine gated:
+  - `vectorized_pipeline` (default): no forced barriers
+  - `blocking_volcano`: default breaker boundaries `[1,2]`
+  - scenario gating still applies (`materialization_policy.scenarios`)
 
 ## Stage-device mapping
 
@@ -101,13 +109,18 @@ Per run:
 - transfer bytes (`host_link`, `cxl_direct`, `host_touch`, path-specific bytes)
 - LB diagnostics (`lb_*`) and `dominant_lb_component`
 - `pipeline_template`
+- `cpu_baseline_engine`
 - Memory-ceiling diagnostics:
   - `memory_ceiling_enabled`
   - `total_compute_time_component_s`
   - `total_cpu_mem_time_component_s`
   - `total_cpu_mem_latency_bound_time_component_s`
   - `total_cpu_mem_peak_bound_time_component_s`
+  - `total_cpu_mem_service_time_component_s`
+  - `total_cpu_mem_queue_delay_component_s`
   - `total_pim_mem_time_component_s`
+  - `total_pim_mem_service_time_component_s`
+  - `total_pim_mem_queue_delay_component_s`
 - CPU materialization diagnostics:
   - `total_cpu_materialize_bytes`
   - `total_cpu_materialize_time_component_s`

@@ -29,13 +29,17 @@ The high-intermediate profile is configured to expose host-bounce penalties and 
 ## What is modeled
 
 - Stage-limited compute pools (CPU/PIM)
-- Template-scoped memory ceilings (`tpch_3op` enabled by default, DeepVariant disabled by default):
+- First-class template-scoped memory systems via `memory_system_by_template`:
+  - `cpu_baseline_system` and `pim_system` are configured separately
+  - DeepVariant defaults to `enabled: false` (compute-only behavior preserved)
+  - TPC-H defaults to `enabled: true`
+  - legacy memory keys are accepted only as deprecated compatibility input when `memory_system_by_template` is absent
+- Memory service model (when enabled):
   - `T_stage = max(T_compute, T_mem)`
-  - CPU/PIM memory ceilings are configurable per stage and template
+  - service BW from access pattern + miss behavior + peak BW
+  - queueing multiplier from utilization (`queue_alpha`, `rho_cap`)
   - bytes-touched factors model scan/join/group-by read/write pressure
-  - CPU access-pattern DRAM-service descriptors (`access_pattern`, `row_hit_rate`, `mlp`, `avg_miss_latency_ns`)
-    model peak-streaming vs latency-limited memory service
-  - CPU random-access penalties remain as compatibility multipliers on top of access-pattern service
+  - CPU penalty multiplier remains supported for compatibility as part of stage service config
 - Per-template scenario stage-device maps
 - Tile overlap with bounded in-flight window (`max_inflight_tiles`)
 - Transition-aware transfer graph:
@@ -48,16 +52,23 @@ The high-intermediate profile is configured to expose host-bounce penalties and 
 - Split host H2D topology: ingress vs stage channels
 - Directional host links for host staging (`host_h2d_link`, `host_d2h_link`)
   - Legacy `host_link` is still accepted and mapped to both directions
-- CPU-only materialization barriers for configured TPC-H pipeline-break boundaries
+- CPU materialization policy is baseline-engine gated:
+  - `baseline_engine=vectorized_pipeline` (default): no forced barriers
+  - `baseline_engine=blocking_volcano`: configured breaker boundaries (default `[1,2]`)
 - Makespan and energy accounting
 - Lower-bound bottleneck diagnostics (`lb_*`, `dominant_lb_component`)
 - Memory-ceiling diagnostics:
   - `memory_ceiling_enabled`
+  - `cpu_baseline_engine`
   - `total_compute_time_component_s`
   - `total_cpu_mem_time_component_s`
   - `total_cpu_mem_latency_bound_time_component_s`
   - `total_cpu_mem_peak_bound_time_component_s`
+  - `total_cpu_mem_service_time_component_s`
+  - `total_cpu_mem_queue_delay_component_s`
   - `total_pim_mem_time_component_s`
+  - `total_pim_mem_service_time_component_s`
+  - `total_pim_mem_queue_delay_component_s`
   - `total_cpu_materialize_time_component_s`
 
 ## Repo layout

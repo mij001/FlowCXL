@@ -34,6 +34,13 @@ ACCESS_PATTERNS = (
     ACCESS_PATTERN_GROUPBY_UPDATE,
 )
 
+CPU_ENGINE_VECTORIZED_PIPELINE = "vectorized_pipeline"
+CPU_ENGINE_BLOCKING_VOLCANO = "blocking_volcano"
+CPU_BASELINE_ENGINES = (
+    CPU_ENGINE_VECTORIZED_PIPELINE,
+    CPU_ENGINE_BLOCKING_VOLCANO,
+)
+
 PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE = "deepvariant_3stage"
 PIPELINE_TEMPLATE_TPCH_3OP = "tpch_3op"
 
@@ -439,6 +446,24 @@ CITED_VALUES = {
         "url": "https://github.com/upmem/dpu_olap",
         "quote": "Public OLAP-oriented PIM kernels demonstrate in-memory operator implementations.",
         "how_used": "Context for stage-level PIM operator capability assumptions in TPC-H modeling.",
+    },
+    "ATTACC_BASELINE_MODELING_CONTEXT": {
+        "value": "qualitative",
+        "url": "https://deepwiki.com/scale-snu/attacc_simulator/1-overview",
+        "quote": "Baseline and accelerator configurations are modeled as distinct system configurations.",
+        "how_used": "Supports first-class CPU/PIM system configuration in the simulator.",
+    },
+    "ATTACC_TRACE_TIMING_CONTEXT": {
+        "value": "qualitative",
+        "url": "https://deepwiki.com/scale-snu/attacc_simulator/3-memory-model",
+        "quote": "Timing is derived from access behavior through the memory model.",
+        "how_used": "Supports moving away from ad-hoc CPU-only slowdown paths.",
+    },
+    "PIMDAL_ANALYTICS_BASELINE_CONTEXT": {
+        "value": "qualitative",
+        "url": "https://arxiv.org/abs/2403.11888",
+        "quote": "PIM data-analytics evaluations use comparable CPU-side baselines and PIM implementations.",
+        "how_used": "Supports calibrated CPU/PIM operator assumptions for OLAP stages.",
     },
 }
 

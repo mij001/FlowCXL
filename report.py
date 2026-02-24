@@ -84,7 +84,11 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
         "total_cpu_mem_time_component_s",
         "total_cpu_mem_latency_bound_time_component_s",
         "total_cpu_mem_peak_bound_time_component_s",
+        "total_cpu_mem_service_time_component_s",
+        "total_cpu_mem_queue_delay_component_s",
         "total_pim_mem_time_component_s",
+        "total_pim_mem_service_time_component_s",
+        "total_pim_mem_queue_delay_component_s",
         "total_cpu_materialize_time_component_s",
         "lb_compute_stage_max_s",
         "lb_host_h2d_ingress_s",
@@ -107,6 +111,7 @@ def _dataset_diagnostic_table(metrics_df: pd.DataFrame, dataset_profile: str) ->
     cols = [
         "dataset_profile",
         "pipeline_template",
+        "cpu_baseline_engine",
         "stage_size_multiplier",
         "scenario",
         "makespan_s",
@@ -130,13 +135,19 @@ def _memory_ceiling_diagnostic_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
     subset["scenario"] = subset["scenario"].map(SCENARIO_LABELS)
     cols = [
         "dataset_profile",
+        "pipeline_template",
+        "cpu_baseline_engine",
         "scenario",
         "memory_ceiling_enabled",
         "total_compute_time_component_s",
         "total_cpu_mem_time_component_s",
         "total_cpu_mem_latency_bound_time_component_s",
         "total_cpu_mem_peak_bound_time_component_s",
+        "total_cpu_mem_service_time_component_s",
+        "total_cpu_mem_queue_delay_component_s",
         "total_pim_mem_time_component_s",
+        "total_pim_mem_service_time_component_s",
+        "total_pim_mem_queue_delay_component_s",
         "total_cpu_materialize_time_component_s",
         "total_cpu_materialize_bytes",
         "cpu_materialize_energy_J",
@@ -326,7 +337,7 @@ def main() -> None:
         "## High-Intermediate Regime Check\n"
         "- Regime-based CPU comparison replaces brittle all-point CPU assertions.\n"
         f"{_tpch_cpu_direct_regime_narrative(metrics_df)}\n\n"
-        "## CPU Memory Ceiling Diagnostics (1x)\n"
+        "## Memory-System Diagnostics (1x)\n"
         f"{_build_markdown_table(memory_diag_table)}\n\n"
         "## Plot Artifacts\n"
         f"{chr(10).join(plot_lines)}\n\n"
