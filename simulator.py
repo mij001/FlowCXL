@@ -1176,7 +1176,7 @@ def _stage_overrides_for_dataset(
     return stage_overrides.get(dataset_profile, {})
 
 
-def _profile_stage_names(profile: Mapping[str, object]) -> List[str]:
+def _profile_execution_stage_names(profile: Mapping[str, object]) -> List[str]:
     stage_names = profile.get("stage_names")
     if not isinstance(stage_names, Sequence):
         raise ValueError("profile is missing stage_names sequence")
@@ -1184,6 +1184,23 @@ def _profile_stage_names(profile: Mapping[str, object]) -> List[str]:
     if not normalized:
         raise ValueError("profile stage_names cannot be empty")
     return normalized
+
+
+def _profile_public_stage_names(profile: Mapping[str, object]) -> List[str]:
+    public_stage_names = profile.get("public_stage_names")
+    if public_stage_names is None:
+        return _profile_execution_stage_names(profile)
+    if not isinstance(public_stage_names, Sequence):
+        raise ValueError("profile public_stage_names must be a sequence when present")
+    normalized = [str(name) for name in public_stage_names]
+    if not normalized:
+        raise ValueError("profile public_stage_names cannot be empty")
+    return normalized
+
+
+def _profile_stage_names(profile: Mapping[str, object]) -> List[str]:
+    # Backward-compatible alias for existing call sites.
+    return _profile_execution_stage_names(profile)
 
 
 def _profile_template(profile: Mapping[str, object]) -> str:
@@ -1251,13 +1268,54 @@ def _derive_compute_rates_for_stages(
         if runtime_total_s <= 0:
             raise ValueError("cpu_reference_total_runtime_s_1x must be > 0")
 
+        make_examples_share = float(stage_shares["make_examples"])
+        call_variants_share = float(stage_shares["call_variants"])
+        postprocess_share = float(stage_shares["postprocess_variants"])
+        make_examples_frontend_fraction = float(
+            params.get("make_examples_frontend_fraction_of_make_examples", 0.45)
+        )
+        call_variants_infer_fraction = float(
+            params.get("call_variants_infer_fraction_of_call_variants", 0.85)
+        )
+        if not 0.0 <= make_examples_frontend_fraction <= 1.0:
+            raise ValueError("make_examples_frontend_fraction_of_make_examples must be in [0,1]")
+        if not 0.0 <= call_variants_infer_fraction <= 1.0:
+            raise ValueError("call_variants_infer_fraction_of_call_variants must be in [0,1]")
+
+        kernel_stage_shares = {
+            "make_examples_frontend": make_examples_share * make_examples_frontend_fraction,
+            "make_examples_tensorize": make_examples_share * (1.0 - make_examples_frontend_fraction),
+            "call_variants_infer": call_variants_share * call_variants_infer_fraction,
+            "call_variants_post": call_variants_share * (1.0 - call_variants_infer_fraction),
+            "postprocess_variants": postprocess_share,
+        }
+
+        using_kernel_split = all(stage_name in kernel_stage_shares for stage_name in stage_names)
+        if using_kernel_split:
+            share_sum = sum(kernel_stage_shares[stage_name] for stage_name in stage_names)
+            if share_sum <= 0:
+                raise ValueError("deepvariant kernel stage shares must sum to > 0")
+            stage_share_map = {
+                stage_name: kernel_stage_shares[stage_name] / share_sum for stage_name in stage_names
+            }
+        else:
+            # Backward compatibility for custom 3-stage profiles.
+            stage_share_map = {}
+            for stage_name in stage_names:
+                if stage_name not in stage_shares:
+                    raise KeyError(f"cpu_stage_time_share_1x missing stage {stage_name}")
+                stage_share_map[stage_name] = float(stage_shares[stage_name])
+            share_sum = sum(stage_share_map.values())
+            if share_sum <= 0:
+                raise ValueError("deepvariant stage shares must sum to > 0")
+            stage_share_map = {
+                stage_name: stage_share_map[stage_name] / share_sum for stage_name in stage_names
+            }
+
         for stage_id, stage_name in enumerate(stage_names, start=1):
-            if stage_name not in stage_shares:
-                raise KeyError(f"cpu_stage_time_share_1x missing stage {stage_name}")
             if stage_name not in pim_speedup_vs_cpu_by_stage:
                 raise KeyError(f"pim speedup map missing stage {stage_name}")
-
-            stage_share = float(stage_shares[stage_name])
+            stage_share = float(stage_share_map[stage_name])
             stage_runtime_s = runtime_total_s * stage_share
             if stage_runtime_s <= 0:
                 raise ValueError(f"stage runtime must be > 0 for {stage_name}")
@@ -1384,10 +1442,14 @@ def _build_tile_operations(
     materialization_scenarios = set(materialization_policy.scenarios)
     breaker_boundaries = set(materialization_policy.boundaries_by_engine.get(baseline_engine, []))
 
-    if stage_devices[0] == sources.DEVICE_PIM and not ingress_resident:
-        operations.append(
-            TileOperation(op_type="TRANSFER", stage_id=1, boundary_index=0, transfer_path="host_h2d_ingress")
-        )
+    skip_first_host_to_pim_transfer = bool(ingress_resident)
+    if stage_devices[0] == sources.DEVICE_PIM:
+        if skip_first_host_to_pim_transfer:
+            skip_first_host_to_pim_transfer = False
+        else:
+            operations.append(
+                TileOperation(op_type="TRANSFER", stage_id=1, boundary_index=0, transfer_path="host_h2d_ingress")
+            )
 
     for stage_id in range(1, num_stages + 1):
         operations.append(TileOperation(op_type="COMPUTE", stage_id=stage_id, boundary_index=stage_id - 1))
@@ -1414,14 +1476,17 @@ def _build_tile_operations(
         if src == sources.DEVICE_CPU and dst == sources.DEVICE_CPU:
             continue
         if src == sources.DEVICE_CPU and dst == sources.DEVICE_PIM:
-            operations.append(
-                TileOperation(
-                    op_type="TRANSFER",
-                    stage_id=stage_id + 1,
-                    boundary_index=boundary_index,
-                    transfer_path="host_h2d_stage",
+            if skip_first_host_to_pim_transfer:
+                skip_first_host_to_pim_transfer = False
+            else:
+                operations.append(
+                    TileOperation(
+                        op_type="TRANSFER",
+                        stage_id=stage_id + 1,
+                        boundary_index=boundary_index,
+                        transfer_path="host_h2d_stage",
+                    )
                 )
-            )
             continue
         if src == sources.DEVICE_PIM and dst == sources.DEVICE_CPU:
             operations.append(
@@ -1571,6 +1636,7 @@ def _validate_config(
         if dataset_profile not in sources.DATASET_PROFILES:
             raise ValueError(f"unknown dataset profile: {dataset_profile}")
         profile = sources.DATASET_PROFILES[dataset_profile]
+        _profile_public_stage_names(profile)
         stage_names = _profile_stage_names(profile)
         boundaries = profile.get("boundaries_bytes")
         if not isinstance(boundaries, Sequence):
@@ -1710,6 +1776,7 @@ def simulate_configuration(
     run_id: str,
     dataset_profile: str,
     boundaries_bytes: Sequence[int],
+    public_stage_names: Sequence[str],
     stage_names: Sequence[str],
     pipeline_template: str,
     size_multiplier: float,
@@ -1749,10 +1816,13 @@ def simulate_configuration(
         raise ValueError(f"unknown cxl direct link: {cxl_direct_link}")
 
     num_stages = len(boundaries_bytes) - 1
+    num_public_stages = len(public_stage_names)
     if len(stage_names) != num_stages:
         raise ValueError(
             f"stage_names length {len(stage_names)} does not match boundaries-derived stages {num_stages}"
         )
+    if num_public_stages <= 0:
+        raise ValueError("public_stage_names must contain at least one stage")
     if pipeline_template not in scenario_stage_device_map_by_template:
         raise KeyError(f"missing scenario stage map for template {pipeline_template}")
     if pipeline_template not in scenario_stage_endpoint_map_by_template:
@@ -2420,7 +2490,8 @@ def simulate_configuration(
         "dataset_profile": dataset_profile,
         "stage_size_multiplier": size_multiplier,
         "scenario": scenario,
-        "num_stages": num_stages,
+        "num_stages": num_public_stages,
+        "num_kernels": num_stages,
         "num_tiles": num_tiles,
         "makespan_s": makespan_s,
         "total_energy_J": total_energy_J,
@@ -2545,6 +2616,7 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
         for workload_profile in run_profiles:
             profile = sources.DATASET_PROFILES[workload_profile]
             boundaries = profile["boundaries_bytes"]
+            public_stage_names = _profile_public_stage_names(profile)
             stage_names = _profile_stage_names(profile)
             pipeline_template = _profile_template(profile)
             workload_family = _workload_family_from_template(pipeline_template)
@@ -2563,6 +2635,7 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                         run_id=run_id,
                         dataset_profile=workload_profile,
                         boundaries_bytes=boundaries,
+                        public_stage_names=public_stage_names,
                         stage_names=stage_names,
                         pipeline_template=pipeline_template,
                         size_multiplier=float(size_multiplier),

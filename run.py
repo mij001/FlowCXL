@@ -16,6 +16,7 @@ BASE_METRICS_COLUMNS = [
     "stage_size_multiplier",
     "scenario",
     "num_stages",
+    "num_kernels",
     "num_tiles",
     "makespan_s",
     "total_energy_J",

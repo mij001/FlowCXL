@@ -7,6 +7,7 @@ import csv
 import importlib
 import os
 import unittest
+from math import prod
 from pathlib import Path
 
 import yaml
@@ -59,6 +60,69 @@ class SimulatorChecks(unittest.TestCase):
 
         report.main()
 
+    def test_deepvariant_public_vs_execution_stage_shape(self) -> None:
+        for profile_id in [
+            sources.PROFILE_DV_ILLUMINA_WGS_30X,
+            sources.PROFILE_DV_ILLUMINA_WES_100X,
+        ]:
+            profile = sources.DATASET_PROFILES[profile_id]
+            self.assertEqual(profile["pipeline_template"], sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE)
+            self.assertEqual(tuple(profile["public_stage_names"]), sources.DEEPVARIANT_PUBLIC_STAGE_NAMES)
+            self.assertEqual(tuple(profile["stage_names"]), sources.DEEPVARIANT_KERNEL_STAGE_NAMES)
+            self.assertEqual(len(profile["public_stage_names"]), 3)
+            self.assertEqual(len(profile["stage_names"]), 5)
+            self.assertEqual(len(profile["boundaries_bytes"]), 6)
+
+    def test_deepvariant_internal_boundaries_derived_from_profile_params(self) -> None:
+        for profile_id in [
+            sources.PROFILE_DV_ILLUMINA_WGS_30X,
+            sources.PROFILE_DV_ILLUMINA_WES_100X,
+        ]:
+            profile = sources.DATASET_PROFILES[profile_id]
+            params = profile["parameters"]
+            num_examples = int(round(
+                float(params["covered_bases"])
+                * float(params["candidate_density_per_base_at_ref_coverage"])
+                * (float(params["coverage_x"]) / float(params["candidate_density_ref_coverage_x"]))
+            ))
+            num_examples = max(1, num_examples)
+            x0 = int(round(
+                float(params["covered_bases"])
+                * float(params["coverage_x"])
+                * float(params["aligned_bytes_per_covered_base"])
+            ))
+            x1 = int(round(num_examples * float(params["frontend_bytes_per_example"])))
+            tensor_bytes = num_examples * prod(int(dim) for dim in params["example_shape"]) * int(
+                params["example_element_bytes"]
+            )
+            x2 = int(round(tensor_bytes * float(params["tensor_overhead_factor"])))
+            x3 = int(round(num_examples * float(params["infer_output_bytes_per_example"])))
+            x4 = int(round(num_examples * float(params["call_post_output_bytes_per_example"])))
+            x5 = int(round(num_examples * int(params["postprocess_output_bytes_per_example"])))
+            self.assertEqual(profile["boundaries_bytes"], [x0, x1, x2, x3, x4, x5])
+
+    def test_deepvariant_kernel_device_map_lengths_match(self) -> None:
+        stage_count = len(sources.DEEPVARIANT_KERNEL_STAGE_NAMES)
+
+        device_map = self.config["scenario_stage_device_map_by_template"]["deepvariant_3stage"]
+        for scenario in self.config["scenarios"]:
+            self.assertEqual(len(device_map[scenario]), stage_count)
+
+        endpoint_map = self.config["scenario_stage_endpoint_map_by_template"]["deepvariant_3stage"]
+        for scenario in self.config["scenarios"]:
+            self.assertEqual(len(endpoint_map[scenario]), stage_count)
+
+        variant_by_name = {entry["name"]: entry for entry in self.config["workload_variants"]}
+        for variant_name in ["retention_colocated", "switch_striping"]:
+            dv_override = (
+                variant_by_name[variant_name]
+                .get("overrides", {})
+                .get("scenario_stage_endpoint_map_by_template", {})
+                .get("deepvariant_3stage", {})
+            )
+            for scenario in [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]:
+                self.assertEqual(len(dv_override[scenario]), stage_count)
+
     def test_run_matrix_includes_dv_and_tpch_profiles_all_variants(self) -> None:
         expected_profiles = (
             list(self.config["workload_sweep"]["tpch_profiles"])
@@ -82,6 +146,7 @@ class SimulatorChecks(unittest.TestCase):
     def test_metrics_schema_drops_deepvariant_mode(self) -> None:
         row = self.metrics[0]
         self.assertNotIn("deepvariant_mode", row)
+        self.assertIn("num_kernels", row)
         for key in ["workload_family", "workload_profile", "workload_variant", "baseline_id"]:
             self.assertIn(key, row)
 
@@ -103,21 +168,43 @@ class SimulatorChecks(unittest.TestCase):
             self.assertNotIn("|new|", str(row["baseline_id"]))
             self.assertNotIn("|legacy|", str(row["baseline_id"]))
 
-    def test_ingressless_skips_stage1_ingress_for_pim_scenarios(self) -> None:
-        profiles = [
+    def test_num_stages_public_and_num_kernels_execution(self) -> None:
+        for profile in [sources.PROFILE_DV_ILLUMINA_WGS_30X, sources.PROFILE_DV_ILLUMINA_WES_100X]:
+            row = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0, "base")
+            self.assertEqual(int(row["num_stages"]), 3)
+            self.assertEqual(int(row["num_kernels"]), 5)
+        for profile in [
             sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
             sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+        ]:
+            row = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0, "base")
+            self.assertEqual(int(row["num_stages"]), 3)
+            self.assertEqual(int(row["num_kernels"]), 3)
+
+    def test_ingressless_skips_first_host_to_pim_transfer_tpch_and_dv(self) -> None:
+        # TPCH: stage-1 PIM ingress transfer is removed.
+        for profile in [
+            sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+        ]:
+            base = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0, "base")
+            ingressless = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0, "ingressless")
+            self.assertGreater(float(base["total_bytes_host_h2d_ingress"]), 0.0)
+            self.assertEqual(float(ingressless["total_bytes_host_h2d_ingress"]), 0.0)
+
+        # DeepVariant: stage-1 CPU frontend means the first host->PIM transfer is host_h2d_stage.
+        for profile in [
             sources.PROFILE_DV_ILLUMINA_WGS_30X,
             sources.PROFILE_DV_ILLUMINA_WES_100X,
-        ]
-        for profile in profiles:
-            for scenario in [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]:
-                base = self._find_row(profile, scenario, 1.0, "base")
-                ingressless = self._find_row(profile, scenario, 1.0, "ingressless")
-                self.assertGreater(float(base["total_bytes_host_h2d_ingress"]), 0.0)
-                self.assertEqual(float(ingressless["total_bytes_host_h2d_ingress"]), 0.0)
+        ]:
+            base = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0, "base")
+            ingressless = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0, "ingressless")
+            self.assertEqual(float(base["total_bytes_host_h2d_ingress"]), 0.0)
+            self.assertEqual(float(ingressless["total_bytes_host_h2d_ingress"]), 0.0)
+            self.assertGreater(float(base["total_bytes_host_h2d_stage"]), 0.0)
+            self.assertEqual(float(ingressless["total_bytes_host_h2d_stage"]), 0.0)
 
-    def test_retention_colocated_triggers_retain_bytes_positive(self) -> None:
+    def test_retention_colocated_triggers_retain_for_dv_and_tpch(self) -> None:
         profiles = [
             sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
             sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
@@ -134,7 +221,7 @@ class SimulatorChecks(unittest.TestCase):
             self.assertTrue(handoff_rows)
             self.assertTrue(any(t["handoff_mode"] == "retain" for t in handoff_rows))
 
-    def test_switch_striping_reports_striping_factor_gt_one(self) -> None:
+    def test_switch_striping_exercises_topology_for_dv_and_tpch(self) -> None:
         profiles = [
             sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
             sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
@@ -145,6 +232,34 @@ class SimulatorChecks(unittest.TestCase):
             row = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0, "switch_striping")
             self.assertGreater(float(row["cxl_effective_striping_factor"]), 1.0)
             self.assertGreater(float(row["cxl_active_direct_endpoints"]), 1.0)
+
+    def test_dv_direct_not_slower_than_bounce_all_profiles_all_sizes_base_and_ingressless(self) -> None:
+        for profile in [
+            sources.PROFILE_DV_ILLUMINA_WGS_30X,
+            sources.PROFILE_DV_ILLUMINA_WES_100X,
+        ]:
+            for variant in ["base", "ingressless"]:
+                for multiplier in self.config["size_multipliers"]:
+                    bounce = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, float(multiplier), variant)
+                    direct = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, float(multiplier), variant)
+                    self.assertLessEqual(float(direct["makespan_s"]), float(bounce["makespan_s"]))
+
+    def test_dv_has_strict_direct_improvement_at_least_one_point_per_profile(self) -> None:
+        for profile in [
+            sources.PROFILE_DV_ILLUMINA_WGS_30X,
+            sources.PROFILE_DV_ILLUMINA_WES_100X,
+        ]:
+            has_strict = False
+            for variant in ["base", "ingressless"]:
+                for multiplier in self.config["size_multipliers"]:
+                    bounce = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, float(multiplier), variant)
+                    direct = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, float(multiplier), variant)
+                    if float(direct["makespan_s"]) < float(bounce["makespan_s"]):
+                        has_strict = True
+                        break
+                if has_strict:
+                    break
+            self.assertTrue(has_strict, msg=f"no strict DV direct improvement for {profile}")
 
     def test_direct_not_slower_than_bounce_all_tpch_points(self) -> None:
         for profile in [

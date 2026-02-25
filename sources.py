@@ -44,7 +44,16 @@ CPU_BASELINE_ENGINES = (
 PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE = "deepvariant_3stage"
 PIPELINE_TEMPLATE_TPCH_3OP = "tpch_3op"
 
-DEEPVARIANT_STAGE_NAMES = ("make_examples", "call_variants", "postprocess_variants")
+DEEPVARIANT_PUBLIC_STAGE_NAMES = ("make_examples", "call_variants", "postprocess_variants")
+DEEPVARIANT_KERNEL_STAGE_NAMES = (
+    "make_examples_frontend",
+    "make_examples_tensorize",
+    "call_variants_infer",
+    "call_variants_post",
+    "postprocess_variants",
+)
+# Backward-friendly public-stage alias for docs and external references.
+DEEPVARIANT_STAGE_NAMES = DEEPVARIANT_PUBLIC_STAGE_NAMES
 TPCH_STAGE_NAMES = ("scan_filter_project", "join", "groupby_agg")
 
 PROFILE_DV_ILLUMINA_WGS_30X = "PROFILE_DV_ILLUMINA_WGS_30X"
@@ -91,6 +100,14 @@ _REQUIRED_DEEPVARIANT_PROFILE_KEYS = (
     "cpu_stage_time_share_1x",
 )
 
+_DEFAULT_DEEPVARIANT_KERNEL_DERIVATION = {
+    "frontend_bytes_per_example": 8192,
+    "tensor_overhead_factor": 1.10,
+    "infer_output_bytes_per_example": 256,
+    "make_examples_frontend_fraction_of_make_examples": 0.45,
+    "call_variants_infer_fraction_of_call_variants": 0.85,
+}
+
 _REQUIRED_TPCH_PROFILE_KEYS = (
     "scale_factor",
     "lineitem_rows_per_sf",
@@ -129,6 +146,36 @@ def _derive_deepvariant_num_examples(params: Mapping[str, float]) -> int:
 
 def _derive_deepvariant_boundaries_bytes(params: Mapping[str, float]) -> list[int]:
     num_examples = _derive_deepvariant_num_examples(params)
+    frontend_bytes_per_example = float(
+        params.get(
+            "frontend_bytes_per_example",
+            _DEFAULT_DEEPVARIANT_KERNEL_DERIVATION["frontend_bytes_per_example"],
+        )
+    )
+    tensor_overhead_factor = float(
+        params.get(
+            "tensor_overhead_factor",
+            _DEFAULT_DEEPVARIANT_KERNEL_DERIVATION["tensor_overhead_factor"],
+        )
+    )
+    infer_output_bytes_per_example = float(
+        params.get(
+            "infer_output_bytes_per_example",
+            _DEFAULT_DEEPVARIANT_KERNEL_DERIVATION["infer_output_bytes_per_example"],
+        )
+    )
+    call_post_output_bytes_per_example = float(
+        params.get("call_post_output_bytes_per_example", params["call_output_bytes_per_example"])
+    )
+    if frontend_bytes_per_example <= 0:
+        raise ValueError("frontend_bytes_per_example must be > 0")
+    if tensor_overhead_factor <= 0:
+        raise ValueError("tensor_overhead_factor must be > 0")
+    if infer_output_bytes_per_example <= 0:
+        raise ValueError("infer_output_bytes_per_example must be > 0")
+    if call_post_output_bytes_per_example <= 0:
+        raise ValueError("call_post_output_bytes_per_example must be > 0")
+
     x0 = int(
         round(
             float(params["covered_bases"])
@@ -136,10 +183,17 @@ def _derive_deepvariant_boundaries_bytes(params: Mapping[str, float]) -> list[in
             * float(params["aligned_bytes_per_covered_base"])
         )
     )
-    x1 = int(num_examples * prod(int(dim) for dim in params["example_shape"]) * int(params["example_element_bytes"]))
-    x2 = int(num_examples * int(params["call_output_bytes_per_example"]))
-    x3 = int(num_examples * int(params["postprocess_output_bytes_per_example"]))
-    return [x0, x1, x2, x3]
+    x1 = int(round(num_examples * frontend_bytes_per_example))
+    tensor_bytes = (
+        num_examples
+        * prod(int(dim) for dim in params["example_shape"])
+        * int(params["example_element_bytes"])
+    )
+    x2 = int(round(tensor_bytes * tensor_overhead_factor))
+    x3 = int(round(num_examples * infer_output_bytes_per_example))
+    x4 = int(round(num_examples * call_post_output_bytes_per_example))
+    x5 = int(round(num_examples * int(params["postprocess_output_bytes_per_example"])))
+    return [x0, x1, x2, x3, x4, x5]
 
 
 def _build_deepvariant_profile(profile_id: str, params: Dict[str, object], description: str) -> Dict[str, object]:
@@ -147,13 +201,14 @@ def _build_deepvariant_profile(profile_id: str, params: Dict[str, object], descr
     if missing:
         raise ValueError(f"profile {profile_id} missing required keys: {missing}")
 
-    _validate_stage_shares(params["cpu_stage_time_share_1x"], DEEPVARIANT_STAGE_NAMES)
+    _validate_stage_shares(params["cpu_stage_time_share_1x"], DEEPVARIANT_PUBLIC_STAGE_NAMES)
     boundaries = _derive_deepvariant_boundaries_bytes(params)
     return {
         "pipeline_template": PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE,
         "boundaries_bytes": boundaries,
         "description": description,
-        "stage_names": list(DEEPVARIANT_STAGE_NAMES),
+        "public_stage_names": list(DEEPVARIANT_PUBLIC_STAGE_NAMES),
+        "stage_names": list(DEEPVARIANT_KERNEL_STAGE_NAMES),
         "parameters": dict(params),
         "num_examples_1x": _derive_deepvariant_num_examples(params),
     }
@@ -210,6 +265,12 @@ DEEPVARIANT_PROFILE_PARAMETERS: Dict[str, Dict[str, object]] = {
         "example_element_bytes": 1,
         "call_output_bytes_per_example": 12,
         "postprocess_output_bytes_per_example": 40,
+        "frontend_bytes_per_example": 8192,
+        "tensor_overhead_factor": 1.10,
+        "infer_output_bytes_per_example": 256,
+        "call_post_output_bytes_per_example": 12,
+        "make_examples_frontend_fraction_of_make_examples": 0.45,
+        "call_variants_infer_fraction_of_call_variants": 0.85,
         "cpu_reference_total_runtime_s_1x": 36792.0,
         "cpu_stage_time_share_1x": {
             "make_examples": 0.3082,
@@ -227,6 +288,12 @@ DEEPVARIANT_PROFILE_PARAMETERS: Dict[str, Dict[str, object]] = {
         "example_element_bytes": 1,
         "call_output_bytes_per_example": 12,
         "postprocess_output_bytes_per_example": 40,
+        "frontend_bytes_per_example": 8192,
+        "tensor_overhead_factor": 1.10,
+        "infer_output_bytes_per_example": 256,
+        "call_post_output_bytes_per_example": 12,
+        "make_examples_frontend_fraction_of_make_examples": 0.45,
+        "call_variants_infer_fraction_of_call_variants": 0.85,
         "cpu_reference_total_runtime_s_1x": 558.0,
         "cpu_stage_time_share_1x": {
             "make_examples": 0.8136,
@@ -404,6 +471,16 @@ CITED_VALUES = {
         "url": "https://github.com/google/deepvariant/releases",
         "quote": "example shape [100, 147, 10]",
         "how_used": "Tensor materialization seed for DeepVariant stage-1 output bytes.",
+    },
+    "DEEPVARIANT_INTERNAL_KERNEL_ASSUMPTIONS": {
+        "value": {
+            "frontend_bytes_per_example": _DEFAULT_DEEPVARIANT_KERNEL_DERIVATION["frontend_bytes_per_example"],
+            "tensor_overhead_factor": _DEFAULT_DEEPVARIANT_KERNEL_DERIVATION["tensor_overhead_factor"],
+            "infer_output_bytes_per_example": _DEFAULT_DEEPVARIANT_KERNEL_DERIVATION["infer_output_bytes_per_example"],
+        },
+        "url": "https://github.com/google/deepvariant",
+        "quote": "Internal kernel decomposition is a simulator modeling assumption layered on public stages.",
+        "how_used": "Documents configurable assumptions for internal DeepVariant 5-kernel boundary sizing.",
     },
     "TPCH_SCHEMA_CONTEXT": {
         "value": "TPC-H",

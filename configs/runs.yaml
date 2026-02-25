@@ -24,8 +24,8 @@ workload_variants:
     overrides:
       scenario_stage_endpoint_map_by_template:
         deepvariant_3stage:
-          pim_host_bounce: [pim0, pim0, cpu0]
-          pim_flowcxl_direct: [pim0, pim0, cpu0]
+          pim_host_bounce: [cpu0, pim0, pim0, pim0, cpu0]
+          pim_flowcxl_direct: [cpu0, pim0, pim0, pim0, cpu0]
         tpch_3op:
           pim_host_bounce: [pim0, pim0, pim0]
           pim_flowcxl_direct: [pim0, pim0, pim0]
@@ -45,8 +45,8 @@ workload_variants:
         cxl_direct_channels: 2
       scenario_stage_endpoint_map_by_template:
         deepvariant_3stage:
-          pim_host_bounce: [pim0, pim1, cpu0]
-          pim_flowcxl_direct: [pim0, pim1, cpu0]
+          pim_host_bounce: [cpu0, pim0, pim1, pim2, cpu0]
+          pim_flowcxl_direct: [cpu0, pim0, pim1, pim2, cpu0]
         tpch_3op:
           pim_host_bounce: [pim0, pim1, pim2]
           pim_flowcxl_direct: [pim0, pim1, pim2]
@@ -75,9 +75,9 @@ default_pim_endpoint_policy: colocate
 
 scenario_stage_endpoint_map_by_template:
   deepvariant_3stage:
-    cpu_only: [cpu0, cpu0, cpu0]
-    pim_host_bounce: [pim0, pim1, cpu0]
-    pim_flowcxl_direct: [pim0, pim1, cpu0]
+    cpu_only: [cpu0, cpu0, cpu0, cpu0, cpu0]
+    pim_host_bounce: [cpu0, pim0, pim1, pim2, cpu0]
+    pim_flowcxl_direct: [cpu0, pim0, pim1, pim2, cpu0]
   tpch_3op:
     cpu_only: [cpu0, cpu0, cpu0]
     pim_host_bounce: [pim0, pim1, pim2]
@@ -130,9 +130,9 @@ stage_defaults:
 
 scenario_stage_device_map_by_template:
   deepvariant_3stage:
-    cpu_only: [cpu, cpu, cpu]
-    pim_host_bounce: [pim, pim, cpu]
-    pim_flowcxl_direct: [pim, pim, cpu]
+    cpu_only: [cpu, cpu, cpu, cpu, cpu]
+    pim_host_bounce: [cpu, pim, pim, pim, cpu]
+    pim_flowcxl_direct: [cpu, pim, pim, pim, cpu]
   tpch_3op:
     cpu_only: [cpu, cpu, cpu]
     pim_host_bounce: [pim, pim, pim]
@@ -140,8 +140,10 @@ scenario_stage_device_map_by_template:
 
 pim_speedup_vs_cpu_by_stage_by_template:
   deepvariant_3stage:
-    make_examples: 1.5
-    call_variants: 2.0
+    make_examples_frontend: 1.0
+    make_examples_tensorize: 1.6
+    call_variants_infer: 2.0
+    call_variants_post: 1.4
     postprocess_variants: 1.0
   tpch_3op:
     scan_filter_project: 2.5
@@ -150,8 +152,10 @@ pim_speedup_vs_cpu_by_stage_by_template:
 
 cpu_stage_unit_compute_Bps_by_template:
   deepvariant_3stage:
-    make_examples: 1000000000.0
-    call_variants: 1000000000.0
+    make_examples_frontend: 1000000000.0
+    make_examples_tensorize: 1000000000.0
+    call_variants_infer: 1000000000.0
+    call_variants_post: 1000000000.0
     postprocess_variants: 1000000000.0
   tpch_3op:
     scan_filter_project: 1200000000.0
@@ -160,11 +164,19 @@ cpu_stage_unit_compute_Bps_by_template:
 
 bytes_touched_factors_by_stage_by_template:
   deepvariant_3stage:
-    make_examples:
+    make_examples_frontend:
       input_factor: 1.0
       output_factor: 1.0
       amplification_factor: 1.0
-    call_variants:
+    make_examples_tensorize:
+      input_factor: 1.0
+      output_factor: 1.0
+      amplification_factor: 1.0
+    call_variants_infer:
+      input_factor: 1.0
+      output_factor: 1.0
+      amplification_factor: 1.0
+    call_variants_post:
       input_factor: 1.0
       output_factor: 1.0
       amplification_factor: 1.0
@@ -270,8 +282,10 @@ dram_service_defaults:
 
 cpu_mem_Bps_by_stage_by_template:
   deepvariant_3stage:
-    make_examples: 120000000000.0
-    call_variants: 120000000000.0
+    make_examples_frontend: 120000000000.0
+    make_examples_tensorize: 120000000000.0
+    call_variants_infer: 120000000000.0
+    call_variants_post: 120000000000.0
     postprocess_variants: 120000000000.0
   tpch_3op:
     scan_filter_project: 120000000000.0
@@ -280,8 +294,10 @@ cpu_mem_Bps_by_stage_by_template:
 
 pim_mem_Bps_by_stage_by_template:
   deepvariant_3stage:
-    make_examples: 240000000000.0
-    call_variants: 240000000000.0
+    make_examples_frontend: 240000000000.0
+    make_examples_tensorize: 240000000000.0
+    call_variants_infer: 240000000000.0
+    call_variants_post: 240000000000.0
     postprocess_variants: 240000000000.0
   tpch_3op:
     scan_filter_project: 240000000000.0
@@ -290,8 +306,10 @@ pim_mem_Bps_by_stage_by_template:
 
 cpu_random_access_penalty_by_stage_by_template:
   deepvariant_3stage:
-    make_examples: 1.0
-    call_variants: 1.0
+    make_examples_frontend: 1.0
+    make_examples_tensorize: 1.0
+    call_variants_infer: 1.0
+    call_variants_post: 1.0
     postprocess_variants: 1.0
   tpch_3op:
     scan_filter_project: 1.0
@@ -300,12 +318,22 @@ cpu_random_access_penalty_by_stage_by_template:
 
 cpu_access_pattern_by_stage_by_template:
   deepvariant_3stage:
-    make_examples:
+    make_examples_frontend:
       access_pattern: sequential_scan
       row_hit_rate: 0.90
       mlp: 32
       avg_miss_latency_ns: 100.0
-    call_variants:
+    make_examples_tensorize:
+      access_pattern: sequential_scan
+      row_hit_rate: 0.90
+      mlp: 32
+      avg_miss_latency_ns: 100.0
+    call_variants_infer:
+      access_pattern: sequential_scan
+      row_hit_rate: 0.90
+      mlp: 32
+      avg_miss_latency_ns: 100.0
+    call_variants_post:
       access_pattern: sequential_scan
       row_hit_rate: 0.90
       mlp: 32

@@ -12,6 +12,12 @@ It models fixed compute capacity per stage, tile-level pipelining, bounded strea
 
 - `deepvariant_3stage`
   - `make_examples -> call_variants -> postprocess_variants`
+  - internally executed as 5 kernels:
+    - `make_examples_frontend`
+    - `make_examples_tensorize`
+    - `call_variants_infer`
+    - `call_variants_post`
+    - `postprocess_variants`
 - `tpch_3op`
   - `scan_filter_project -> join -> groupby_agg`
 
@@ -49,6 +55,9 @@ The high-intermediate TPCH profile is configured to expose host-bounce penalties
   - bytes-touched factors model scan/join/group-by read/write pressure
   - CPU penalty multiplier remains supported for compatibility as part of stage service config
 - Per-template scenario stage-device maps
+- DeepVariant public-vs-execution modeling:
+  - public metrics remain 3-stage (`num_stages=3`)
+  - execution uses 5 kernels (`num_kernels=5`) to model internal PIM->PIM boundaries
 - Tile overlap with bounded in-flight window (`max_inflight_tiles`)
 - Transition-aware transfer graph:
   - `cpu->cpu`: no transfer
