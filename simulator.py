@@ -641,22 +641,6 @@ def _normalize_workload_variants(config: Mapping[str, object]) -> List[Dict[str,
     return variants
 
 
-def _normalize_deepvariant_mode_sweep(config: Mapping[str, object]) -> List[str]:
-    raw = config.get("deepvariant_mode_sweep", ["new"])
-    if not isinstance(raw, Sequence):
-        raise ValueError("deepvariant_mode_sweep must be a list")
-    modes: List[str] = []
-    for value in raw:
-        mode = str(value).strip().lower()
-        if mode not in {"new", "legacy"}:
-            raise ValueError(f"invalid deepvariant mode: {mode}")
-        if mode not in modes:
-            modes.append(mode)
-    if not modes:
-        raise ValueError("deepvariant_mode_sweep must contain at least one mode")
-    return modes
-
-
 def _normalize_workload_sweep(config: Mapping[str, object]) -> Dict[str, List[str]]:
     dataset_profiles = config["dataset_profiles"]
     if not isinstance(dataset_profiles, Sequence):
@@ -726,6 +710,35 @@ def _normalize_workload_sweep(config: Mapping[str, object]) -> Dict[str, List[st
     dataset_profile_order = [str(value) for value in dataset_profiles]
     if dataset_profile_order and dataset_profile_order != sweep_union:
         return classify_profiles(dataset_profiles)
+    return normalized
+
+
+def _normalize_ingress_resident_scenarios_by_template(
+    *,
+    config: Mapping[str, object],
+    template_to_stage_names: Mapping[str, Sequence[str]],
+) -> Dict[str, Tuple[str, ...]]:
+    raw = config.get("ingress_resident_scenarios_by_template")
+    if raw is None:
+        return {template: tuple() for template in template_to_stage_names}
+    if not isinstance(raw, Mapping):
+        raise ValueError("ingress_resident_scenarios_by_template must be a map")
+
+    normalized: Dict[str, Tuple[str, ...]] = {}
+    for template in template_to_stage_names:
+        values = raw.get(template, [])
+        if not isinstance(values, Sequence):
+            raise ValueError(f"ingress_resident_scenarios_by_template[{template}] must be a list")
+        scenarios: List[str] = []
+        for value in values:
+            scenario = str(value)
+            if scenario not in sources.SCENARIOS:
+                raise ValueError(
+                    f"ingress_resident_scenarios_by_template[{template}] has unknown scenario {scenario}"
+                )
+            if scenario not in scenarios:
+                scenarios.append(scenario)
+        normalized[template] = tuple(scenarios)
     return normalized
 
 
@@ -1362,6 +1375,7 @@ def _build_tile_operations(
     stage_endpoints: Sequence[str],
     materialization_policy: MaterializationPolicyConfig,
     baseline_engine: str,
+    ingress_resident: bool,
 ) -> List[TileOperation]:
     num_stages = len(stage_devices)
     if len(stage_endpoints) != num_stages:
@@ -1370,7 +1384,7 @@ def _build_tile_operations(
     materialization_scenarios = set(materialization_policy.scenarios)
     breaker_boundaries = set(materialization_policy.boundaries_by_engine.get(baseline_engine, []))
 
-    if stage_devices[0] == sources.DEVICE_PIM:
+    if stage_devices[0] == sources.DEVICE_PIM and not ingress_resident:
         operations.append(
             TileOperation(op_type="TRANSFER", stage_id=1, boundary_index=0, transfer_path="host_h2d_ingress")
         )
@@ -1466,6 +1480,7 @@ def _validate_config(
         "stage_defaults",
         "transfer_power_W",
         "scenario_stage_device_map_by_template",
+        "ingress_resident_scenarios_by_template",
         "pim_speedup_vs_cpu_by_stage_by_template",
         "cpu_stage_unit_compute_Bps_by_template",
         "bytes_touched_factors_by_stage_by_template",
@@ -1658,6 +1673,10 @@ def _validate_config(
     _normalize_pim_retention_config(config=config, warn_defaults=False)
     _normalize_cxl_direct_concurrency_config(config=config, warn_defaults=False)
     _normalize_cxl_topology_config(config=config, warn_defaults=False)
+    _normalize_ingress_resident_scenarios_by_template(
+        config=config,
+        template_to_stage_names=template_to_stage_names,
+    )
 
     if int(config["tile_size_bytes"]) <= 0:
         raise ValueError("tile_size_bytes must be > 0")
@@ -1706,6 +1725,7 @@ def simulate_configuration(
     stage_overrides: Dict[str, Dict[object, Dict[str, object]]],
     scenario_stage_device_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
     scenario_stage_endpoint_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
+    ingress_resident_scenarios_by_template: Mapping[str, Sequence[str]],
     pim_speedup_vs_cpu_by_stage_by_template: Mapping[str, Mapping[str, object]],
     cpu_stage_unit_compute_Bps_by_template: Mapping[str, Mapping[str, object]],
     memory_system_by_template: Mapping[str, Mapping[str, object]],
@@ -1713,7 +1733,6 @@ def simulate_configuration(
     cxl_direct_concurrency: CXLDirectConcurrencyConfig,
     cxl_topology: CXLTopologyConfig,
     bytes_touched_factors_by_stage_by_template: Mapping[str, Mapping[str, Mapping[str, object]]],
-    deepvariant_mode: str,
     workload_family: str,
     workload_profile: str,
     workload_variant: str,
@@ -1738,6 +1757,8 @@ def simulate_configuration(
         raise KeyError(f"missing scenario stage map for template {pipeline_template}")
     if pipeline_template not in scenario_stage_endpoint_map_by_template:
         raise KeyError(f"missing scenario endpoint map for template {pipeline_template}")
+    if pipeline_template not in ingress_resident_scenarios_by_template:
+        raise KeyError(f"missing ingress resident scenario map for template {pipeline_template}")
     if pipeline_template not in pim_speedup_vs_cpu_by_stage_by_template:
         raise KeyError(f"missing pim speedup map for template {pipeline_template}")
     if pipeline_template not in cpu_stage_unit_compute_Bps_by_template:
@@ -1856,6 +1877,7 @@ def simulate_configuration(
         stage_endpoints=stage_endpoints,
         materialization_policy=cpu_baseline_cfg.materialization_policy,
         baseline_engine=cpu_baseline_engine,
+        ingress_resident=scenario in set(ingress_resident_scenarios_by_template[pipeline_template]),
     )
     active_direct_endpoints: set[str] = set()
     if scenario == sources.SCENARIO_PIM_FLOWCXL_DIRECT:
@@ -2301,7 +2323,6 @@ def simulate_configuration(
                         "stage_size_multiplier": size_multiplier,
                         "scenario": scenario,
                         "pipeline_template": pipeline_template,
-                        "deepvariant_mode": deepvariant_mode,
                         "workload_family": workload_family,
                         "workload_profile": workload_profile,
                         "workload_variant": workload_variant,
@@ -2426,7 +2447,6 @@ def simulate_configuration(
         "lb_cxl_direct_s": lb_cxl_direct_s,
         "dominant_lb_component": dominant_lb_component,
         "pipeline_template": pipeline_template,
-        "deepvariant_mode": deepvariant_mode,
         "workload_family": workload_family,
         "workload_profile": workload_profile,
         "workload_variant": workload_variant,
@@ -2455,7 +2475,6 @@ def simulate_configuration(
 def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     workload_sweep = _normalize_workload_sweep(config)
     workload_variants = _normalize_workload_variants(config)
-    deepvariant_mode_sweep = _normalize_deepvariant_mode_sweep(config)
 
     tpch_profiles = workload_sweep["tpch_profiles"]
     deepvariant_profiles = workload_sweep["deepvariant_profiles"]
@@ -2500,6 +2519,10 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
             scenario_stage_device_map_by_template=scenario_stage_device_map_by_template,
             warn_defaults=True,
         )
+        ingress_resident_scenarios_by_template = _normalize_ingress_resident_scenarios_by_template(
+            config=merged_config,
+            template_to_stage_names=template_to_stage_names,
+        )
         pim_retention_cfg = _normalize_pim_retention_config(config=merged_config, warn_defaults=True)
         cxl_direct_concurrency_cfg = _normalize_cxl_direct_concurrency_config(
             config=merged_config,
@@ -2519,88 +2542,57 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
             if trace_max_tiles < 0:
                 trace_max_tiles = None
 
-        legacy_memory_system_by_template: Dict[str, Dict[str, object]] | None = None
-        if deepvariant_profiles and "legacy" in deepvariant_mode_sweep:
-            legacy_memory_system_by_template = _normalize_memory_system_config_from_legacy_keys(
-                config=merged_config,
-                template_to_stage_names=template_to_stage_names,
-                warn_deprecated=False,
-            )
-
         for workload_profile in run_profiles:
             profile = sources.DATASET_PROFILES[workload_profile]
             boundaries = profile["boundaries_bytes"]
             stage_names = _profile_stage_names(profile)
             pipeline_template = _profile_template(profile)
             workload_family = _workload_family_from_template(pipeline_template)
-            mode_list = (
-                list(deepvariant_mode_sweep)
-                if pipeline_template == sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE
-                else ["new"]
-            )
-
-            for deepvariant_mode in mode_list:
-                effective_memory_system = memory_system_by_template
-                if (
-                    pipeline_template == sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE
-                    and deepvariant_mode == "legacy"
-                ):
-                    if legacy_memory_system_by_template is None:
-                        raise KeyError(
-                            "deepvariant_mode_sweep includes legacy but legacy keys are unavailable in config"
-                        )
-                    effective_memory_system = dict(memory_system_by_template)
-                    effective_memory_system[sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE] = (
-                        legacy_memory_system_by_template[sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE]
+            for size_multiplier in size_multipliers:
+                multiplier_token = str(size_multiplier).replace(".", "p")
+                baseline_id = f"{workload_family}|{workload_profile}|{variant_name}|m{multiplier_token}"
+                for scenario in scenarios:
+                    run_id = (
+                        f"run_{run_counter:03d}_{workload_profile}_{variant_name}_{scenario}_m{multiplier_token}"
+                        .replace(" ", "_")
+                        .replace("/", "_")
                     )
+                    run_counter += 1
 
-                for size_multiplier in size_multipliers:
-                    multiplier_token = str(size_multiplier).replace(".", "p")
-                    baseline_id = (
-                        f"{workload_family}|{workload_profile}|{variant_name}|{deepvariant_mode}|m{multiplier_token}"
+                    row, trace_rows = simulate_configuration(
+                        run_id=run_id,
+                        dataset_profile=workload_profile,
+                        boundaries_bytes=boundaries,
+                        stage_names=stage_names,
+                        pipeline_template=pipeline_template,
+                        size_multiplier=float(size_multiplier),
+                        scenario=scenario,
+                        tile_size_bytes=tile_size_bytes,
+                        max_inflight_tiles=max_inflight_tiles,
+                        host_h2d_link=host_h2d_link,
+                        host_d2h_link=host_d2h_link,
+                        cxl_direct_link=cxl_direct_link,
+                        resource_capacity=resource_capacity,
+                        stage_defaults=stage_defaults,
+                        transfer_power_W=transfer_power_W,
+                        stage_overrides=stage_overrides,
+                        scenario_stage_device_map_by_template=scenario_stage_device_map_by_template,
+                        scenario_stage_endpoint_map_by_template=scenario_stage_endpoint_map_by_template,
+                        ingress_resident_scenarios_by_template=ingress_resident_scenarios_by_template,
+                        pim_speedup_vs_cpu_by_stage_by_template=pim_speedup_vs_cpu_by_stage_by_template,
+                        cpu_stage_unit_compute_Bps_by_template=cpu_stage_unit_compute_Bps_by_template,
+                        memory_system_by_template=memory_system_by_template,
+                        pim_retention=pim_retention_cfg,
+                        cxl_direct_concurrency=cxl_direct_concurrency_cfg,
+                        cxl_topology=cxl_topology_cfg,
+                        bytes_touched_factors_by_stage_by_template=bytes_touched_factors_by_stage_by_template,
+                        workload_family=workload_family,
+                        workload_profile=workload_profile,
+                        workload_variant=variant_name,
+                        baseline_id=baseline_id,
+                        trace_max_tiles=trace_max_tiles,
                     )
-                    for scenario in scenarios:
-                        run_id = (
-                            f"run_{run_counter:03d}_{workload_profile}_{variant_name}_{deepvariant_mode}_{scenario}_m{multiplier_token}"
-                            .replace(" ", "_")
-                            .replace("/", "_")
-                        )
-                        run_counter += 1
-
-                        row, trace_rows = simulate_configuration(
-                            run_id=run_id,
-                            dataset_profile=workload_profile,
-                            boundaries_bytes=boundaries,
-                            stage_names=stage_names,
-                            pipeline_template=pipeline_template,
-                            size_multiplier=float(size_multiplier),
-                            scenario=scenario,
-                            tile_size_bytes=tile_size_bytes,
-                            max_inflight_tiles=max_inflight_tiles,
-                            host_h2d_link=host_h2d_link,
-                            host_d2h_link=host_d2h_link,
-                            cxl_direct_link=cxl_direct_link,
-                            resource_capacity=resource_capacity,
-                            stage_defaults=stage_defaults,
-                            transfer_power_W=transfer_power_W,
-                            stage_overrides=stage_overrides,
-                            scenario_stage_device_map_by_template=scenario_stage_device_map_by_template,
-                            scenario_stage_endpoint_map_by_template=scenario_stage_endpoint_map_by_template,
-                            pim_speedup_vs_cpu_by_stage_by_template=pim_speedup_vs_cpu_by_stage_by_template,
-                            cpu_stage_unit_compute_Bps_by_template=cpu_stage_unit_compute_Bps_by_template,
-                            memory_system_by_template=effective_memory_system,
-                            pim_retention=pim_retention_cfg,
-                            cxl_direct_concurrency=cxl_direct_concurrency_cfg,
-                            cxl_topology=cxl_topology_cfg,
-                            bytes_touched_factors_by_stage_by_template=bytes_touched_factors_by_stage_by_template,
-                            deepvariant_mode=deepvariant_mode,
-                            workload_family=workload_family,
-                            workload_profile=workload_profile,
-                            workload_variant=variant_name,
-                            baseline_id=baseline_id,
-                            trace_max_tiles=trace_max_tiles,
-                        )
-                        metrics.append(row)
-                        traces.extend(trace_rows)
+                    metrics.append(row)
+                    traces.extend(trace_rows)
 
     return metrics, traces

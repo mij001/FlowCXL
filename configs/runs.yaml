@@ -2,6 +2,7 @@ dataset_profiles:
   - PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE
   - PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
   - PROFILE_DV_ILLUMINA_WGS_30X
+  - PROFILE_DV_ILLUMINA_WES_100X
 
 workload_sweep:
   tpch_profiles:
@@ -9,14 +10,46 @@ workload_sweep:
     - PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
   deepvariant_profiles:
     - PROFILE_DV_ILLUMINA_WGS_30X
+    - PROFILE_DV_ILLUMINA_WES_100X
 
 workload_variants:
   - name: base
     overrides: {}
-
-deepvariant_mode_sweep:
-  - new
-  - legacy
+  - name: ingressless
+    overrides:
+      ingress_resident_scenarios_by_template:
+        deepvariant_3stage: [pim_host_bounce, pim_flowcxl_direct]
+        tpch_3op: [pim_host_bounce, pim_flowcxl_direct]
+  - name: retention_colocated
+    overrides:
+      scenario_stage_endpoint_map_by_template:
+        deepvariant_3stage:
+          pim_host_bounce: [pim0, pim0, cpu0]
+          pim_flowcxl_direct: [pim0, pim0, cpu0]
+        tpch_3op:
+          pim_host_bounce: [pim0, pim0, pim0]
+          pim_flowcxl_direct: [pim0, pim0, pim0]
+      pim_retention:
+        pim_retention_capacity_bytes: 1099511627776
+  - name: switch_striping
+    overrides:
+      link_profile:
+        cxl_direct_link: CXL_SWITCH
+      cxl_topology:
+        enabled: true
+        mode: dynamic_striping
+        max_stripes: 4
+        num_physical_links: 4
+        applies_to_links: [CXL_SWITCH]
+      resource_capacity:
+        cxl_direct_channels: 2
+      scenario_stage_endpoint_map_by_template:
+        deepvariant_3stage:
+          pim_host_bounce: [pim0, pim1, cpu0]
+          pim_flowcxl_direct: [pim0, pim1, cpu0]
+        tpch_3op:
+          pim_host_bounce: [pim0, pim1, pim2]
+          pim_flowcxl_direct: [pim0, pim1, pim2]
 
 size_multipliers:
   - 0.5
@@ -49,6 +82,10 @@ scenario_stage_endpoint_map_by_template:
     cpu_only: [cpu0, cpu0, cpu0]
     pim_host_bounce: [pim0, pim1, pim2]
     pim_flowcxl_direct: [pim0, pim1, pim2]
+
+ingress_resident_scenarios_by_template:
+  deepvariant_3stage: []
+  tpch_3op: []
 
 pim_retention:
   enabled: true

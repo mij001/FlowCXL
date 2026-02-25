@@ -19,12 +19,20 @@ Template selection is profile-driven from `sources.py` (`pipeline_template` fiel
 
 ## Current default runs
 
-`configs/runs.yaml` defaults to two TPC-H-like profiles:
+`configs/runs.yaml` defaults to TPCH + DeepVariant profiles:
 
 - `PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE`
 - `PROFILE_TPCH_SF100_HIGH_INTERMEDIATE`
+- `PROFILE_DV_ILLUMINA_WGS_30X`
+- `PROFILE_DV_ILLUMINA_WES_100X`
 
-The high-intermediate profile is configured to expose host-bounce penalties and target `bounce/direct >= 2.0` at `1x`.
+All default profiles run across:
+
+- variants: `base`, `ingressless`, `retention_colocated`, `switch_striping`
+- multipliers: `0.5x, 1x, 2x, 4x`
+- scenarios: `cpu_only`, `pim_host_bounce`, `pim_flowcxl_direct`
+
+The high-intermediate TPCH profile is configured to expose host-bounce penalties and target `bounce/direct >= 2.0` at `1x`.
 
 ## What is modeled
 
@@ -95,7 +103,14 @@ Artifacts:
 - `artifacts/traces.yaml`
 - `artifacts/report/plot_makespan_grouped_*.png`
 - `artifacts/report/plot_energy_grouped_*.png`
+- `artifacts/report/plot_makespan_grouped_pim_only_*.png`
+- `artifacts/report/plot_energy_grouped_pim_only_*.png`
 - `artifacts/report/report.md`
+
+Report structure:
+
+- main body: `base` + `ingressless` per profile
+- appendix: `retention_colocated` + `switch_striping`
 
 ## Tests
 

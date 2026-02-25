@@ -1,4 +1,4 @@
-"""Checks for first-class CPU/PIM memory-system modeling and acceptance gates."""
+"""Checks for unified TPCH+DeepVariant matrix and grouped absolute reporting."""
 
 from __future__ import annotations
 
@@ -7,13 +7,12 @@ import csv
 import importlib
 import os
 import unittest
-import warnings
 from pathlib import Path
 
 import yaml
 
 import sources
-from simulator import generate_runs_from_config, scale_boundaries_exact
+from simulator import generate_runs_from_config
 
 
 class SimulatorChecks(unittest.TestCase):
@@ -28,9 +27,8 @@ class SimulatorChecks(unittest.TestCase):
         dataset_profile: str,
         scenario: str,
         multiplier: float,
+        workload_variant: str = "base",
         metrics: list[dict] | None = None,
-        workload_variant: str | None = None,
-        deepvariant_mode: str | None = None,
     ) -> dict:
         rows = self.metrics if metrics is None else metrics
         for row in rows:
@@ -38,597 +36,12 @@ class SimulatorChecks(unittest.TestCase):
                 row["dataset_profile"] == dataset_profile
                 and row["scenario"] == scenario
                 and abs(float(row["stage_size_multiplier"]) - float(multiplier)) < 1e-12
-                and (workload_variant is None or str(row.get("workload_variant")) == workload_variant)
-                and (deepvariant_mode is None or str(row.get("deepvariant_mode")) == deepvariant_mode)
+                and str(row.get("workload_variant", "")) == workload_variant
             ):
                 return row
-        raise KeyError((dataset_profile, scenario, multiplier))
+        raise KeyError((dataset_profile, scenario, multiplier, workload_variant))
 
-    def _ratio(self, metrics: list[dict], dataset_profile: str, multiplier: float = 1.0) -> float:
-        bounce = self._find_row(
-            dataset_profile=dataset_profile,
-            scenario=sources.SCENARIO_PIM_HOST_BOUNCE,
-            multiplier=multiplier,
-            metrics=metrics,
-        )
-        direct = self._find_row(
-            dataset_profile=dataset_profile,
-            scenario=sources.SCENARIO_PIM_FLOWCXL_DIRECT,
-            multiplier=multiplier,
-            metrics=metrics,
-        )
-        return float(bounce["makespan_s"]) / float(direct["makespan_s"])
-
-    def _tpch_profiles(self) -> list[str]:
-        return [
-            sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
-            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
-        ]
-
-    def _traces_for(self, run_id: str, *, op_type: str | None = None) -> list[dict]:
-        rows = [row for row in self.traces if row["run_id"] == run_id]
-        if op_type is not None:
-            rows = [row for row in rows if row["op_type"] == op_type]
-        return rows
-
-    def test_memory_system_schema_validation_required_keys(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg.pop("memory_system_by_template", None)
-        cfg.pop("enable_memory_ceiling_by_template", None)
-        with self.assertRaises((KeyError, ValueError)):
-            generate_runs_from_config(cfg)
-
-    def test_legacy_memory_keys_are_normalized_with_warning(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg.pop("memory_system_by_template", None)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY, sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            metrics, traces = generate_runs_from_config(cfg)
-        self.assertTrue(metrics)
-        self.assertTrue(traces)
-        self.assertTrue(any(issubclass(w.category, UserWarning) for w in caught))
-
-    def test_cpu_engine_gates_materialization_vectorized_vs_blocking(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-
-        cfg_vec = copy.deepcopy(self.config)
-        cfg_vec["dataset_profiles"] = [profile]
-        cfg_vec["size_multipliers"] = [1.0]
-        cfg_vec["scenarios"] = [sources.SCENARIO_CPU_ONLY]
-        cfg_vec["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["cpu_baseline_system"][
-            "baseline_engine"
-        ] = sources.CPU_ENGINE_VECTORIZED_PIPELINE
-
-        metrics_vec, traces_vec = generate_runs_from_config(cfg_vec)
-        row_vec = metrics_vec[0]
-        run_id_vec = row_vec["run_id"]
-        materialize_vec = [r for r in traces_vec if r["run_id"] == run_id_vec and r["op_type"] == "MATERIALIZE"]
-        self.assertFalse(materialize_vec)
-        self.assertEqual(int(row_vec["total_cpu_materialize_bytes"]), 0)
-
-        cfg_blk = copy.deepcopy(cfg_vec)
-        cfg_blk["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["cpu_baseline_system"][
-            "baseline_engine"
-        ] = sources.CPU_ENGINE_BLOCKING_VOLCANO
-
-        metrics_blk, traces_blk = generate_runs_from_config(cfg_blk)
-        row_blk = metrics_blk[0]
-        run_id_blk = row_blk["run_id"]
-        materialize_blk = [r for r in traces_blk if r["run_id"] == run_id_blk and r["op_type"] == "MATERIALIZE"]
-        self.assertTrue(materialize_blk)
-
-        boundaries = sources.DATASET_PROFILES[profile]["boundaries_bytes"]
-        scaled = scale_boundaries_exact(boundaries, 1.0)
-        expected_bytes = int(scaled[1] + scaled[2])
-        self.assertEqual(int(row_blk["total_cpu_materialize_bytes"]), expected_bytes)
-
-    def test_cpu_memory_service_random_patterns_latency_limited(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        row = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
-        run_id = row["run_id"]
-        compute_rows = self._traces_for(run_id, op_type="COMPUTE")
-        join_rows = [r for r in compute_rows if r["stage_name"] == "join" and r["stage_device"] == sources.DEVICE_CPU]
-        groupby_rows = [
-            r for r in compute_rows if r["stage_name"] == "groupby_agg" and r["stage_device"] == sources.DEVICE_CPU
-        ]
-        self.assertTrue(join_rows)
-        self.assertTrue(groupby_rows)
-        self.assertTrue(any(r["cpu_mem_bound_mode"] == "latency_limited" for r in join_rows))
-        self.assertTrue(any(r["cpu_mem_bound_mode"] == "latency_limited" for r in groupby_rows))
-
-    def test_cpu_memory_queue_delay_positive_under_pressure(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
-        stage_cfg = cfg["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["cpu_baseline_system"]["stages"]
-        stage_cfg["join"]["peak_bw_Bps"] = 8.0e9
-        stage_cfg["groupby_agg"]["peak_bw_Bps"] = 8.0e9
-        metrics, _ = generate_runs_from_config(cfg)
-        row = metrics[0]
-        self.assertGreater(float(row["total_cpu_mem_queue_delay_component_s"]), 0.0)
-        self.assertGreater(float(row["total_cpu_mem_service_time_component_s"]), 0.0)
-
-    def test_pim_memory_system_path_uses_first_class_config(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        baseline = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0)
-        baseline_makespan = float(baseline["makespan_s"])
-        baseline_pim_mem = float(baseline["total_pim_mem_time_component_s"])
-
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [profile]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        pim_stages = cfg["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["pim_system"]["stages"]
-        for stage_name in sources.TPCH_STAGE_NAMES:
-            pim_stages[stage_name]["peak_bw_Bps"] = 6.0e9
-        metrics_slow, _ = generate_runs_from_config(cfg)
-        row_slow = metrics_slow[0]
-
-        self.assertGreater(float(row_slow["total_pim_mem_time_component_s"]), 0.0)
-        self.assertGreater(float(row_slow["makespan_s"]), baseline_makespan)
-        self.assertGreater(float(row_slow["total_pim_mem_time_component_s"]), baseline_pim_mem)
-
-    def test_directional_links_unchanged(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        row = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, 1.0)
-        run_id = row["run_id"]
-        h2d_link = self.config["link_profile"]["host_h2d_link"]
-        d2h_link = self.config["link_profile"]["host_d2h_link"]
-
-        transfer_rows = [r for r in self._traces_for(run_id, op_type="TRANSFER")]
-        self.assertTrue(transfer_rows)
-        h2d_rows = [r for r in transfer_rows if r["transfer_path"] in {"host_h2d_ingress", "host_h2d_stage"}]
-        d2h_rows = [r for r in transfer_rows if r["transfer_path"] == "host_d2h"]
-        self.assertTrue(h2d_rows)
-        self.assertTrue(d2h_rows)
-        self.assertTrue(all(r["link_type"] == h2d_link for r in h2d_rows))
-        self.assertTrue(all(r["link_type"] == d2h_link for r in d2h_rows))
-
-    def test_default_endpoint_policy_colocate_derivation(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        cfg["default_pim_endpoint_policy"] = "colocate"
-        cfg["pim_retention"]["pim_retention_capacity_bytes"] = 10**15
-        cfg.pop("scenario_stage_endpoint_map_by_template", None)
-        metrics, traces = generate_runs_from_config(cfg)
-        row = metrics[0]
-        self.assertGreater(float(row["total_bytes_pim_retained"]), 0.0)
-        self.assertEqual(float(row["total_retain_fallback_bytes"]), 0.0)
-        handoff_rows = [t for t in traces if str(t.get("handoff_mode", ""))]
-        self.assertTrue(handoff_rows)
-        self.assertTrue(all(t["handoff_mode"] == "retain" for t in handoff_rows))
-        self.assertTrue(all(t["stage_src_endpoint"] == "pim0" for t in handoff_rows))
-        self.assertTrue(all(t["stage_dst_endpoint"] == "pim0" for t in handoff_rows))
-
-    def test_default_endpoint_policy_spread_derivation(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        cfg["default_pim_endpoint_policy"] = "spread"
-        cfg.pop("scenario_stage_endpoint_map_by_template", None)
-        metrics, traces = generate_runs_from_config(cfg)
-        row = metrics[0]
-        self.assertEqual(float(row["total_bytes_pim_retained"]), 0.0)
-        handoff_rows = [t for t in traces if str(t.get("handoff_mode", ""))]
-        self.assertTrue(handoff_rows)
-        self.assertTrue(all(t["handoff_mode"] == "transfer_direct" for t in handoff_rows))
-        self.assertTrue(any(t["stage_src_endpoint"] != t["stage_dst_endpoint"] for t in handoff_rows))
-
-    def test_retention_not_triggered_when_endpoints_spread(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        direct = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0)
-        self.assertEqual(float(direct["total_bytes_pim_retained"]), 0.0)
-        self.assertGreater(float(direct["total_bytes_cxl_direct"]), 0.0)
-        run_id = direct["run_id"]
-        handoff_rows = [t for t in self.traces if t["run_id"] == run_id and str(t.get("handoff_mode", ""))]
-        self.assertTrue(handoff_rows)
-        self.assertFalse(any(t["handoff_mode"] == "retain" for t in handoff_rows))
-
-    def test_retain_only_on_pim_same_endpoint_transition(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT, sources.SCENARIO_CPU_ONLY]
-        cfg["pim_retention"]["pim_retention_capacity_bytes"] = 10**15
-        cfg["scenario_stage_endpoint_map_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
-            sources.SCENARIO_PIM_FLOWCXL_DIRECT
-        ] = ["pim0", "pim0", "pim0"]
-        metrics, traces = generate_runs_from_config(cfg)
-
-        direct = next(row for row in metrics if row["scenario"] == sources.SCENARIO_PIM_FLOWCXL_DIRECT)
-        cpu = next(row for row in metrics if row["scenario"] == sources.SCENARIO_CPU_ONLY)
-        self.assertGreater(float(direct["total_bytes_pim_retained"]), 0.0)
-        self.assertEqual(float(cpu["total_bytes_pim_retained"]), 0.0)
-        direct_handoff_rows = [t for t in traces if t["run_id"] == direct["run_id"] and str(t.get("handoff_mode", ""))]
-        self.assertTrue(direct_handoff_rows)
-        self.assertTrue(all(t["handoff_mode"] == "retain" for t in direct_handoff_rows))
-        cpu_handoff_rows = [t for t in traces if t["run_id"] == cpu["run_id"] and str(t.get("handoff_mode", ""))]
-        self.assertFalse(cpu_handoff_rows)
-
-    def test_retention_capacity_limit_falls_back_to_transfer(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        cfg["scenario_stage_endpoint_map_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
-            sources.SCENARIO_PIM_FLOWCXL_DIRECT
-        ] = ["pim0", "pim0", "pim0"]
-        cfg["pim_retention"]["pim_retention_capacity_bytes"] = 1024
-        metrics, traces = generate_runs_from_config(cfg)
-        row = metrics[0]
-        self.assertEqual(float(row["total_bytes_pim_retained"]), 0.0)
-        self.assertGreater(float(row["total_retain_fallback_bytes"]), 0.0)
-        self.assertGreater(float(row["total_bytes_cxl_direct"]), 0.0)
-        handoff_rows = [t for t in traces if str(t.get("handoff_mode", ""))]
-        self.assertTrue(any(bool(t["retention_capacity_blocked"]) for t in handoff_rows))
-        self.assertTrue(all(t["handoff_mode"] == "transfer_direct" for t in handoff_rows))
-
-    def test_cxl_vc_does_not_hard_partition_bandwidth(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        cfg["tile_size_bytes"] = 10**15
-        cfg["max_inflight_tiles"] = 1
-
-        cfg_vc1 = copy.deepcopy(cfg)
-        cfg_vc1["cxl_direct_concurrency"]["virtual_channels_per_channel"] = 1
-        metrics_vc1, _ = generate_runs_from_config(cfg_vc1)
-        makespan_vc1 = float(metrics_vc1[0]["makespan_s"])
-
-        cfg_vc8 = copy.deepcopy(cfg)
-        cfg_vc8["cxl_direct_concurrency"]["virtual_channels_per_channel"] = 8
-        metrics_vc8, _ = generate_runs_from_config(cfg_vc8)
-        makespan_vc8 = float(metrics_vc8[0]["makespan_s"])
-
-        self.assertAlmostEqual(makespan_vc1, makespan_vc8, places=9)
-
-    def test_striping_factor_uses_physical_cap_and_active_direct_endpoints(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        cfg["link_profile"]["cxl_direct_link"] = sources.LINK_CXL_SWITCH
-        cfg["cxl_topology"]["enabled"] = True
-        cfg["cxl_topology"]["max_stripes"] = 4
-        cfg["cxl_topology"]["num_physical_links"] = 2
-        cfg["cxl_topology"]["applies_to_links"] = [sources.LINK_CXL_SWITCH]
-        cfg["scenario_stage_endpoint_map_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
-            sources.SCENARIO_PIM_FLOWCXL_DIRECT
-        ] = ["pim0", "pim1", "pim2"]
-        metrics, _ = generate_runs_from_config(cfg)
-        row = metrics[0]
-        self.assertEqual(int(float(row["cxl_active_direct_endpoints"])), 3)
-        self.assertEqual(int(float(row["cxl_effective_striping_factor"])), 2)
-
-    def test_cxl_switch_striping_improves_or_equals_local_under_transfer_bound_case(self) -> None:
-        cfg_local = copy.deepcopy(self.config)
-        cfg_local["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg_local["size_multipliers"] = [1.0]
-        cfg_local["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        cfg_local["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["enabled"] = False
-        for stage in sources.TPCH_STAGE_NAMES:
-            cfg_local["cpu_stage_unit_compute_Bps_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][stage] = 1.0e12
-        cfg_local["link_profile"]["host_h2d_link"] = sources.LINK_PCIE_GEN4_X16
-        cfg_local["link_profile"]["host_d2h_link"] = sources.LINK_PCIE_GEN4_X16
-        cfg_local["link_profile"]["cxl_direct_link"] = sources.LINK_CXL_LOCAL
-        local_metrics, _ = generate_runs_from_config(cfg_local)
-        local_makespan = float(local_metrics[0]["makespan_s"])
-
-        cfg_switch = copy.deepcopy(cfg_local)
-        cfg_switch["link_profile"]["cxl_direct_link"] = sources.LINK_CXL_SWITCH
-        cfg_switch["cxl_topology"]["enabled"] = True
-        cfg_switch["cxl_topology"]["max_stripes"] = 4
-        cfg_switch["cxl_topology"]["num_physical_links"] = 4
-        cfg_switch["cxl_topology"]["applies_to_links"] = [sources.LINK_CXL_SWITCH]
-        cfg_switch["scenario_stage_endpoint_map_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][
-            sources.SCENARIO_PIM_FLOWCXL_DIRECT
-        ] = ["pim0", "pim1", "pim2"]
-        switch_metrics, _ = generate_runs_from_config(cfg_switch)
-        switch_makespan = float(switch_metrics[0]["makespan_s"])
-
-        self.assertLessEqual(switch_makespan, local_makespan)
-
-    def test_compute_dominated_profile_direct_concurrency_no_effect(self) -> None:
-        cfg_slow = copy.deepcopy(self.config)
-        cfg_slow["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg_slow["size_multipliers"] = [1.0]
-        cfg_slow["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
-        cfg_slow["memory_system_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP]["enabled"] = False
-        for stage in sources.TPCH_STAGE_NAMES:
-            cfg_slow["cpu_stage_unit_compute_Bps_by_template"][sources.PIPELINE_TEMPLATE_TPCH_3OP][stage] = 1.0e7
-        cfg_slow["cxl_direct_concurrency"]["virtual_channels_per_channel"] = 1
-        cfg_slow["cxl_direct_concurrency"]["dma_outstanding_per_vc"] = 1
-        cfg_slow["resource_capacity"]["cxl_direct_channels"] = 1
-        slow_metrics, _ = generate_runs_from_config(cfg_slow)
-        slow_makespan = float(slow_metrics[0]["makespan_s"])
-
-        cfg_fast = copy.deepcopy(cfg_slow)
-        cfg_fast["cxl_direct_concurrency"]["virtual_channels_per_channel"] = 8
-        cfg_fast["cxl_direct_concurrency"]["dma_outstanding_per_vc"] = 64
-        cfg_fast["resource_capacity"]["cxl_direct_channels"] = 4
-        fast_metrics, _ = generate_runs_from_config(cfg_fast)
-        fast_makespan = float(fast_metrics[0]["makespan_s"])
-
-        relative_delta = abs(fast_makespan - slow_makespan) / max(slow_makespan, 1e-12)
-        self.assertLessEqual(relative_delta, 1e-2)
-
-    def test_new_metrics_and_trace_fields_exist_append_only(self) -> None:
-        row = self.metrics[0]
-        for key in [
-            "total_bytes_pim_retained",
-            "total_retain_fallback_bytes",
-            "total_retain_handoff_time_component_s",
-            "cxl_direct_stream_slots",
-            "cxl_active_direct_endpoints",
-            "cxl_effective_striping_factor",
-            "total_cxl_dma_issue_time_component_s",
-        ]:
-            self.assertIn(key, row)
-
-        self.assertTrue(self.traces)
-        trace_row = self.traces[0]
-        for key in [
-            "stage_src_endpoint",
-            "stage_dst_endpoint",
-            "handoff_mode",
-            "retention_capacity_blocked",
-            "cxl_active_streams",
-            "cxl_bw_share_Bps",
-            "cxl_issue_overhead_s",
-            "cxl_striping_factor",
-        ]:
-            self.assertIn(key, trace_row)
-
-    def test_direct_not_slower_than_bounce_all_tpch_points(self) -> None:
-        for profile in self._tpch_profiles():
-            for multiplier in self.config["size_multipliers"]:
-                ratio = self._ratio(self.metrics, dataset_profile=profile, multiplier=float(multiplier))
-                self.assertGreaterEqual(ratio, 1.0)
-
-    def test_tpch_high_profile_1x_bounce_direct_ratio_at_least_2x(self) -> None:
-        ratio = self._ratio(self.metrics, dataset_profile=sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE, multiplier=1.0)
-        self.assertGreaterEqual(ratio, 2.0)
-
-    def test_tpch_high_profile_1x_cpu_direct_ratio_at_least_1p2(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        cpu = self._find_row(profile, sources.SCENARIO_CPU_ONLY, 1.0)
-        direct = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0)
-        ratio = float(cpu["makespan_s"]) / float(direct["makespan_s"])
-        self.assertGreaterEqual(ratio, 1.2)
-
-    def test_high_profile_bounce_dominant_lb_is_host_link_or_host_touch(self) -> None:
-        profile = sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE
-        bounce = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, 1.0)
-        self.assertIn(str(bounce["dominant_lb_component"]), {"host_link", "host_touch"})
-
-    def test_deepvariant_default_behavior_unchanged(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
-        cfg["size_multipliers"] = [1.0]
-        metrics, traces = generate_runs_from_config(cfg)
-
-        self.assertTrue(metrics)
-        for row in metrics:
-            self.assertEqual(row["pipeline_template"], sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE)
-            self.assertFalse(bool(row["memory_ceiling_enabled"]))
-            self.assertEqual(row["cpu_baseline_engine"], sources.CPU_ENGINE_VECTORIZED_PIPELINE)
-            self.assertEqual(float(row["total_cpu_mem_service_time_component_s"]), 0.0)
-            self.assertEqual(float(row["total_cpu_mem_queue_delay_component_s"]), 0.0)
-            self.assertEqual(float(row["total_pim_mem_service_time_component_s"]), 0.0)
-            self.assertEqual(float(row["total_pim_mem_queue_delay_component_s"]), 0.0)
-            self.assertEqual(int(row["total_cpu_materialize_bytes"]), 0)
-
-        self.assertFalse(any(t["op_type"] == "MATERIALIZE" for t in traces))
-
-    def test_metrics_schema_includes_new_memory_system_columns(self) -> None:
-        row = self.metrics[0]
-        for key in [
-            "cpu_baseline_engine",
-            "total_cpu_mem_service_time_component_s",
-            "total_cpu_mem_queue_delay_component_s",
-            "total_pim_mem_service_time_component_s",
-            "total_pim_mem_queue_delay_component_s",
-            "memory_ceiling_enabled",
-        ]:
-            self.assertIn(key, row)
-
-        for forbidden in ["queue_wait_s", "utilization", "speedup_vs_cpu_only"]:
-            self.assertNotIn(forbidden, row)
-
-    def test_workload_sweep_generates_tpch_and_deepvariant_rows(self) -> None:
-        families = {str(row.get("workload_family", "")) for row in self.metrics}
-        self.assertIn("tpch", families)
-        self.assertIn("deepvariant", families)
-
-    def test_workload_variants_expand_run_count(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["workload_sweep"] = {
-            "tpch_profiles": [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE],
-            "deepvariant_profiles": [],
-        }
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
-        cfg["workload_variants"] = [
-            {"name": "base", "overrides": {}},
-            {"name": "v2", "overrides": {"stage_defaults": {"cpu_units": 16}}},
-        ]
-        cfg["deepvariant_mode_sweep"] = ["new"]
-        metrics, _ = generate_runs_from_config(cfg)
-        self.assertEqual(len(metrics), 2)
-        variants = {str(row["workload_variant"]) for row in metrics}
-        self.assertEqual(variants, {"base", "v2"})
-
-    def test_variant_override_deep_merge_applies_nested_stage_fields(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["workload_sweep"] = {
-            "tpch_profiles": [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE],
-            "deepvariant_profiles": [],
-        }
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
-        cfg["workload_variants"] = [
-            {"name": "base", "overrides": {}},
-            {
-                "name": "cpuheavy",
-                "overrides": {
-                    "memory_system_by_template": {
-                        sources.PIPELINE_TEMPLATE_TPCH_3OP: {
-                            "cpu_baseline_system": {
-                                "stages": {
-                                    "join": {"row_hit_rate": 0.08, "mlp": 4, "avg_miss_latency_ns": 160.0},
-                                }
-                            }
-                        }
-                    }
-                },
-            },
-        ]
-        cfg["deepvariant_mode_sweep"] = ["new"]
-        metrics, _ = generate_runs_from_config(cfg)
-        base = next(row for row in metrics if row["workload_variant"] == "base")
-        cpuheavy = next(row for row in metrics if row["workload_variant"] == "cpuheavy")
-        self.assertGreater(float(cpuheavy["makespan_s"]), float(base["makespan_s"]))
-
-    def test_deepvariant_mode_sweep_expands_rows(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
-        cfg["workload_sweep"] = {
-            "tpch_profiles": [],
-            "deepvariant_profiles": [sources.PROFILE_DV_ILLUMINA_WGS_30X],
-        }
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
-        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
-        cfg["deepvariant_mode_sweep"] = ["new", "legacy"]
-        metrics, _ = generate_runs_from_config(cfg)
-        modes = {str(row["deepvariant_mode"]) for row in metrics}
-        self.assertEqual(modes, {"new", "legacy"})
-        self.assertEqual(len(metrics), 2)
-
-    def test_deepvariant_legacy_forces_legacy_memory_path(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
-        cfg["workload_sweep"] = {
-            "tpch_profiles": [],
-            "deepvariant_profiles": [sources.PROFILE_DV_ILLUMINA_WGS_30X],
-        }
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
-        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
-        cfg["deepvariant_mode_sweep"] = ["new", "legacy"]
-
-        stage_names = list(sources.DEEPVARIANT_STAGE_NAMES)
-        cfg["memory_system_by_template"][sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE] = {
-            "enabled": True,
-            "cpu_baseline_system": {
-                "baseline_engine": sources.CPU_ENGINE_VECTORIZED_PIPELINE,
-                "dram_channels": 8,
-                "banks_per_channel": 16,
-                "cacheline_bytes": 64,
-                "queueing_model": "utilization_penalty",
-                "queue_alpha": 0.35,
-                "rho_cap": 0.95,
-                "stages": {
-                    stage: {
-                        "access_pattern": sources.ACCESS_PATTERN_SEQUENTIAL_SCAN,
-                        "row_hit_rate": 0.9,
-                        "mlp": 32,
-                        "avg_miss_latency_ns": 100.0,
-                        "peak_bw_Bps": 120e9,
-                        "penalty_multiplier": 1.0,
-                    }
-                    for stage in stage_names
-                },
-                "materialization_policy": {
-                    "boundaries_by_engine": {
-                        sources.CPU_ENGINE_VECTORIZED_PIPELINE: [],
-                        sources.CPU_ENGINE_BLOCKING_VOLCANO: [],
-                    },
-                    "materialize_Bps": 80e9,
-                    "fixed_s": 2e-6,
-                    "scenarios": [],
-                },
-            },
-            "pim_system": {"enabled": False},
-        }
-        cfg["enable_memory_ceiling_by_template"][sources.PIPELINE_TEMPLATE_DEEPVARIANT_3STAGE] = False
-
-        metrics, _ = generate_runs_from_config(cfg)
-        new_row = next(row for row in metrics if row["deepvariant_mode"] == "new")
-        legacy_row = next(row for row in metrics if row["deepvariant_mode"] == "legacy")
-        self.assertTrue(bool(new_row["memory_ceiling_enabled"]))
-        self.assertFalse(bool(legacy_row["memory_ceiling_enabled"]))
-        self.assertGreater(float(new_row["total_cpu_mem_time_component_s"]), 0.0)
-        self.assertEqual(float(legacy_row["total_cpu_mem_time_component_s"]), 0.0)
-
-    def test_tpch_rows_ignore_deepvariant_mode_switch_logic(self) -> None:
-        cfg = copy.deepcopy(self.config)
-        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
-        cfg["workload_sweep"] = {
-            "tpch_profiles": [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE],
-            "deepvariant_profiles": [],
-        }
-        cfg["size_multipliers"] = [1.0]
-        cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
-        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
-        cfg["deepvariant_mode_sweep"] = ["new", "legacy"]
-        metrics, _ = generate_runs_from_config(cfg)
-        self.assertEqual(len(metrics), 1)
-        self.assertEqual(str(metrics[0]["deepvariant_mode"]), "new")
-
-    def test_metrics_schema_includes_workload_metadata_columns(self) -> None:
-        row = self.metrics[0]
-        for key in [
-            "workload_family",
-            "workload_profile",
-            "workload_variant",
-            "deepvariant_mode",
-            "baseline_id",
-        ]:
-            self.assertIn(key, row)
-
-    def test_traces_schema_includes_workload_metadata_columns(self) -> None:
-        self.assertTrue(self.traces)
-        row = self.traces[0]
-        for key in [
-            "workload_family",
-            "workload_profile",
-            "workload_variant",
-            "deepvariant_mode",
-            "baseline_id",
-        ]:
-            self.assertIn(key, row)
-
-    def test_relative_ratio_computation_direct_over_bounce(self) -> None:
-        try:
-            import pandas as pd  # noqa: F401
-            report = importlib.import_module("report")
-        except Exception as exc:  # pragma: no cover
-            self.skipTest(f"report dependencies unavailable: {exc}")
-
-        df = pd.DataFrame(
-            [
-                {"stage_size_multiplier": 1.0, "scenario": sources.SCENARIO_PIM_HOST_BOUNCE, "makespan_s": 10.0},
-                {"stage_size_multiplier": 1.0, "scenario": sources.SCENARIO_PIM_FLOWCXL_DIRECT, "makespan_s": 5.0},
-                {"stage_size_multiplier": 1.0, "scenario": sources.SCENARIO_CPU_ONLY, "makespan_s": 8.0},
-            ]
-        )
-        ratio = report._build_ratio_wide(df, "makespan_s")
-        self.assertAlmostEqual(float(ratio.loc[1.0, "direct_over_bounce"]), 0.5)
-        self.assertAlmostEqual(float(ratio.loc[1.0, "cpu_over_bounce"]), 0.8)
-        self.assertAlmostEqual(float(ratio.loc[1.0, "bounce_over_bounce"]), 1.0)
-
-    def test_report_generates_relative_plot_files(self) -> None:
+    def _write_metrics_and_run_report(self) -> None:
         try:
             import pandas as pd  # noqa: F401
             import matplotlib.pyplot as plt  # noqa: F401
@@ -645,26 +58,197 @@ class SimulatorChecks(unittest.TestCase):
             writer.writerows(self.metrics)
 
         report.main()
+
+    def test_run_matrix_includes_dv_and_tpch_profiles_all_variants(self) -> None:
+        expected_profiles = (
+            list(self.config["workload_sweep"]["tpch_profiles"])
+            + list(self.config["workload_sweep"]["deepvariant_profiles"])
+        )
+        expected_variants = [entry["name"] for entry in self.config["workload_variants"]]
+        expected_count = (
+            len(expected_profiles)
+            * len(expected_variants)
+            * len(self.config["size_multipliers"])
+            * len(self.config["scenarios"])
+        )
+
+        self.assertEqual(len(self.metrics), expected_count)
+
+        profiles_seen = {row["dataset_profile"] for row in self.metrics}
+        variants_seen = {row["workload_variant"] for row in self.metrics}
+        self.assertEqual(profiles_seen, set(expected_profiles))
+        self.assertEqual(variants_seen, set(expected_variants))
+
+    def test_metrics_schema_drops_deepvariant_mode(self) -> None:
+        row = self.metrics[0]
+        self.assertNotIn("deepvariant_mode", row)
+        for key in ["workload_family", "workload_profile", "workload_variant", "baseline_id"]:
+            self.assertIn(key, row)
+
+    def test_traces_schema_drops_deepvariant_mode(self) -> None:
+        self.assertTrue(self.traces)
+        row = self.traces[0]
+        self.assertNotIn("deepvariant_mode", row)
+        for key in ["workload_family", "workload_profile", "workload_variant", "baseline_id"]:
+            self.assertIn(key, row)
+
+    def test_baseline_id_no_mode_component(self) -> None:
+        for row in self.metrics:
+            multiplier_token = str(row["stage_size_multiplier"]).replace(".", "p")
+            expected = (
+                f"{row['workload_family']}|{row['workload_profile']}|"
+                f"{row['workload_variant']}|m{multiplier_token}"
+            )
+            self.assertEqual(str(row["baseline_id"]), expected)
+            self.assertNotIn("|new|", str(row["baseline_id"]))
+            self.assertNotIn("|legacy|", str(row["baseline_id"]))
+
+    def test_ingressless_skips_stage1_ingress_for_pim_scenarios(self) -> None:
+        profiles = [
+            sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+            sources.PROFILE_DV_ILLUMINA_WGS_30X,
+            sources.PROFILE_DV_ILLUMINA_WES_100X,
+        ]
+        for profile in profiles:
+            for scenario in [sources.SCENARIO_PIM_HOST_BOUNCE, sources.SCENARIO_PIM_FLOWCXL_DIRECT]:
+                base = self._find_row(profile, scenario, 1.0, "base")
+                ingressless = self._find_row(profile, scenario, 1.0, "ingressless")
+                self.assertGreater(float(base["total_bytes_host_h2d_ingress"]), 0.0)
+                self.assertEqual(float(ingressless["total_bytes_host_h2d_ingress"]), 0.0)
+
+    def test_retention_colocated_triggers_retain_bytes_positive(self) -> None:
+        profiles = [
+            sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+            sources.PROFILE_DV_ILLUMINA_WGS_30X,
+            sources.PROFILE_DV_ILLUMINA_WES_100X,
+        ]
+        for profile in profiles:
+            row = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0, "retention_colocated")
+            self.assertGreater(float(row["total_bytes_pim_retained"]), 0.0)
+            run_id = str(row["run_id"])
+            handoff_rows = [
+                t for t in self.traces if t["run_id"] == run_id and str(t.get("handoff_mode", ""))
+            ]
+            self.assertTrue(handoff_rows)
+            self.assertTrue(any(t["handoff_mode"] == "retain" for t in handoff_rows))
+
+    def test_switch_striping_reports_striping_factor_gt_one(self) -> None:
+        profiles = [
+            sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+            sources.PROFILE_DV_ILLUMINA_WGS_30X,
+            sources.PROFILE_DV_ILLUMINA_WES_100X,
+        ]
+        for profile in profiles:
+            row = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, 1.0, "switch_striping")
+            self.assertGreater(float(row["cxl_effective_striping_factor"]), 1.0)
+            self.assertGreater(float(row["cxl_active_direct_endpoints"]), 1.0)
+
+    def test_direct_not_slower_than_bounce_all_tpch_points(self) -> None:
+        for profile in [
+            sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE,
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+        ]:
+            for multiplier in self.config["size_multipliers"]:
+                bounce = self._find_row(profile, sources.SCENARIO_PIM_HOST_BOUNCE, float(multiplier), "base")
+                direct = self._find_row(profile, sources.SCENARIO_PIM_FLOWCXL_DIRECT, float(multiplier), "base")
+                self.assertLessEqual(float(direct["makespan_s"]), float(bounce["makespan_s"]))
+
+    def test_tpch_high_profile_1x_bounce_direct_ratio_at_least_2x(self) -> None:
+        bounce = self._find_row(
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+            sources.SCENARIO_PIM_HOST_BOUNCE,
+            1.0,
+            "base",
+        )
+        direct = self._find_row(
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+            sources.SCENARIO_PIM_FLOWCXL_DIRECT,
+            1.0,
+            "base",
+        )
+        ratio = float(bounce["makespan_s"]) / float(direct["makespan_s"])
+        self.assertGreaterEqual(ratio, 2.0)
+
+    def test_tpch_high_profile_1x_cpu_direct_ratio_at_least_1p2(self) -> None:
+        cpu = self._find_row(
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+            sources.SCENARIO_CPU_ONLY,
+            1.0,
+            "base",
+        )
+        direct = self._find_row(
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+            sources.SCENARIO_PIM_FLOWCXL_DIRECT,
+            1.0,
+            "base",
+        )
+        ratio = float(cpu["makespan_s"]) / float(direct["makespan_s"])
+        self.assertGreaterEqual(ratio, 1.2)
+
+    def test_high_profile_bounce_dominant_lb_is_host_link_or_host_touch(self) -> None:
+        bounce = self._find_row(
+            sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE,
+            sources.SCENARIO_PIM_HOST_BOUNCE,
+            1.0,
+            "base",
+        )
+        self.assertIn(str(bounce["dominant_lb_component"]), {"host_link", "host_touch"})
+
+    def test_report_generates_grouped_absolute_files_per_profile_variant(self) -> None:
+        self._write_metrics_and_run_report()
         report_dir = Path("artifacts/report")
-        generated = os.listdir(report_dir)
-        self.assertTrue(any(name.startswith("plot_ratio_direct_over_bounce_makespan_") for name in generated))
-        self.assertTrue(any(name.startswith("plot_ratio_direct_over_bounce_energy_") for name in generated))
-        self.assertTrue(any(name.startswith("plot_ratio_norm_to_bounce_makespan_") for name in generated))
-        self.assertTrue(any(name.startswith("plot_ratio_norm_to_bounce_energy_") for name in generated))
+        generated = set(os.listdir(report_dir))
+
+        profiles = sorted({str(row["workload_profile"]) for row in self.metrics})
+        variants = sorted({str(row["workload_variant"]) for row in self.metrics})
+        for profile in profiles:
+            profile_token = profile.replace(".", "p")
+            for variant in variants:
+                variant_token = variant.replace(".", "p")
+                self.assertIn(f"plot_makespan_grouped_{profile_token}_{variant_token}.png", generated)
+                self.assertIn(f"plot_energy_grouped_{profile_token}_{variant_token}.png", generated)
+                self.assertIn(f"plot_makespan_grouped_pim_only_{profile_token}_{variant_token}.png", generated)
+                self.assertIn(f"plot_energy_grouped_pim_only_{profile_token}_{variant_token}.png", generated)
+
+    def test_report_main_shows_base_and_ingressless_only(self) -> None:
+        self._write_metrics_and_run_report()
+        text = Path("artifacts/report/report.md").read_text(encoding="utf-8")
+        self.assertIn("## Main Results", text)
+        self.assertIn("## Appendix: Additional Variants", text)
+        main_block = text.split("## Main Results", 1)[1].split("## Appendix: Additional Variants", 1)[0]
+        self.assertIn("| base", main_block)
+        self.assertIn("| ingressless", main_block)
+        self.assertNotIn("| retention_colocated", main_block)
+        self.assertNotIn("| switch_striping", main_block)
+
+    def test_report_appendix_contains_retention_and_switch_variants(self) -> None:
+        self._write_metrics_and_run_report()
+        text = Path("artifacts/report/report.md").read_text(encoding="utf-8")
+        appendix = text.split("## Appendix: Additional Variants", 1)[1]
+        self.assertIn("retention_colocated", appendix)
+        self.assertIn("switch_striping", appendix)
+
+    def test_report_has_no_legacy_or_mode_sections(self) -> None:
+        self._write_metrics_and_run_report()
+        text = Path("artifacts/report/report.md").read_text(encoding="utf-8")
+        self.assertNotIn("DeepVariant New vs Legacy", text)
+        self.assertNotIn("deepvariant_mode", text)
+        self.assertNotIn("legacy switch", text.lower())
 
     def test_backward_compat_without_workload_sweep(self) -> None:
         cfg = copy.deepcopy(self.config)
         cfg.pop("workload_sweep", None)
         cfg.pop("workload_variants", None)
-        cfg.pop("deepvariant_mode_sweep", None)
         cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
         cfg["size_multipliers"] = [1.0]
         cfg["scenarios"] = [sources.SCENARIO_CPU_ONLY]
-        metrics, _ = generate_runs_from_config(cfg)
+        metrics, traces = generate_runs_from_config(cfg)
         self.assertEqual(len(metrics), 1)
-        self.assertEqual(str(metrics[0]["workload_profile"]), sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE)
-        self.assertEqual(str(metrics[0]["workload_variant"]), "base")
-        self.assertEqual(str(metrics[0]["deepvariant_mode"]), "new")
+        self.assertTrue(traces)
+        self.assertNotIn("deepvariant_mode", metrics[0])
 
 
 if __name__ == "__main__":

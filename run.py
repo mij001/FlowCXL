@@ -62,7 +62,6 @@ BASE_METRICS_COLUMNS = [
     "workload_family",
     "workload_profile",
     "workload_variant",
-    "deepvariant_mode",
     "baseline_id",
 ]
 TRACE_YAML_MAX_EVENTS = 2000
