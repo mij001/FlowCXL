@@ -198,6 +198,24 @@ class SimulatorInvariantChecks(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(math.isfinite(scheduler.next_completion_time(at_t=0.0)))
 
+    def test_scheduler_token_is_integer_and_stale_events_rejected(self) -> None:
+        scheduler = CXLProcessorShareScheduler(bw_total_Bps=100.0, slots=4)
+        ok, first_events = scheduler.try_admit(transfer_id=1, bytes_total=100, at_t=0.0)
+        self.assertTrue(ok)
+        stale_token = first_events[0][2]
+        self.assertIsInstance(scheduler._active[1]["token"], int)
+
+        ok, second_events = scheduler.try_admit(transfer_id=2, bytes_total=100, at_t=0.0)
+        self.assertTrue(ok)
+        by_id = {transfer_id: token for _, transfer_id, token in second_events}
+        self.assertIsInstance(by_id[1], int)
+        self.assertNotEqual(stale_token, by_id[1])
+
+        stale_valid, _ = scheduler.complete_if_valid(transfer_id=1, token=stale_token, at_t=0.5)
+        self.assertFalse(stale_valid)
+        valid, _ = scheduler.complete_if_valid(transfer_id=1, token=by_id[1], at_t=2.0)
+        self.assertTrue(valid)
+
     def test_direct_trace_effective_bw_matches_completion_duration(self) -> None:
         direct_rows = [
             row

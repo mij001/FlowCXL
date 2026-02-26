@@ -142,7 +142,7 @@ class CXLProcessorShareScheduler:
         self.now_t = 0.0
         self.busy_slot_time_s = 0.0
         self._token_counter = 0
-        self._active: Dict[int, Dict[str, float]] = {}
+        self._active: Dict[int, Dict[str, float | int]] = {}
 
     def _advance(self, to_t: float) -> None:
         if to_t < self.now_t:
@@ -170,7 +170,7 @@ class CXLProcessorShareScheduler:
             t_complete = self.now_t + (remaining_bytes / per_transfer_Bps)
             self._token_counter += 1
             token = self._token_counter
-            state["token"] = float(token)
+            state["token"] = token
             state["scheduled_complete_t"] = t_complete
             events.append((t_complete, transfer_id, token))
         return events
@@ -201,7 +201,7 @@ class CXLProcessorShareScheduler:
             return False, []
         self._active[transfer_id] = {
             "remaining_bytes": float(max(0, bytes_total)),
-            "token": -1.0,
+            "token": -1,
             "scheduled_complete_t": at_t,
         }
         return True, self._reschedule_completions()
@@ -217,7 +217,7 @@ class CXLProcessorShareScheduler:
         state = self._active.get(transfer_id)
         if state is None:
             return False, []
-        current_token = int(state.get("token", -1.0))
+        current_token = int(state.get("token", -1))
         if current_token != token:
             return False, []
         del self._active[transfer_id]
@@ -268,10 +268,16 @@ def tile_boundary_bytes(total_bytes: int, num_tiles: int) -> List[int]:
     return tiled
 
 
-def transfer_duration_s(bytes_moved: int, link_type: str) -> float:
-    if link_type not in sources.LINKS:
+def transfer_duration_s(
+    bytes_moved: int,
+    link_type: str,
+    *,
+    links_catalog: Mapping[str, Mapping[str, object]] | None = None,
+) -> float:
+    link_catalog = sources.LINKS if links_catalog is None else links_catalog
+    if link_type not in link_catalog:
         raise ValueError(f"unknown link type: {link_type}")
-    link = sources.LINKS[link_type]
+    link = link_catalog[link_type]
     return float(link["latency_s"]) + (bytes_moved / float(link["bandwidth_Bps"]))
 
 
@@ -1100,7 +1106,12 @@ def _normalize_cxl_direct_concurrency_config(
     return cfg
 
 
-def _normalize_cxl_topology_config(config: Mapping[str, object], warn_defaults: bool) -> CXLTopologyConfig:
+def _normalize_cxl_topology_config(
+    config: Mapping[str, object],
+    warn_defaults: bool,
+    *,
+    links_catalog: Mapping[str, Mapping[str, object]] | None = None,
+) -> CXLTopologyConfig:
     defaults: Dict[str, object] = {
         "enabled": True,
         "mode": "dynamic_striping",
@@ -1117,12 +1128,13 @@ def _normalize_cxl_topology_config(config: Mapping[str, object], warn_defaults: 
         raise ValueError("cxl_topology must be a map")
     merged = dict(defaults)
     merged.update(raw)
+    link_catalog = sources.LINKS if links_catalog is None else links_catalog
     mode = str(merged["mode"])
     if mode != "dynamic_striping":
         raise ValueError("cxl_topology.mode must be dynamic_striping")
     applies_to_links = tuple(str(value) for value in merged["applies_to_links"])
     for link_name in applies_to_links:
-        if link_name not in sources.LINKS:
+        if link_name not in link_catalog:
             raise ValueError(f"cxl_topology.applies_to_links has unknown link {link_name}")
     cfg = CXLTopologyConfig(
         enabled=bool(merged["enabled"]),
@@ -1499,7 +1511,10 @@ def _build_tile_operations(
 
 def _validate_config(
     config: Dict[str, object],
+    *,
+    links_catalog: Mapping[str, Mapping[str, object]] | None = None,
 ) -> Dict[str, Dict[str, object]]:
+    link_catalog = sources.LINKS if links_catalog is None else links_catalog
     required_top_level = [
         "dataset_profiles",
         "size_multipliers",
@@ -1551,7 +1566,7 @@ def _validate_config(
         ("host_d2h_link", host_d2h_link),
         ("cxl_direct_link", cxl_direct_link),
     ]:
-        if link_id not in sources.LINKS:
+        if link_id not in link_catalog:
             raise ValueError(f"{link_name} references unknown link: {link_id}")
 
     resource_capacity = config["resource_capacity"]
@@ -1715,7 +1730,7 @@ def _validate_config(
     )
     _normalize_pim_retention_config(config=config, warn_defaults=False)
     _normalize_cxl_direct_concurrency_config(config=config, warn_defaults=False)
-    _normalize_cxl_topology_config(config=config, warn_defaults=False)
+    _normalize_cxl_topology_config(config=config, warn_defaults=False, links_catalog=link_catalog)
     _normalize_ingress_resident_scenarios_by_template(
         config=config,
         template_to_stage_names=template_to_stage_names,
@@ -1790,15 +1805,17 @@ def simulate_configuration(
     workload_profile: str,
     workload_variant: str,
     baseline_id: str,
+    links_catalog: Mapping[str, Mapping[str, object]] | None = None,
     trace_max_tiles: int | None = None,
 ) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    link_catalog = sources.LINKS if links_catalog is None else links_catalog
     if scenario not in sources.SCENARIOS:
         raise ValueError(f"unknown scenario: {scenario}")
-    if host_h2d_link not in sources.LINKS:
+    if host_h2d_link not in link_catalog:
         raise ValueError(f"unknown host H2D link: {host_h2d_link}")
-    if host_d2h_link not in sources.LINKS:
+    if host_d2h_link not in link_catalog:
         raise ValueError(f"unknown host D2H link: {host_d2h_link}")
-    if cxl_direct_link not in sources.LINKS:
+    if cxl_direct_link not in link_catalog:
         raise ValueError(f"unknown cxl direct link: {cxl_direct_link}")
 
     num_stages = len(boundaries_bytes) - 1
@@ -1951,7 +1968,7 @@ def simulate_configuration(
                 active_direct_endpoints.add(dst_endpoint)
     active_direct_endpoint_count = len(active_direct_endpoints)
     cxl_striping_factor = 1
-    cxl_link = sources.LINKS[cxl_direct_link]
+    cxl_link = link_catalog[cxl_direct_link]
     supports_dynamic_striping = bool(cxl_link.get("supports_dynamic_striping", False))
     if (
         cxl_topology.enabled
@@ -2403,13 +2420,21 @@ def simulate_configuration(
                     continue
                 elif scenario == sources.SCENARIO_PIM_HOST_BOUNCE:
                     handoff_mode = "transfer_bounce"
-                    d2h_duration = transfer_duration_s(bytes_moved=bytes_moved, link_type=host_d2h_link)
+                    d2h_duration = transfer_duration_s(
+                        bytes_moved=bytes_moved,
+                        link_type=host_d2h_link,
+                        links_catalog=link_catalog,
+                    )
                     touch_duration = host_touch_duration_s(
                         bytes_moved=bytes_moved,
                         touch_Bps=stage_cfg.host_touch_Bps,
                         touch_fixed_s=stage_cfg.host_touch_fixed_s,
                     )
-                    h2d_duration = transfer_duration_s(bytes_moved=bytes_moved, link_type=host_h2d_link)
+                    h2d_duration = transfer_duration_s(
+                        bytes_moved=bytes_moved,
+                        link_type=host_h2d_link,
+                        links_catalog=link_catalog,
+                    )
                     total_bytes_host_link += bytes_moved * 2
                     total_bytes_host_d2h += bytes_moved
                     total_bytes_host_h2d_stage += bytes_moved
@@ -2458,7 +2483,11 @@ def simulate_configuration(
                         "op_type": "TRANSFER",
                         "stage_id": operation.stage_id,
                         "pool": host_h2d_ingress_pool,
-                        "duration_s": transfer_duration_s(bytes_moved=bytes_moved, link_type=host_h2d_link),
+                        "duration_s": transfer_duration_s(
+                            bytes_moved=bytes_moved,
+                            link_type=host_h2d_link,
+                            links_catalog=link_catalog,
+                        ),
                         "transfer_path": "host_h2d_ingress",
                         "link_used": host_h2d_link,
                         "bytes": bytes_moved,
@@ -2474,7 +2503,11 @@ def simulate_configuration(
                         "op_type": "TRANSFER",
                         "stage_id": operation.stage_id,
                         "pool": host_h2d_stage_pool,
-                        "duration_s": transfer_duration_s(bytes_moved=bytes_moved, link_type=host_h2d_link),
+                        "duration_s": transfer_duration_s(
+                            bytes_moved=bytes_moved,
+                            link_type=host_h2d_link,
+                            links_catalog=link_catalog,
+                        ),
                         "transfer_path": "host_h2d_stage",
                         "link_used": host_h2d_link,
                         "bytes": bytes_moved,
@@ -2490,7 +2523,11 @@ def simulate_configuration(
                         "op_type": "TRANSFER",
                         "stage_id": operation.stage_id,
                         "pool": host_d2h_pool,
-                        "duration_s": transfer_duration_s(bytes_moved=bytes_moved, link_type=host_d2h_link),
+                        "duration_s": transfer_duration_s(
+                            bytes_moved=bytes_moved,
+                            link_type=host_d2h_link,
+                            links_catalog=link_catalog,
+                        ),
                         "transfer_path": "host_d2h",
                         "link_used": host_d2h_link,
                         "bytes": bytes_moved,
@@ -2503,7 +2540,11 @@ def simulate_configuration(
                         "op_type": "TRANSFER",
                         "stage_id": operation.stage_id,
                         "pool": cxl_direct_pool,
-                        "duration_s": transfer_duration_s(bytes_moved=bytes_moved, link_type=cxl_direct_link),
+                        "duration_s": transfer_duration_s(
+                            bytes_moved=bytes_moved,
+                            link_type=cxl_direct_link,
+                            links_catalog=link_catalog,
+                        ),
                         "transfer_path": "cxl_direct",
                         "link_used": cxl_direct_link,
                         "bytes": bytes_moved,
@@ -2701,7 +2742,11 @@ def simulate_configuration(
     return metrics_row, traces
 
 
-def resolve_variant_configs(config: Dict[str, object]) -> Dict[str, Dict[str, object]]:
+def resolve_variant_configs(
+    config: Dict[str, object],
+    *,
+    links_catalog: Mapping[str, Mapping[str, object]] | None = None,
+) -> Dict[str, Dict[str, object]]:
     workload_sweep = _normalize_workload_sweep(config)
     workload_variants = _normalize_workload_variants(config)
 
@@ -2722,13 +2767,17 @@ def resolve_variant_configs(config: Dict[str, object]) -> Dict[str, Dict[str, ob
         merged_config["dataset_profiles"] = list(run_profiles)
         merged_config["size_multipliers"] = list(size_multipliers)
         merged_config["scenarios"] = list(scenarios)
-        _validate_config(merged_config)
+        _validate_config(merged_config, links_catalog=links_catalog)
         resolved[variant_name] = merged_config
     return resolved
 
 
-def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    resolved_variant_configs = resolve_variant_configs(config)
+def generate_runs_from_config(
+    config: Dict[str, object],
+    *,
+    links_catalog: Mapping[str, Mapping[str, object]] | None = None,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    resolved_variant_configs = resolve_variant_configs(config, links_catalog=links_catalog)
 
     metrics: List[Dict[str, object]] = []
     traces: List[Dict[str, object]] = []
@@ -2739,7 +2788,7 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
         size_multipliers = [float(value) for value in merged_config["size_multipliers"]]
         scenarios = [str(value) for value in merged_config["scenarios"]]
 
-        memory_system_by_template = _validate_config(merged_config)
+        memory_system_by_template = _validate_config(merged_config, links_catalog=links_catalog)
         template_to_stage_names = _template_to_stage_names_from_config(merged_config)
 
         tile_size_bytes = int(merged_config["tile_size_bytes"])
@@ -2767,7 +2816,11 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
             config=merged_config,
             warn_defaults=True,
         )
-        cxl_topology_cfg = _normalize_cxl_topology_config(config=merged_config, warn_defaults=True)
+        cxl_topology_cfg = _normalize_cxl_topology_config(
+            config=merged_config,
+            warn_defaults=True,
+            links_catalog=links_catalog,
+        )
         pim_speedup_vs_cpu_by_stage_by_template = merged_config["pim_speedup_vs_cpu_by_stage_by_template"]
         cpu_stage_unit_compute_Bps_by_template = merged_config["cpu_stage_unit_compute_Bps_by_template"]
         bytes_touched_factors_by_stage_by_template = merged_config["bytes_touched_factors_by_stage_by_template"]
@@ -2831,6 +2884,7 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
                         workload_profile=workload_profile,
                         workload_variant=variant_name,
                         baseline_id=baseline_id,
+                        links_catalog=links_catalog,
                         trace_max_tiles=trace_max_tiles,
                     )
                     metrics.append(row)

@@ -115,6 +115,10 @@ Validation pipeline:
 python tools/validation/run_validation.py --config configs/runs.yaml --artifacts-dir artifacts
 ```
 
+Claim-to-evidence mapping for paper artifacts:
+
+- `paper/CLAIMS.md`
+
 Artifacts:
 
 - `artifacts/metrics.csv`

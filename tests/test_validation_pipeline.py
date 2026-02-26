@@ -65,9 +65,59 @@ class ValidationPipelineChecks(unittest.TestCase):
             },
             "cxl_direct_concurrency": {"dma_issue_fixed_s": 1.0e-7},
         }
-        merged_a = run_module._apply_validation_overlay(copy.deepcopy(base), copy.deepcopy(overlay))
-        merged_b = run_module._apply_validation_overlay(copy.deepcopy(base), copy.deepcopy(overlay))
+        merged_a, links_a = run_module._apply_validation_overlay(copy.deepcopy(base), copy.deepcopy(overlay))
+        merged_b, links_b = run_module._apply_validation_overlay(copy.deepcopy(base), copy.deepcopy(overlay))
         self.assertEqual(merged_a, merged_b)
+        self.assertEqual(links_a, links_b)
+
+    def test_validation_overlay_does_not_mutate_sources_links(self) -> None:
+        import run as run_module
+
+        base = self._small_config()
+        overlay = {
+            "link_constant_overrides": {
+                sources.LINK_CXL_SWITCH: {"bandwidth_Bps": 70e9, "latency_s": 300e-9}
+            },
+        }
+        before = copy.deepcopy(sources.LINKS)
+        _, links_catalog = run_module._apply_validation_overlay(copy.deepcopy(base), copy.deepcopy(overlay))
+        self.assertEqual(before, sources.LINKS)
+        self.assertNotEqual(before[sources.LINK_CXL_SWITCH], links_catalog[sources.LINK_CXL_SWITCH])
+
+    def test_overlay_isolation_between_two_runs(self) -> None:
+        cfg = self._small_config()
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["size_multipliers"] = [1.0]
+        direct_link = str(cfg["link_profile"]["cxl_direct_link"])
+        before = copy.deepcopy(sources.LINKS)
+
+        links_fast = {k: dict(v) for k, v in sources.LINKS.items()}
+        links_slow = {k: dict(v) for k, v in sources.LINKS.items()}
+        links_fast[direct_link]["bandwidth_Bps"] = float(links_fast[direct_link]["bandwidth_Bps"]) * 2.0
+        links_slow[direct_link]["bandwidth_Bps"] = max(1.0, float(links_slow[direct_link]["bandwidth_Bps"]) * 0.5)
+
+        metrics_fast, _ = generate_runs_from_config(cfg, links_catalog=links_fast)
+        metrics_slow, _ = generate_runs_from_config(cfg, links_catalog=links_slow)
+        self.assertEqual(before, sources.LINKS)
+        self.assertLess(float(metrics_fast[0]["makespan_s"]), float(metrics_slow[0]["makespan_s"]))
+
+    def test_simulator_uses_injected_links_catalog(self) -> None:
+        cfg = self._small_config()
+        cfg["scenarios"] = [sources.SCENARIO_PIM_HOST_BOUNCE]
+        cfg["size_multipliers"] = [1.0]
+        host_h2d = str(cfg["link_profile"]["host_h2d_link"])
+        host_d2h = str(cfg["link_profile"]["host_d2h_link"])
+
+        links_fast = {k: dict(v) for k, v in sources.LINKS.items()}
+        links_slow = {k: dict(v) for k, v in sources.LINKS.items()}
+        links_fast[host_h2d]["bandwidth_Bps"] = float(links_fast[host_h2d]["bandwidth_Bps"]) * 2.0
+        links_fast[host_d2h]["bandwidth_Bps"] = float(links_fast[host_d2h]["bandwidth_Bps"]) * 2.0
+        links_slow[host_h2d]["bandwidth_Bps"] = max(1.0, float(links_slow[host_h2d]["bandwidth_Bps"]) * 0.5)
+        links_slow[host_d2h]["bandwidth_Bps"] = max(1.0, float(links_slow[host_d2h]["bandwidth_Bps"]) * 0.5)
+
+        metrics_fast, _ = generate_runs_from_config(cfg, links_catalog=links_fast)
+        metrics_slow, _ = generate_runs_from_config(cfg, links_catalog=links_slow)
+        self.assertLess(float(metrics_fast[0]["makespan_s"]), float(metrics_slow[0]["makespan_s"]))
 
     def test_crosscheck_output_schema(self) -> None:
         cfg = self._small_config()
@@ -122,6 +172,22 @@ class ValidationPipelineChecks(unittest.TestCase):
         run_ids_a = [row["run_id"] for row in metrics_a]
         run_ids_b = [row["run_id"] for row in metrics_b]
         self.assertEqual(run_ids_a, run_ids_b)
+
+    def test_claims_file_exists_and_has_required_sections(self) -> None:
+        claims_path = Path("paper/CLAIMS.md")
+        self.assertTrue(claims_path.exists())
+        text = claims_path.read_text(encoding="utf-8")
+        required_markers = [
+            "Claim statement",
+            "Supporting artifacts",
+            "Canonical config",
+            "Reproduce",
+            "Parameter provenance",
+            "Sensitivity statement",
+            "Residual caveats",
+        ]
+        for marker in required_markers:
+            self.assertIn(marker, text)
 
 
 if __name__ == "__main__":

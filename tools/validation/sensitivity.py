@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import argparse
 import copy
-from contextlib import contextmanager
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, List, Mapping, Sequence, Tuple
 
 import pandas as pd
 import yaml
@@ -32,21 +31,21 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-@contextmanager
-def _temporary_link_overrides(overrides: Mapping[str, Mapping[str, float]] | None):
-    original = copy.deepcopy(sources.LINKS)
-    try:
-        if overrides:
-            for link_id, patch in overrides.items():
-                if link_id not in sources.LINKS:
-                    raise ValueError(f"unknown link id for override: {link_id}")
-                updated = dict(sources.LINKS[link_id])
-                updated.update(dict(patch))
-                sources.LINKS[link_id] = updated
-        yield
-    finally:
-        sources.LINKS.clear()
-        sources.LINKS.update(original)
+def _build_links_catalog(
+    overrides: Mapping[str, Mapping[str, float]] | None,
+) -> Dict[str, Dict[str, object]]:
+    links_catalog: Dict[str, Dict[str, object]] = {
+        str(link_id): dict(link_cfg) for link_id, link_cfg in sources.LINKS.items()
+    }
+    if not overrides:
+        return links_catalog
+    for link_id, patch in overrides.items():
+        if link_id not in links_catalog:
+            raise ValueError(f"unknown link id for override: {link_id}")
+        updated = dict(links_catalog[link_id])
+        updated.update(dict(patch))
+        links_catalog[link_id] = updated
+    return links_catalog
 
 
 def _compute_ratios(metrics_rows: List[Dict[str, object]]) -> pd.DataFrame:
@@ -134,8 +133,8 @@ def _run_case(
     cfg["trace_max_tiles"] = 0
     if patch:
         cfg = deep_merge(cfg, patch)
-    with _temporary_link_overrides(link_overrides):
-        metrics, _ = generate_runs_from_config(cfg)
+    links_catalog = _build_links_catalog(link_overrides)
+    metrics, _ = generate_runs_from_config(cfg, links_catalog=links_catalog)
     return _compute_ratios(metrics)
 
 

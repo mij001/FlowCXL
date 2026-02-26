@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
 import yaml
@@ -146,21 +146,24 @@ def _deep_merge(base: Dict[str, object], patch: Dict[str, object]) -> Dict[str, 
 def _apply_validation_overlay(
     config: Dict[str, object],
     overlay: Dict[str, object],
-) -> Dict[str, object]:
+) -> Tuple[Dict[str, object], Dict[str, Dict[str, object]]]:
+    resolved_links: Dict[str, Dict[str, object]] = {
+        str(link_id): dict(link_cfg) for link_id, link_cfg in sources.LINKS.items()
+    }
     effective_overlay = copy.deepcopy(overlay)
     link_overrides = effective_overlay.pop("link_constant_overrides", {})
     if link_overrides:
         if not isinstance(link_overrides, dict):
             raise ValueError("validation overlay link_constant_overrides must be a map")
         for link_id, link_patch in link_overrides.items():
-            if link_id not in sources.LINKS:
+            if link_id not in resolved_links:
                 raise ValueError(f"validation overlay references unknown link id: {link_id}")
             if not isinstance(link_patch, dict):
                 raise ValueError(f"validation overlay for {link_id} must be a map")
-            current = dict(sources.LINKS[link_id])
+            current = dict(resolved_links[link_id])
             current.update(link_patch)
-            sources.LINKS[link_id] = current
-    return _deep_merge(config, effective_overlay)
+            resolved_links[link_id] = current
+    return _deep_merge(config, effective_overlay), resolved_links
 
 
 def _write_yaml(path: Path, payload: Dict[str, object]) -> None:
@@ -176,6 +179,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     config = load_config(config_path)
     config_input_snapshot = copy.deepcopy(config)
+    links_catalog: Dict[str, Dict[str, object]] = {
+        str(link_id): dict(link_cfg) for link_id, link_cfg in sources.LINKS.items()
+    }
     overlay_payload: Dict[str, object] | None = None
     if args.validation_overlay:
         overlay_path = Path(args.validation_overlay)
@@ -186,7 +192,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         if not isinstance(loaded, dict):
             raise ValueError("validation overlay root must be a mapping")
         overlay_payload = loaded
-        config = _apply_validation_overlay(config=config, overlay=overlay_payload)
+        config, links_catalog = _apply_validation_overlay(config=config, overlay=overlay_payload)
 
     artifacts_dir = Path(args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -194,12 +200,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     _write_yaml(artifacts_dir / "config_input.yaml", config_input_snapshot)
     if overlay_payload is not None:
         _write_yaml(artifacts_dir / "config_validation_overlay.yaml", overlay_payload)
-    resolved_variant_configs = resolve_variant_configs(config)
+    resolved_variant_configs = resolve_variant_configs(config, links_catalog=links_catalog)
     for variant_name, resolved_cfg in resolved_variant_configs.items():
         resolved_name = variant_name.replace("/", "_").replace(" ", "_")
         _write_yaml(artifacts_dir / f"config_resolved_{resolved_name}.yaml", resolved_cfg)
 
-    metrics, traces = generate_runs_from_config(config)
+    metrics, traces = generate_runs_from_config(config, links_catalog=links_catalog)
 
     metrics_df = pd.DataFrame(metrics)
     metrics_df = metrics_df.reindex(columns=metrics_columns())

@@ -20,6 +20,7 @@ Use these classes consistently:
 - `UPMEM_HOST_H2D_MEASURED_BW_Bps` and `UPMEM_HOST_D2H_MEASURED_BW_Bps` are selected directional points within cited single-digit GB/s context.
 - DeepVariant internal 5-kernel split factors/byte factors are explicit modeling assumptions layered on cited public stage definitions.
 - Validation artifacts are system-tagged (`validation.system_id`) and should be interpreted as system-specific calibration, not universal constants.
+- Validation overlay link constants are applied per run through an injected catalog; base `sources.LINKS` remains unchanged across runs/tests.
 
 ## How To Audit A Parameter
 

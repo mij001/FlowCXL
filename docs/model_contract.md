@@ -36,6 +36,7 @@ Trace semantics:
 
 - Run matrix expansion and IDs are deterministic for a fixed config.
 - Floating-point values may differ at sub-ulp scales; tests should use tolerances for timing equality.
+- Validation overlays are run-scoped: link constant overrides are applied to an injected link catalog and do not mutate `sources.LINKS`.
 
 ## Processor-Sharing Approximation
 
@@ -46,6 +47,14 @@ Direct CXL scheduling uses a fluid processor-sharing approximation:
 - single-bottleneck link abstraction.
 
 This is not packet-level simulation and does not model burstiness/HOL details.
+
+## Processor-Sharing Performance Note
+
+The current scheduler reissues completion candidates for all active direct transfers at each admit/complete event (using stale-token invalidation for superseded events).
+
+- Practical cost scales with active direct streams.
+- Keep direct concurrency in a moderate range for fast simulation turnaround.
+- The model is intended for architectural trend analysis, not high-fanout packet-level stress simulation.
 
 ## Ingressless Semantics
 
