@@ -129,6 +129,101 @@ class ResourcePool:
         return t_start, t_end, wait_s, slot_idx
 
 
+class CXLProcessorShareScheduler:
+    """Symmetric processor-sharing model for direct CXL data service."""
+
+    def __init__(self, *, bw_total_Bps: float, slots: int) -> None:
+        if bw_total_Bps <= 0:
+            raise ValueError("bw_total_Bps must be > 0")
+        if slots <= 0:
+            raise ValueError("slots must be > 0")
+        self.bw_total_Bps = float(bw_total_Bps)
+        self.slots = int(slots)
+        self.now_t = 0.0
+        self.busy_slot_time_s = 0.0
+        self._token_counter = 0
+        self._active: Dict[int, Dict[str, float]] = {}
+
+    def _advance(self, to_t: float) -> None:
+        if to_t < self.now_t:
+            to_t = self.now_t
+        if not self._active:
+            self.now_t = to_t
+            return
+        dt = to_t - self.now_t
+        if dt <= 0:
+            return
+        active_count = len(self._active)
+        served_per_transfer = (self.bw_total_Bps * dt) / float(active_count)
+        for state in self._active.values():
+            state["remaining_bytes"] = max(0.0, state["remaining_bytes"] - served_per_transfer)
+        self.busy_slot_time_s += dt * float(active_count)
+        self.now_t = to_t
+
+    def _reschedule_completions(self) -> List[Tuple[float, int, int]]:
+        events: List[Tuple[float, int, int]] = []
+        if not self._active:
+            return events
+        per_transfer_Bps = self.bw_total_Bps / float(len(self._active))
+        for transfer_id, state in self._active.items():
+            remaining_bytes = max(0.0, float(state["remaining_bytes"]))
+            t_complete = self.now_t + (remaining_bytes / per_transfer_Bps)
+            self._token_counter += 1
+            token = self._token_counter
+            state["token"] = float(token)
+            state["scheduled_complete_t"] = t_complete
+            events.append((t_complete, transfer_id, token))
+        return events
+
+    def next_completion_time(self, *, at_t: float | None = None) -> float:
+        if at_t is not None:
+            self._advance(at_t)
+        if not self._active:
+            return math.inf
+        per_transfer_Bps = self.bw_total_Bps / float(len(self._active))
+        min_remaining = min(float(state["remaining_bytes"]) for state in self._active.values())
+        return self.now_t + (min_remaining / per_transfer_Bps)
+
+    def active_count(self, *, at_t: float | None = None) -> int:
+        if at_t is not None:
+            self._advance(at_t)
+        return len(self._active)
+
+    def try_admit(
+        self,
+        *,
+        transfer_id: int,
+        bytes_total: int,
+        at_t: float,
+    ) -> Tuple[bool, List[Tuple[float, int, int]]]:
+        self._advance(at_t)
+        if len(self._active) >= self.slots:
+            return False, []
+        self._active[transfer_id] = {
+            "remaining_bytes": float(max(0, bytes_total)),
+            "token": -1.0,
+            "scheduled_complete_t": at_t,
+        }
+        return True, self._reschedule_completions()
+
+    def complete_if_valid(
+        self,
+        *,
+        transfer_id: int,
+        token: int,
+        at_t: float,
+    ) -> Tuple[bool, List[Tuple[float, int, int]]]:
+        self._advance(at_t)
+        state = self._active.get(transfer_id)
+        if state is None:
+            return False, []
+        current_token = int(state.get("token", -1.0))
+        if current_token != token:
+            return False, []
+        del self._active[transfer_id]
+        return True, self._reschedule_completions()
+
+
 def scale_boundaries_exact(boundaries_bytes: Sequence[int], multiplier: float) -> List[int]:
     if multiplier <= 0:
         raise ValueError("size multiplier must be > 0")
@@ -315,10 +410,6 @@ def retain_duration_s(retain_fixed_s: float, retain_metadata_bytes: int, retain_
     return retain_fixed_s + (float(retain_metadata_bytes) / retain_local_BW_Bps)
 
 
-def _active_slots_at_time(pool: ResourcePool, t_point: float) -> int:
-    return sum(1 for free_t in pool.next_free_time_by_slot if free_t > t_point)
-
-
 def _resolve_host_link_names(link_profile: Mapping[str, object]) -> Tuple[str, str]:
     if "host_h2d_link" in link_profile or "host_d2h_link" in link_profile:
         if "host_h2d_link" not in link_profile or "host_d2h_link" not in link_profile:
@@ -456,148 +547,25 @@ def _normalize_memory_system_config(
     *,
     config: Mapping[str, object],
     template_to_stage_names: Mapping[str, Sequence[str]],
-    warn_deprecated: bool,
 ) -> Dict[str, Dict[str, object]]:
-    memory_system_by_template_raw = config.get("memory_system_by_template")
-    if memory_system_by_template_raw is not None:
-        if not isinstance(memory_system_by_template_raw, Mapping):
-            raise ValueError("memory_system_by_template must be a map")
-        normalized: Dict[str, Dict[str, object]] = {}
-        for template, stage_names in template_to_stage_names.items():
-            if template not in memory_system_by_template_raw:
-                raise KeyError(f"memory_system_by_template missing template {template}")
-            template_cfg = memory_system_by_template_raw[template]
-            if not isinstance(template_cfg, Mapping):
-                raise ValueError(f"memory_system_by_template[{template}] must be a map")
-            merged = dict(template_cfg)
-            merged["_stage_names"] = list(stage_names)
-            normalized[template] = merged
-        return normalized
-    return _normalize_memory_system_config_from_legacy_keys(
-        config=config,
-        template_to_stage_names=template_to_stage_names,
-        warn_deprecated=warn_deprecated,
-    )
-
-
-def _normalize_memory_system_config_from_legacy_keys(
-    *,
-    config: Mapping[str, object],
-    template_to_stage_names: Mapping[str, Sequence[str]],
-    warn_deprecated: bool,
-) -> Dict[str, Dict[str, object]]:
-    legacy_keys = [
-        "enable_memory_ceiling_by_template",
-        "dram_service_defaults",
-        "cpu_mem_Bps_by_stage_by_template",
-        "pim_mem_Bps_by_stage_by_template",
-        "cpu_access_pattern_by_stage_by_template",
-        "cpu_random_access_penalty_by_stage_by_template",
-        "cpu_materialization_by_template",
-    ]
-    missing = [key for key in legacy_keys if key not in config]
-    if missing:
+    if "memory_system_by_template" not in config:
         raise KeyError(
-            "memory_system_by_template missing and cannot normalize from legacy keys; missing: "
-            + ", ".join(missing)
+            "missing required config key: memory_system_by_template. "
+            "Legacy memory keys are no longer supported."
         )
-
-    if warn_deprecated:
-        warnings.warn(
-            "memory_system_by_template missing and deprecated legacy keys were used for normalization.",
-            UserWarning,
-            stacklevel=2,
-        )
-
-    enable_map = config["enable_memory_ceiling_by_template"]
-    dram_defaults = config["dram_service_defaults"]
-    cpu_mem_map = config["cpu_mem_Bps_by_stage_by_template"]
-    pim_mem_map = config["pim_mem_Bps_by_stage_by_template"]
-    cpu_access_map = config["cpu_access_pattern_by_stage_by_template"]
-    cpu_penalty_map = config["cpu_random_access_penalty_by_stage_by_template"]
-    cpu_mat_map = config["cpu_materialization_by_template"]
-    if not isinstance(dram_defaults, Mapping):
-        raise ValueError("legacy dram_service_defaults must be a map")
-    cacheline_bytes = float(dram_defaults.get("cacheline_bytes", 64.0))
-    if cacheline_bytes <= 0:
-        raise ValueError("legacy dram_service_defaults.cacheline_bytes must be > 0")
-
+    memory_system_by_template_raw = config["memory_system_by_template"]
+    if not isinstance(memory_system_by_template_raw, Mapping):
+        raise ValueError("memory_system_by_template must be a map")
     normalized: Dict[str, Dict[str, object]] = {}
     for template, stage_names in template_to_stage_names.items():
-        if template not in enable_map:
-            raise KeyError(f"legacy enable_memory_ceiling_by_template missing template {template}")
-        if template not in cpu_mem_map:
-            raise KeyError(f"legacy cpu_mem_Bps_by_stage_by_template missing template {template}")
-        if template not in pim_mem_map:
-            raise KeyError(f"legacy pim_mem_Bps_by_stage_by_template missing template {template}")
-        if template not in cpu_access_map:
-            raise KeyError(f"legacy cpu_access_pattern_by_stage_by_template missing template {template}")
-        if template not in cpu_penalty_map:
-            raise KeyError(f"legacy cpu_random_access_penalty_by_stage_by_template missing template {template}")
-        if template not in cpu_mat_map:
-            raise KeyError(f"legacy cpu_materialization_by_template missing template {template}")
-
-        cpu_stages: Dict[str, Dict[str, object]] = {}
-        pim_stages: Dict[str, Dict[str, object]] = {}
-        for stage_name in stage_names:
-            access_cfg = cpu_access_map[template][stage_name]
-            cpu_stages[stage_name] = {
-                "access_pattern": access_cfg["access_pattern"],
-                "row_hit_rate": access_cfg["row_hit_rate"],
-                "mlp": access_cfg["mlp"],
-                "avg_miss_latency_ns": access_cfg["avg_miss_latency_ns"],
-                "peak_bw_Bps": cpu_mem_map[template][stage_name],
-                "penalty_multiplier": cpu_penalty_map[template][stage_name],
-            }
-            pim_stages[stage_name] = {
-                "access_pattern": access_cfg["access_pattern"],
-                "row_hit_rate": access_cfg["row_hit_rate"],
-                "mlp": access_cfg["mlp"],
-                "avg_miss_latency_ns": access_cfg["avg_miss_latency_ns"],
-                "peak_bw_Bps": pim_mem_map[template][stage_name],
-            }
-
-        legacy_mat = cpu_mat_map[template]
-        blocker_boundaries = list(legacy_mat.get("breaker_boundaries", []))
-        mat_scenarios = list(legacy_mat.get("scenarios", []))
-        mat_enabled = bool(legacy_mat.get("enabled", False))
-        if not mat_enabled:
-            blocker_boundaries = []
-            mat_scenarios = []
-
-        normalized[template] = {
-            "enabled": bool(enable_map[template]),
-            "_stage_names": list(stage_names),
-            "cpu_baseline_system": {
-                "baseline_engine": sources.CPU_ENGINE_VECTORIZED_PIPELINE,
-                "dram_channels": 8,
-                "banks_per_channel": 16,
-                "cacheline_bytes": cacheline_bytes,
-                "queueing_model": "utilization_penalty",
-                "queue_alpha": 0.35,
-                "rho_cap": 0.95,
-                "stages": cpu_stages,
-                "materialization_policy": {
-                    "boundaries_by_engine": {
-                        sources.CPU_ENGINE_VECTORIZED_PIPELINE: [],
-                        sources.CPU_ENGINE_BLOCKING_VOLCANO: blocker_boundaries,
-                    },
-                    "materialize_Bps": legacy_mat["materialize_Bps"],
-                    "fixed_s": legacy_mat["fixed_s"],
-                    "scenarios": mat_scenarios,
-                },
-            },
-            "pim_system": {
-                "enabled": bool(enable_map[template]),
-                "dram_channels": 16,
-                "banks_per_channel": 16,
-                "cacheline_bytes": cacheline_bytes,
-                "queueing_model": "utilization_penalty",
-                "queue_alpha": 0.20,
-                "rho_cap": 0.95,
-                "stages": pim_stages,
-            },
-        }
+        if template not in memory_system_by_template_raw:
+            raise KeyError(f"memory_system_by_template missing template {template}")
+        template_cfg = memory_system_by_template_raw[template]
+        if not isinstance(template_cfg, Mapping):
+            raise ValueError(f"memory_system_by_template[{template}] must be a map")
+        merged = dict(template_cfg)
+        merged["_stage_names"] = list(stage_names)
+        normalized[template] = merged
     return normalized
 
 
@@ -1531,8 +1499,6 @@ def _build_tile_operations(
 
 def _validate_config(
     config: Dict[str, object],
-    *,
-    warn_deprecated_memory_keys: bool = False,
 ) -> Dict[str, Dict[str, object]]:
     required_top_level = [
         "dataset_profiles",
@@ -1549,6 +1515,7 @@ def _validate_config(
         "pim_speedup_vs_cpu_by_stage_by_template",
         "cpu_stage_unit_compute_Bps_by_template",
         "bytes_touched_factors_by_stage_by_template",
+        "memory_system_by_template",
     ]
     missing = [key for key in required_top_level if key not in config]
     if missing:
@@ -1558,10 +1525,20 @@ def _validate_config(
         "scenario_stage_device_map",
         "pim_speedup_vs_cpu_by_stage",
         "cpu_stage_unit_compute_Bps",
+        "enable_memory_ceiling_by_template",
+        "dram_service_defaults",
+        "cpu_mem_Bps_by_stage_by_template",
+        "pim_mem_Bps_by_stage_by_template",
+        "cpu_random_access_penalty_by_stage_by_template",
+        "cpu_access_pattern_by_stage_by_template",
+        "cpu_materialization_by_template",
     ]
     legacy_present = [key for key in legacy_flat_keys if key in config]
     if legacy_present:
-        raise ValueError(f"legacy flat template keys are not allowed: {legacy_present}")
+        raise ValueError(
+            "legacy keys are not supported; use memory_system_by_template instead. "
+            f"Found: {legacy_present}"
+        )
 
     link_profile = config["link_profile"]
     host_h2d_link, host_d2h_link = _resolve_host_link_names(link_profile)
@@ -1722,7 +1699,6 @@ def _validate_config(
     memory_system_by_template = _normalize_memory_system_config(
         config=config,
         template_to_stage_names=template_to_stage_names,
-        warn_deprecated=warn_deprecated_memory_keys,
     )
     _validate_memory_system_config(
         memory_system_by_template=memory_system_by_template,
@@ -1979,6 +1955,15 @@ def simulate_configuration(
             cxl_topology.num_physical_links,
             endpoint_factor,
         )
+    cxl_total_bw_Bps = float(cxl_link["bandwidth_Bps"]) * float(cxl_striping_factor)
+    cxl_processor_scheduler = CXLProcessorShareScheduler(
+        bw_total_Bps=cxl_total_bw_Bps,
+        slots=cxl_direct_stream_slots,
+    )
+    cxl_direct_completion_heap: List[Tuple[float, int, int]] = []
+    pending_direct_transfers: Dict[Tuple[int, int], Dict[str, object]] = {}
+    active_direct_transfers: Dict[int, Dict[str, object]] = {}
+    next_direct_transfer_id = 1
 
     traces: List[Dict[str, object]] = []
     completion_times = [0.0 for _ in range(num_tiles)]
@@ -2011,7 +1996,106 @@ def simulate_configuration(
     total_retain_handoff_time_component_s = 0.0
     total_cxl_dma_issue_time_component_s = 0.0
 
-    while request_heap:
+    while request_heap or cxl_direct_completion_heap:
+        next_req_t = request_heap[0][0] if request_heap else math.inf
+        next_direct_done_t = cxl_direct_completion_heap[0][0] if cxl_direct_completion_heap else math.inf
+
+        if next_direct_done_t <= next_req_t:
+            t_done, transfer_id, token = heapq.heappop(cxl_direct_completion_heap)
+            transfer_info = active_direct_transfers.get(transfer_id)
+            if transfer_info is None:
+                continue
+            valid, new_completion_events = cxl_processor_scheduler.complete_if_valid(
+                transfer_id=transfer_id,
+                token=token,
+                at_t=t_done,
+            )
+            if not valid:
+                continue
+            for t_evt, tr_id, tr_token in new_completion_events:
+                heapq.heappush(cxl_direct_completion_heap, (t_evt, tr_id, tr_token))
+
+            direct_record = active_direct_transfers.pop(transfer_id)
+            tile_id = int(direct_record["tile_id"])
+            op_index = int(direct_record["op_index"])
+            t_req = float(direct_record["t_req"])
+            t_start = float(direct_record["t_start"])
+            t_end = float(t_done)
+            wait_s = max(0.0, t_start - t_req)
+            duration_s = max(0.0, t_end - t_start)
+            stage_id = int(direct_record["stage_id"])
+            stage_device = str(direct_record["stage_device"])
+
+            if trace_max_tiles is None or tile_id < trace_max_tiles:
+                traces.append(
+                    {
+                        "run_id": run_id,
+                        "dataset_profile": dataset_profile,
+                        "stage_size_multiplier": size_multiplier,
+                        "scenario": scenario,
+                        "pipeline_template": pipeline_template,
+                        "workload_family": workload_family,
+                        "workload_profile": workload_profile,
+                        "workload_variant": workload_variant,
+                        "baseline_id": baseline_id,
+                        "tile_id": tile_id,
+                        "op_index": op_index + 1,
+                        "stage_id": stage_id,
+                        "stage_name": stage_names[stage_id - 1],
+                        "stage_device": stage_device,
+                        "op_type": "TRANSFER",
+                        "transfer_path": "cxl_direct",
+                        "resource": cxl_direct_pool.name,
+                        "resource_slot": -1,
+                        "link_type": cxl_direct_link,
+                        "bytes": int(direct_record["bytes"]),
+                        "t_req": t_req,
+                        "t_start": t_start,
+                        "t_end": t_end,
+                        "duration_s": duration_s,
+                        "wait_s": wait_s,
+                        "compute_component_s": 0.0,
+                        "memory_component_s": 0.0,
+                        "bytes_touched": 0.0,
+                        "cpu_access_pattern": "",
+                        "cpu_row_hit_rate": 0.0,
+                        "cpu_mlp": 0.0,
+                        "cpu_avg_miss_latency_ns": 0.0,
+                        "cpu_bw_peak_Bps": 0.0,
+                        "cpu_bw_latency_Bps": 0.0,
+                        "cpu_bw_eff_stage_Bps": 0.0,
+                        "cpu_bw_eff_per_unit_Bps": 0.0,
+                        "cpu_mem_bound_mode": "",
+                        "memory_ceiling_enabled": memory_system_enabled,
+                        "memory_system_role": "",
+                        "mem_service_Bps": 0.0,
+                        "mem_queue_multiplier": 1.0,
+                        "mem_rho": 0.0,
+                        "mem_service_time_s": 0.0,
+                        "mem_queue_delay_s": 0.0,
+                        "cpu_baseline_engine": cpu_baseline_engine,
+                        "stage_src_endpoint": str(direct_record["stage_src_endpoint"]),
+                        "stage_dst_endpoint": str(direct_record["stage_dst_endpoint"]),
+                        "handoff_mode": str(direct_record["handoff_mode"]),
+                        "retention_capacity_blocked": bool(direct_record["retention_capacity_blocked"]),
+                        "cxl_active_streams": int(direct_record["cxl_active_streams"]),
+                        "cxl_bw_share_Bps": float(direct_record["cxl_bw_share_Bps"]),
+                        "cxl_issue_overhead_s": float(direct_record["cxl_issue_overhead_s"]),
+                        "cxl_striping_factor": int(direct_record["cxl_striping_factor"]),
+                    }
+                )
+
+            next_op_index[tile_id] = op_index + 1
+            completion_times[tile_id] = t_end
+            if next_op_index[tile_id] < len(operations):
+                heapq.heappush(request_heap, (t_end, tile_id))
+            elif next_tile_to_admit < num_tiles:
+                heapq.heappush(request_heap, (t_end, next_tile_to_admit))
+                next_tile_to_admit += 1
+            continue
+
+        if not request_heap:
+            break
         t_req, tile_id = heapq.heappop(request_heap)
         op_index = next_op_index[tile_id]
         if op_index >= len(operations):
@@ -2224,37 +2308,84 @@ def simulate_configuration(
             if not event_specs:
                 if scenario == sources.SCENARIO_PIM_FLOWCXL_DIRECT:
                     handoff_mode = "transfer_direct"
-                    earliest_slot_free = min(cxl_direct_pool.next_free_time_by_slot)
-                    t_direct_start_snapshot = max(t_req, earliest_slot_free)
-                    active_direct_streams = _active_slots_at_time(cxl_direct_pool, t_direct_start_snapshot)
-                    cxl_active_streams = active_direct_streams + 1
-                    cxl_striping_factor_trace = cxl_striping_factor
-                    total_cxl_bw_Bps = float(cxl_link["bandwidth_Bps"]) * float(cxl_striping_factor_trace)
-                    cxl_bw_share_Bps = total_cxl_bw_Bps / float(max(1, cxl_active_streams))
-                    u_out = min(
-                        1.0,
-                        float(cxl_direct_concurrency.dma_outstanding_per_vc)
-                        / float(cxl_direct_concurrency.full_bw_outstanding_threshold),
-                    )
-                    cxl_issue_overhead_s = cxl_direct_concurrency.dma_issue_fixed_s / max(u_out, 1e-6)
-                    total_cxl_dma_issue_time_component_s += cxl_issue_overhead_s
-                    direct_duration = (
-                        float(cxl_link["latency_s"])
-                        + cxl_issue_overhead_s
-                        + (bytes_moved / cxl_bw_share_Bps)
-                    )
-                    total_bytes_cxl_direct += bytes_moved
-                    event_specs.append(
-                        {
-                            "op_type": "TRANSFER",
+                    pending_key = (tile_id, op_index)
+                    pending = pending_direct_transfers.get(pending_key)
+                    if pending is None:
+                        u_out = min(
+                            1.0,
+                            float(cxl_direct_concurrency.dma_outstanding_per_vc)
+                            / float(cxl_direct_concurrency.full_bw_outstanding_threshold),
+                        )
+                        issue_overhead_s = cxl_direct_concurrency.dma_issue_fixed_s / max(u_out, 1e-6)
+                        ready_t = t_req + float(cxl_link["latency_s"]) + issue_overhead_s
+                        total_cxl_dma_issue_time_component_s += issue_overhead_s
+                        pending = {
+                            "tile_id": tile_id,
+                            "op_index": op_index,
                             "stage_id": src_stage_id,
-                            "pool": cxl_direct_pool,
-                            "duration_s": direct_duration,
-                            "transfer_path": "cxl_direct",
-                            "link_used": cxl_direct_link,
+                            "stage_device": stage_devices[src_stage_id - 1],
                             "bytes": bytes_moved,
+                            "stage_src_endpoint": src_endpoint,
+                            "stage_dst_endpoint": dst_endpoint,
+                            "handoff_mode": handoff_mode,
+                            "retention_capacity_blocked": retention_capacity_blocked,
+                            "t_req": t_req,
+                            "ready_t": ready_t,
+                            "cxl_issue_overhead_s": issue_overhead_s,
+                            "cxl_striping_factor": cxl_striping_factor,
                         }
+                        pending_direct_transfers[pending_key] = pending
+
+                    admit_t = max(t_req, float(pending["ready_t"]))
+                    active_before = cxl_processor_scheduler.active_count(at_t=admit_t)
+                    if active_before >= cxl_direct_stream_slots:
+                        retry_t = cxl_processor_scheduler.next_completion_time(at_t=admit_t)
+                        if not math.isfinite(retry_t):
+                            retry_t = admit_t
+                        heapq.heappush(request_heap, (max(admit_t, retry_t), tile_id))
+                        continue
+
+                    transfer_id = next_direct_transfer_id
+                    next_direct_transfer_id += 1
+                    admitted, new_completion_events = cxl_processor_scheduler.try_admit(
+                        transfer_id=transfer_id,
+                        bytes_total=bytes_moved,
+                        at_t=admit_t,
                     )
+                    if not admitted:
+                        retry_t = cxl_processor_scheduler.next_completion_time(at_t=admit_t)
+                        if not math.isfinite(retry_t):
+                            retry_t = admit_t
+                        heapq.heappush(request_heap, (max(admit_t, retry_t), tile_id))
+                        continue
+
+                    cxl_active_streams = active_before + 1
+                    cxl_bw_share_Bps = cxl_total_bw_Bps / float(max(1, cxl_active_streams))
+                    cxl_issue_overhead_s = float(pending["cxl_issue_overhead_s"])
+                    cxl_striping_factor_trace = int(pending["cxl_striping_factor"])
+                    total_bytes_cxl_direct += bytes_moved
+
+                    active_direct_transfers[transfer_id] = {
+                        "tile_id": tile_id,
+                        "op_index": op_index,
+                        "stage_id": src_stage_id,
+                        "stage_device": stage_devices[src_stage_id - 1],
+                        "bytes": bytes_moved,
+                        "stage_src_endpoint": src_endpoint,
+                        "stage_dst_endpoint": dst_endpoint,
+                        "handoff_mode": handoff_mode,
+                        "retention_capacity_blocked": retention_capacity_blocked,
+                        "t_req": float(pending["t_req"]),
+                        "t_start": admit_t,
+                        "cxl_active_streams": cxl_active_streams,
+                        "cxl_bw_share_Bps": cxl_bw_share_Bps,
+                        "cxl_issue_overhead_s": cxl_issue_overhead_s,
+                        "cxl_striping_factor": cxl_striping_factor_trace,
+                    }
+                    pending_direct_transfers.pop(pending_key, None)
+                    for t_evt, tr_id, tr_token in new_completion_events:
+                        heapq.heappush(cxl_direct_completion_heap, (t_evt, tr_id, tr_token))
+                    continue
                 elif scenario == sources.SCENARIO_PIM_HOST_BOUNCE:
                     handoff_mode = "transfer_bounce"
                     d2h_duration = transfer_duration_s(bytes_moved=bytes_moved, link_type=host_d2h_link)
@@ -2452,6 +2583,10 @@ def simulate_configuration(
             heapq.heappush(request_heap, (t_end, next_tile_to_admit))
             next_tile_to_admit += 1
 
+    if active_direct_transfers:
+        raise AssertionError("direct transfer state left active at simulation end")
+    cxl_direct_pool.busy_time_s = cxl_processor_scheduler.busy_slot_time_s
+
     makespan_s = max(completion_times) if completion_times else 0.0
 
     compute_energy_J = sum(pool.busy_time_s * pool.power_W for pool in compute_pools)
@@ -2539,11 +2674,12 @@ def simulate_configuration(
         "cxl_active_direct_endpoints": active_direct_endpoint_count,
         "cxl_effective_striping_factor": cxl_striping_factor,
         "total_cxl_dma_issue_time_component_s": total_cxl_dma_issue_time_component_s,
+        "cxl_bw_model": "processor_share",
     }
     return metrics_row, traces
 
 
-def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+def resolve_variant_configs(config: Dict[str, object]) -> Dict[str, Dict[str, object]]:
     workload_sweep = _normalize_workload_sweep(config)
     workload_variants = _normalize_workload_variants(config)
 
@@ -2556,10 +2692,7 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
     size_multipliers = [float(value) for value in config["size_multipliers"]]
     scenarios = [str(value) for value in config["scenarios"]]
 
-    metrics: List[Dict[str, object]] = []
-    traces: List[Dict[str, object]] = []
-    run_counter = 1
-
+    resolved: Dict[str, Dict[str, object]] = {}
     for variant in workload_variants:
         variant_name = str(variant["name"])
         variant_overrides = variant["overrides"]
@@ -2567,11 +2700,24 @@ def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str,
         merged_config["dataset_profiles"] = list(run_profiles)
         merged_config["size_multipliers"] = list(size_multipliers)
         merged_config["scenarios"] = list(scenarios)
+        _validate_config(merged_config)
+        resolved[variant_name] = merged_config
+    return resolved
 
-        memory_system_by_template = _validate_config(
-            merged_config,
-            warn_deprecated_memory_keys=True,
-        )
+
+def generate_runs_from_config(config: Dict[str, object]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    resolved_variant_configs = resolve_variant_configs(config)
+
+    metrics: List[Dict[str, object]] = []
+    traces: List[Dict[str, object]] = []
+    run_counter = 1
+
+    for variant_name, merged_config in resolved_variant_configs.items():
+        run_profiles = [str(value) for value in merged_config["dataset_profiles"]]
+        size_multipliers = [float(value) for value in merged_config["size_multipliers"]]
+        scenarios = [str(value) for value in merged_config["scenarios"]]
+
+        memory_system_by_template = _validate_config(merged_config)
         template_to_stage_names = _template_to_stage_names_from_config(merged_config)
 
         tile_size_bytes = int(merged_config["tile_size_bytes"])

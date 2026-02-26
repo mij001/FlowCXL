@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import pandas as pd
 import yaml
 
-from simulator import generate_runs_from_config
+from simulator import generate_runs_from_config, resolve_variant_configs
 
 BASE_METRICS_COLUMNS = [
     "run_id",
@@ -60,12 +61,13 @@ BASE_METRICS_COLUMNS = [
     "cxl_active_direct_endpoints",
     "cxl_effective_striping_factor",
     "total_cxl_dma_issue_time_component_s",
+    "cxl_bw_model",
     "workload_family",
     "workload_profile",
     "workload_variant",
     "baseline_id",
 ]
-TRACE_YAML_MAX_EVENTS = 2000
+DEFAULT_TRACE_YAML_MAX_EVENTS = 2000
 
 
 def _sample_yaml_events(traces: List[Dict[str, object]], max_events: int) -> List[Dict[str, object]]:
@@ -99,37 +101,80 @@ def _sample_yaml_events(traces: List[Dict[str, object]], max_events: int) -> Lis
     return selected
 
 
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run FlowCXL simulations.")
+    parser.add_argument("--config", default="configs/runs.yaml", help="Path to run config YAML.")
+    parser.add_argument("--artifacts-dir", default="artifacts", help="Artifacts output directory.")
+    parser.add_argument(
+        "--trace-yaml-max-events",
+        type=int,
+        default=DEFAULT_TRACE_YAML_MAX_EVENTS,
+        help="Maximum number of trace events stored in traces.yaml.",
+    )
+    return parser.parse_args(argv)
+
+
 def metrics_columns() -> List[str]:
     return list(BASE_METRICS_COLUMNS)
 
 
 def load_config(config_path: Path) -> Dict[str, object]:
     with config_path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+        config = yaml.safe_load(handle)
+    if not isinstance(config, dict):
+        raise ValueError("config root must be a mapping")
+    return config
 
 
-def main() -> None:
-    config_path = Path("configs/runs.yaml")
+def _write_yaml(path: Path, payload: Dict[str, object]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _parse_args(argv)
+    config_path = Path(args.config)
     if not config_path.exists():
-        raise FileNotFoundError("configs/runs.yaml not found.")
+        raise FileNotFoundError(f"config file not found: {config_path}")
 
     config = load_config(config_path)
-    metrics, traces = generate_runs_from_config(config)
-
-    artifacts_dir = Path("artifacts")
+    artifacts_dir = Path(args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_yaml(artifacts_dir / "config_input.yaml", config)
+    resolved_variant_configs = resolve_variant_configs(config)
+    for variant_name, resolved_cfg in resolved_variant_configs.items():
+        resolved_name = variant_name.replace("/", "_").replace(" ", "_")
+        _write_yaml(artifacts_dir / f"config_resolved_{resolved_name}.yaml", resolved_cfg)
+
+    metrics, traces = generate_runs_from_config(config)
 
     metrics_df = pd.DataFrame(metrics)
     metrics_df = metrics_df.reindex(columns=metrics_columns())
     metrics_path = artifacts_dir / "metrics.csv"
     metrics_df.to_csv(metrics_path, index=False)
 
+    run_matrix_cols = [
+        "run_id",
+        "workload_family",
+        "workload_profile",
+        "workload_variant",
+        "dataset_profile",
+        "pipeline_template",
+        "scenario",
+        "stage_size_multiplier",
+        "baseline_id",
+    ]
+    run_matrix_df = metrics_df[run_matrix_cols].copy()
+    run_matrix_path = artifacts_dir / "run_matrix.csv"
+    run_matrix_df.to_csv(run_matrix_path, index=False)
+
     traces_df = pd.DataFrame(traces)
     traces_csv_path = artifacts_dir / "traces.csv"
     traces_df.to_csv(traces_csv_path, index=False)
 
     traces_yaml_path = artifacts_dir / "traces.yaml"
-    yaml_events = _sample_yaml_events(traces=traces, max_events=TRACE_YAML_MAX_EVENTS)
+    yaml_events = _sample_yaml_events(traces=traces, max_events=int(args.trace_yaml_max_events))
     with traces_yaml_path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(
             {
@@ -143,10 +188,9 @@ def main() -> None:
         )
 
     print(f"Wrote {metrics_path} ({len(metrics_df)} rows)")
+    print(f"Wrote {run_matrix_path} ({len(run_matrix_df)} rows)")
     print(f"Wrote {traces_csv_path} ({len(traces_df)} rows)")
-    print(
-        f"Wrote {traces_yaml_path} ({len(yaml_events)} events in YAML, total events {len(traces)})"
-    )
+    print(f"Wrote {traces_yaml_path} ({len(yaml_events)} events in YAML, total events {len(traces)})")
 
 
 if __name__ == "__main__":

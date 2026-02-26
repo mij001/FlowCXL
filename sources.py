@@ -569,3 +569,78 @@ CITED_VALUES = {
 }
 
 CITATIONS = {key: {"url": value["url"], "quote": value["quote"]} for key, value in CITED_VALUES.items()}
+
+PARAMETER_PROVENANCE = {
+    "link_profile.host_h2d_link": {
+        "class": "assumed_sweepable",
+        "source": "configs/runs.yaml",
+        "note": "Directional host H2D link selection for the experiment matrix.",
+        "config_key": "link_profile.host_h2d_link",
+    },
+    "link_profile.host_d2h_link": {
+        "class": "assumed_sweepable",
+        "source": "configs/runs.yaml",
+        "note": "Directional host D2H link selection for the experiment matrix.",
+        "config_key": "link_profile.host_d2h_link",
+    },
+    "LINK_UPMEM_HOST_H2D_MEASURED.bandwidth_Bps": {
+        "class": "measured_cited",
+        "source": "CITED_VALUES.UPMEM_HOST_H2D_MEASURED_BW_Bps",
+        "note": "Chosen H2D point in the cited single-digit GB/s range.",
+        "config_key": "sources.LINKS[UPMEM_HOST_H2D_MEASURED].bandwidth_Bps",
+    },
+    "LINK_UPMEM_HOST_D2H_MEASURED.bandwidth_Bps": {
+        "class": "measured_cited",
+        "source": "CITED_VALUES.UPMEM_HOST_D2H_MEASURED_BW_Bps",
+        "note": "Chosen D2H point in the cited single-digit GB/s range.",
+        "config_key": "sources.LINKS[UPMEM_HOST_D2H_MEASURED].bandwidth_Bps",
+    },
+    "LINK_CXL_SWITCH.bandwidth_Bps": {
+        "class": "assumed_sweepable",
+        "source": "CITED_VALUES.CXL_SWITCH_BW_Bps",
+        "note": "Switch-link bandwidth assumption used for topology sensitivity.",
+        "config_key": "sources.LINKS[CXL_SWITCH].bandwidth_Bps",
+    },
+    "LINK_CXL_SWITCH.latency_s": {
+        "class": "assumed_sweepable",
+        "source": "CITED_VALUES.CXL_SWITCH_LAT_s",
+        "note": "Switch-link latency assumption used for topology sensitivity.",
+        "config_key": "sources.LINKS[CXL_SWITCH].latency_s",
+    },
+    "tpch_3op.boundaries_bytes": {
+        "class": "derived_workload",
+        "source": "TPCH_PROFILE_PARAMETERS",
+        "note": "Derived from rows, selectivity, fanout, and reduction equations.",
+        "config_key": "sources.TPCH_PROFILE_PARAMETERS",
+    },
+    "deepvariant_3stage.boundaries_bytes": {
+        "class": "derived_workload",
+        "source": "DEEPVARIANT_PROFILE_PARAMETERS",
+        "note": "Derived from coverage-density and tensor/output factor equations.",
+        "config_key": "sources.DEEPVARIANT_PROFILE_PARAMETERS",
+    },
+    "memory_system_by_template": {
+        "class": "assumed_sweepable",
+        "source": "configs/runs.yaml",
+        "note": "Primary memory-service model configuration for CPU/PIM systems.",
+        "config_key": "memory_system_by_template",
+    },
+    "cxl_direct_concurrency": {
+        "class": "assumed_sweepable",
+        "source": "configs/runs.yaml",
+        "note": "Processor-sharing direct-path concurrency controls.",
+        "config_key": "cxl_direct_concurrency",
+    },
+    "cxl_topology": {
+        "class": "assumed_sweepable",
+        "source": "configs/runs.yaml",
+        "note": "Topology striping model and physical caps.",
+        "config_key": "cxl_topology",
+    },
+    "pim_retention": {
+        "class": "assumed_sweepable",
+        "source": "configs/runs.yaml",
+        "note": "Retention shortcut model and capacity guard configuration.",
+        "config_key": "pim_retention",
+    },
+}

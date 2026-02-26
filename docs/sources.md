@@ -1,62 +1,28 @@
-# Sources and Cited Constants
+# Sources And Provenance
 
-All cited constants and references are recorded in `sources.py`.
+All references and constants are defined in `sources.py`:
 
-## Transfer/link constants
+- `CITED_VALUES`
+- `CITATIONS`
+- `PARAMETER_PROVENANCE`
 
-- PCIe Gen4 x16 host bandwidth and fixed latency components
-- Measured UPMEM-order host H2D and D2H bandwidth points (directional defaults)
-- CXL local/remote representative latency and bandwidth points
+## Provenance Classes
 
-These constants are used directly in transfer duration equations.
+Use these classes consistently:
 
-## DeepVariant anchors
+- `measured_cited`: value point anchored to published measurement context.
+- `derived_workload`: computed from workload/profile equations.
+- `assumed_sweepable`: modeling knob for design-space sweeps.
 
-- Stage names:
-  - `make_examples`, `call_variants`, `postprocess_variants`
-- Example tensor shape anchor (`example_info` style): `[100, 147, 10]`
-- Runtime-share context used for CPU calibration defaults
+## Important Clarifications
 
-## TPC-H / OLAP anchors
+- `CXL_SWITCH_LAT_s` and `CXL_SWITCH_BW_Bps` are **assumed_sweepable** topology points, not directly measured constants from the cited CXL homepage.
+- `UPMEM_HOST_H2D_MEASURED_BW_Bps` and `UPMEM_HOST_D2H_MEASURED_BW_Bps` are selected directional points within cited single-digit GB/s context.
+- DeepVariant internal 5-kernel split factors/byte factors are explicit modeling assumptions layered on cited public stage definitions.
 
-- TPC-H benchmark context for scan/join/aggregation pipeline modeling
-- Host-bounce vs direct-copy context from direct-data-path literature/blogs
-- PIM-operator context references for scan, join, and analytics aggregation
-- OLAP memory-pressure context used to justify stage memory-ceiling modeling
+## How To Audit A Parameter
 
-## Configurable modeling assumptions (not fixed hardware truth)
-
-These are explicit knobs in `sources.py`/`configs/runs.yaml`:
-
-- TPC-H profile parameters:
-  - selectivity, join fanout, aggregation reduction ratio
-  - row-byte widths per stage boundary
-- Stage compute rates/speedups:
-  - `cpu_stage_unit_compute_Bps_by_template`
-  - `pim_speedup_vs_cpu_by_stage_by_template`
-- First-class memory-system knobs:
-  - `memory_system_by_template`
-  - `memory_system_by_template.<template>.cpu_baseline_system`
-  - `memory_system_by_template.<template>.pim_system`
-  - `memory_system_by_template.<template>.cpu_baseline_system.baseline_engine`
-  - `memory_system_by_template.<template>.cpu_baseline_system.materialization_policy`
-  - `bytes_touched_factors_by_stage_by_template`
-- Deprecated compatibility knobs (used only when `memory_system_by_template` is absent):
-  - `enable_memory_ceiling_by_template`
-  - `dram_service_defaults`
-  - `cpu_mem_Bps_by_stage_by_template`
-  - `pim_mem_Bps_by_stage_by_template`
-  - `cpu_random_access_penalty_by_stage_by_template`
-  - `cpu_access_pattern_by_stage_by_template`
-  - `cpu_materialization_by_template`
-- CPU pipeline-break materialization knobs:
-  - `resource_capacity.cpu_materialize_channels`
-  - `transfer_power_W.cpu_materialize_channel`
-- Scenario stage maps:
-  - `scenario_stage_device_map_by_template`
-- Transfer-channel counts and per-channel power
-- Host-touch throughput/fixed overhead
-- Directional host-link selection (`host_h2d_link`, `host_d2h_link`)
-- Tile size and in-flight window
-
-These knobs are intended for controlled sensitivity studies, not as universal measured constants.
+1. Locate config key/value in `configs/runs.yaml`.
+2. Check `sources.PARAMETER_PROVENANCE[config_key-or-logical-id]`.
+3. Follow `source` into `CITED_VALUES` or workload derivation fields.
+4. Confirm classification (`measured_cited`, `derived_workload`, `assumed_sweepable`) matches report narrative.

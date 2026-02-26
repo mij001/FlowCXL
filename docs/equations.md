@@ -1,346 +1,282 @@
 # Equations
 
-This model includes boundary derivation, stage compute calibration, tiled scheduling, transfer contention, makespan, and energy.
+This document is the executable model math contract for boundary derivation, compute/memory service, transfer timing, and energy.
 
-## 1) Boundary derivation by template
+## 1) Boundary Derivation
 
-### DeepVariant (`deepvariant_3stage`)
+### DeepVariant (`deepvariant_3stage`, public 3-stage, internal 5-kernel)
+
+Public stages:
+
+- `make_examples`
+- `call_variants`
+- `postprocess_variants`
+
+Execution kernels:
+
+- `make_examples_frontend`
+- `make_examples_tensorize`
+- `call_variants_infer`
+- `call_variants_post`
+- `postprocess_variants`
 
 Given:
 
 - covered bases `B_cov`
 - coverage `C`
-- candidate density at reference coverage `d_ref`
-- reference coverage `C_ref`
-- aligned bytes per covered base `b_aln`
-- example shape `[h, w, c]`
+- candidate density `d_ref` at reference coverage `C_ref`
+- aligned bytes/base `b_aln`
+- example shape `[h,w,c]`
 - example element bytes `b_elem`
-- call output bytes/example `b_call`
-- postprocess output bytes/example `b_post`
-
-Examples:
-
-\[
-N_{ex} = round\left(B_{cov} \cdot d_{ref} \cdot \frac{C}{C_{ref}}\right)
-\]
-
-Boundaries (`X0..X3`):
+- frontend bytes/example `b_front`
+- tensor overhead factor `f_tensor`
+- infer output bytes/example `b_infer`
+- call-post output bytes/example `b_call_post`
+- final postprocess output bytes/example `b_post`
 
 \[
-X_0 = round(B_{cov} \cdot C \cdot b_{aln})
-\]
-\[
-X_1 = N_{ex} \cdot h \cdot w \cdot c \cdot b_{elem}
-\]
-\[
-X_2 = N_{ex} \cdot b_{call}
-\]
-\[
-X_3 = N_{ex} \cdot b_{post}
+N_{ex}=round\left(B_{cov}\cdot d_{ref}\cdot\frac{C}{C_{ref}}\right)
 \]
 
-### TPC-H OLAP (`tpch_3op`)
+Execution boundaries (`X0..X5`):
+
+\[
+X_0=round(B_{cov}\cdot C\cdot b_{aln})
+\]
+\[
+X_1=round(N_{ex}\cdot b_{front})
+\]
+\[
+X_2=round(N_{ex}\cdot h\cdot w\cdot c\cdot b_{elem}\cdot f_{tensor})
+\]
+\[
+X_3=round(N_{ex}\cdot b_{infer})
+\]
+\[
+X_4=round(N_{ex}\cdot b_{call\_post})
+\]
+\[
+X_5=round(N_{ex}\cdot b_{post})
+\]
+
+Kernel runtime-share split from public shares:
+
+\[
+q_{front}=q_{make}\cdot f_{make\_front}
+\]
+\[
+q_{tensor}=q_{make}\cdot (1-f_{make\_front})
+\]
+\[
+q_{infer}=q_{call}\cdot f_{call\_infer}
+\]
+\[
+q_{call\_post}=q_{call}\cdot (1-f_{call\_infer})
+\]
+\[
+q_{post}=q_{postprocess}
+\]
+
+### TPC-H (`tpch_3op`)
 
 Given:
 
 - scale factor `SF`
-- base rows per SF `R_sf`
-- scan input row bytes `b_scan_in`
-- projected row bytes `b_scan_out`
+- base rows/SF `R_sf`
 - scan selectivity `s_scan`
 - join fanout `f_join`
-- join output row bytes `b_join_out`
-- aggregation reduction ratio `r_agg`
-- aggregation output row bytes `b_agg_out`
-
-Row counts:
+- agg reduction `r_agg`
+- row widths `b_scan_in,b_scan_out,b_join_out,b_agg_out`
 
 \[
-R_{scan\_in} = round(SF \cdot R_{sf})
+R_{scan\_in}=round(SF\cdot R_{sf})
 \]
 \[
-R_{scan\_out} = max(1, round(R_{scan\_in} \cdot s_{scan}))
+R_{scan\_out}=max(1, round(R_{scan\_in}\cdot s_{scan}))
 \]
 \[
-R_{join\_out} = max(1, round(R_{scan\_out} \cdot f_{join}))
+R_{join\_out}=max(1, round(R_{scan\_out}\cdot f_{join}))
 \]
 \[
-R_{agg\_out} = max(1, round(R_{join\_out} \cdot r_{agg}))
+R_{agg\_out}=max(1, round(R_{join\_out}\cdot r_{agg}))
 \]
 
-Boundaries (`X0..X3`):
-
 \[
-X_0 = R_{scan\_in} \cdot b_{scan\_in}
-\]
-\[
-X_1 = R_{scan\_out} \cdot b_{scan\_out}
-\]
-\[
-X_2 = R_{join\_out} \cdot b_{join\_out}
-\]
-\[
-X_3 = R_{agg\_out} \cdot b_{agg\_out}
+X_0=R_{scan\_in}\cdot b_{scan\_in},\;
+X_1=R_{scan\_out}\cdot b_{scan\_out},\;
+X_2=R_{join\_out}\cdot b_{join\_out},\;
+X_3=R_{agg\_out}\cdot b_{agg\_out}
 \]
 
-## 2) Stage-size scaling
+## 2) Scaling, Tiling, Admission
 
-For multiplier `m`, each boundary is scaled with integer conservation:
+Stage multiplier `m` uses integer-conserving boundary scaling:
 
 \[
-\sum_i X'_i = round\left(m \cdot \sum_i X_i\right)
+\sum_i X'_i = round\left(m\cdot \sum_i X_i\right)
 \]
 
-## 3) Tiling
-
 \[
-K = max\left(1, \left\lceil \frac{\max_i(X'_i)}{tile\_size} \right\rceil \right)
+K=max\left(1,\left\lceil \frac{\max_i(X'_i)}{tile\_size}\right\rceil\right)
 \]
 
-Each boundary is partitioned exactly:
+Each boundary is exactly partitioned:
 
 \[
-X'_i = \sum_{k=1}^{K} X_{i,k}
+X'_i=\sum_{k=1}^{K} X_{i,k}
 \]
 
-## 4) Streaming admission
+Streaming admission:
 
-Initial active tiles:
+- initial admitted tiles: `min(K, max_inflight_tiles)`
+- each final tile completion admits exactly one next tile.
+
+## 3) Compute And Memory Service
+
+Per stage `s`, tile `k`:
 
 \[
-K_{active,0} = min(K, max\_inflight\_tiles)
+T_{compute}(s,k)=\frac{X_{s-1,k}}{R_{device,s}}
 \]
 
-When tile `k` completes final op at `t_done,k`, admit one new tile at that time.
-
-## 5) Compute calibration
-
-### DeepVariant path
-
-Given CPU reference total runtime `T_cpu_ref` and stage share `q_s`:
-
 \[
-T_{cpu,stage}(s) = T_{cpu,ref} \cdot q_s
+bytes\_touched(s,k)=f_{amp,s}\cdot\left(f_{in,s}\cdot X_{s-1,k}+f_{out,s}\cdot X_{s,k}\right)
 \]
 
-With stage input bytes `X_{s-1}` and CPU units `U_cpu`:
+Memory service (CPU/PIM first-class systems):
 
 \[
-R_{cpu}(s) = \frac{X_{s-1}}{U_{cpu} \cdot T_{cpu,stage}(s)}
-\]
-
-### TPC-H path
-
-`R_cpu(s)` is taken directly from `cpu_stage_unit_compute_Bps_by_template[tpch_3op][s]`.
-
-### PIM rate (all templates)
-
-Given template stage speedup `a_s`:
-
-\[
-R_{pim}(s) = R_{cpu}(s) \cdot a_s
-\]
-
-Tile compute duration:
-
-\[
-T_{compute}(s,k) = \frac{X_{s-1,k}}{R_s}
-\]
-
-## 5b) Bytes touched and first-class memory service
-
-For tile `k` at stage `s`:
-
-- `bytes_in = X_{s-1,k}`
-- `bytes_out = X_{s,k}`
-- factors: `f_in`, `f_out`, `f_amp`
-
-\[
-bytes\_touched(s,k) = f_{amp}(s)\cdot\left(f_{in}(s)\cdot bytes_{in} + f_{out}(s)\cdot bytes_{out}\right)
-\]
-
-When `memory_system_by_template[template].enabled = true`, CPU and PIM stages use their own system configs:
-
-- `cpu_baseline_system.stages[s]`
-- `pim_system.stages[s]`
-
-Inputs per stage:
-
-- `a_s`: access pattern in `{sequential_scan, hash_probe, hash_build, groupby_update}`
-- `h_s`: row-hit rate proxy
-- `m_s`: memory-level parallelism
-- `L_s`: average miss latency (ns)
-- `BW_peak(s)`: stage peak memory service bandwidth
-- `p_s`: penalty multiplier (CPU compatibility path, default `1.0`; PIM uses `1.0`)
-- `U_s`: stage units
-- queue model parameters: `queue_alpha`, `rho_cap`
-
-\[
-miss_s = max(10^{-6}, 1-h_s)
+miss=max(10^{-6},1-row\_hit)
 \]
 \[
-BW_{lat}(s) = \frac{m_s \cdot CL}{(L_s \cdot 10^{-9}) \cdot miss_s}
+BW_{lat}=\frac{MLP\cdot CL}{(latency\_ns\cdot 10^{-9})\cdot miss}
 \]
-
-Pattern-limited service:
-
 \[
-BW_{service}(s) =
+BW_{service}=
 \begin{cases}
-BW_{peak}(s), & a_s = sequential\_scan \\
-min(BW_{peak}(s), BW_{lat}(s)), & \text{otherwise}
+BW_{peak}, & access=sequential\_scan\\
+min(BW_{peak}, BW_{lat}), & access\in\{hash\_probe,hash\_build,groupby\_update\}
 \end{cases}
 \]
-
-Penalty-adjusted service:
-
 \[
-BW_{service,adj}(s) = \frac{BW_{service}(s)}{p_s}
+BW_{service,adj}=BW_{service}/penalty\_multiplier
 \]
 
-Offered load estimate:
+Offered load and queueing:
 
 \[
-BW_{offered}(s,k) = \frac{bytes\_touched(s,k)}{max(T_{compute}(s,k), \epsilon)}
+BW_{offered}=\frac{bytes\_touched}{max(T_{compute},\epsilon)}
+\]
+\[
+\rho=min\left(\rho_{cap},\frac{BW_{offered}}{BW_{service,adj}}\right)
+\]
+\[
+Q=1+queue\_\alpha\cdot\frac{\rho}{1-\rho}
+\]
+\[
+BW_{eff,stage}=BW_{service,adj}/Q
+\]
+\[
+BW_{eff,unit}=BW_{eff,stage}/units
+\]
+\[
+T_{mem}=\frac{bytes\_touched}{BW_{eff,unit}}
+\]
+\[
+T_{stage}=max(T_{compute},T_{mem})
+\]
+
+When memory system is disabled for template: `T_stage = T_compute`.
+
+## 4) Transfer Equations
+
+Directional host links:
+
+\[
+T_{host\_h2d}(B)=lat_{h2d}+\frac{B}{BW_{h2d}}
+\]
+\[
+T_{host\_d2h}(B)=lat_{d2h}+\frac{B}{BW_{d2h}}
+\]
+
+Host touch:
+
+\[
+T_{touch}(B)=touch\_fixed+\frac{B}{touch\_BW}
+\]
+
+CPU materialize:
+
+\[
+T_{mat}(B)=mat\_fixed+\frac{B}{mat\_BW}
+\]
+
+Retention handoff:
+
+\[
+T_{retain}=retain\_fixed+\frac{retain\_metadata\_bytes}{retain\_local\_BW}
+\]
+
+Ingressless rule:
+
+- for configured scenarios, skip the first host->PIM transfer per tile (`host_h2d_ingress` or first `host_h2d_stage`).
+
+## 5) CXL Direct Processor Sharing
+
+Direct path uses symmetric processor-sharing with slot cap.
+
+- total direct service bandwidth:
+\[
+BW_{total}=BW_{link}\cdot striping\_factor
+\]
+- active transfers at time `t`: `N(t)` with `N(t)\le slots`
+- each active transfer instantaneous rate:
+\[
+r_i(t)=BW_{total}/N(t)
+\]
+
+Admission overhead (before data service):
+
+\[
+T_{issue}=dma\_issue\_fixed / u_{out}
+\]
+\[
+u_{out}=min\left(1,\frac{dma\_outstanding\_per\_vc}{full\_bw\_outstanding\_threshold}\right)
+\]
+
+Data service advances continuously; overlapping transfers symmetrically slow all active flows.
+
+## 6) Lower-Bound Diagnostics
+
+\[
+lb_{pool}=busy\_time\_s/capacity
 \]
 
 \[
-\rho(s,k) = min\left(\rho_{cap}, \frac{BW_{offered}(s,k)}{BW_{service,adj}(s)}\right)
+lb_{compute\_stage\_max}=max(lb_{cpu/pim\_stage\_pools}, lb_{cpu\_materialize})
 \]
 \[
-Q(s,k) = 1 + queue_{\alpha}\cdot\frac{\rho(s,k)}{1-\rho(s,k)}
-\]
-\[
-BW_{eff,stage}(s,k) = \frac{BW_{service,adj}(s)}{Q(s,k)}
-\]
-\[
-BW_{eff,unit}(s,k) = \frac{BW_{eff,stage}(s,k)}{U_s}
-\]
-\[
-T_{mem}(s,k) = \frac{bytes\_touched(s,k)}{BW_{eff,unit}(s,k)}
+lb_{host\_link}=max(lb_{host\_h2d\_ingress}, lb_{host\_h2d\_stage}, lb_{host\_d2h})
 \]
 
-Final compute-op duration:
+Dominant component:
 
 \[
-T_{stage}(s,k) = max(T_{compute}(s,k), T_{mem}(s,k))
+dominant=\arg\max\{lb_{compute\_stage\_max},lb_{host\_link},lb_{host\_touch},lb_{cxl\_direct}\}
 \]
 
-If memory ceiling is disabled for the template:
+## 7) Energy
 
 \[
-T_{stage}(s,k) = T_{compute}(s,k)
+E_{pool}=busy\_time\_s \cdot power\_W
 \]
-
-Service-vs-queue diagnostics:
 
 \[
-T_{mem,service}(s,k) = \frac{bytes\_touched(s,k)}{BW_{service,adj}(s)/U_s}
+E_{compute}=\sum E_{stage\_compute}+E_{cpu\_materialize}
 \]
 \[
-T_{mem,queue}(s,k) = max(0, T_{mem}(s,k)-T_{mem,service}(s,k))
-\]
-
-## 6) Transfer duration
-
-Host H2D transfer:
-
-\[
-T_{h2d}(B) = T_{fixed,host} + \frac{B}{BW_{h2d}}
-\]
-
-Host D2H transfer:
-
-\[
-T_{d2h}(B) = T_{fixed,host} + \frac{B}{BW_{d2h}}
-\]
-
-Direct CXL transfer:
-
-\[
-T_{cxl}(B) = L_{cxl} + \frac{B}{BW_{cxl}}
-\]
-
-Host-touch:
-
-\[
-T_{touch}(B) = T_{touch,fixed} + \frac{B}{BW_{touch}}
-\]
-
-CPU materialization barrier:
-
-\[
-T_{mat}(B) = T_{mat,fixed} + \frac{B}{BW_{mat}}
-\]
-
-## 7) Transition-aware transfer graph
-
-For stage transition `s -> s+1`:
-
-- `cpu -> cpu`: no transfer op
-- `cpu -> pim`: `host_h2d_stage`
-- `pim -> cpu`: `host_d2h`
-- `pim -> pim` in bounce: `host_d2h -> HOST_TOUCH -> host_h2d_stage`
-- `pim -> pim` in direct: `cxl_direct`
-- `MATERIALIZE` boundaries for CPU-only runs come from
-  `cpu_baseline_system.materialization_policy.boundaries_by_engine[baseline_engine]`
-
-Ingress `host_h2d_ingress` is added only when stage 1 is on PIM.
-Egress `host_d2h` is added only when final stage is on PIM.
-
-## 8) Resource-pool scheduling
-
-Each op reserves one pool slot:
-
-\[
-t_{start} = max(t_{req}, t_{free,earliest})
+E_{transfer}=E_{h2d\_ingress}+E_{h2d\_stage}+E_{d2h}+E_{cxl\_direct}+E_{host\_touch}
 \]
 \[
-t_{end} = t_{start} + duration
+E_{total}=E_{compute}+E_{transfer}
 \]
-
-## 9) Makespan
-
-\[
-T_{makespan} = \max_k(t_{end,k})
-\]
-
-## 10) Energy
-
-Per resource `r`:
-
-\[
-E_r = busy\_time_r \cdot P_r
-\]
-
-Totals:
-
-\[
-E_{compute} = \sum_{r \in compute} E_r
-\]
-\[
-E_{transfer} = \sum_{r \in transfer} E_r
-\]
-\[
-E_{total} = E_{compute} + E_{transfer}
-\]
-
-## 11) LB diagnostics
-
-Pool lower bound:
-
-\[
-LB_r = \frac{busy\_time_r}{capacity_r}
-\]
-
-Reported:
-
-- `lb_compute_stage_max_s = max(compute pool LBs)`
-- `lb_host_h2d_ingress_s`
-- `lb_host_h2d_stage_s`
-- `lb_host_d2h_s`
-- `lb_host_link_s = max(lb_host_h2d_ingress_s, lb_host_h2d_stage_s, lb_host_d2h_s)`
-- `lb_host_touch_s`
-- `lb_cxl_direct_s`
-
-`dominant_lb_component` is the max among `{compute_stage_max, host_link, host_touch, cxl_direct}`.

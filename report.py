@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
+import matplotlib
+
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import pandas as pd
+import yaml
 
 import sources
 
@@ -28,6 +33,18 @@ SCENARIO_LABELS = {
 
 MAIN_VARIANTS = ("base", "ingressless")
 APPENDIX_VARIANTS = ("retention_colocated", "switch_striping")
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate FlowCXL report artifacts.")
+    parser.add_argument("--config", default="configs/runs.yaml", help="Path to run config YAML.")
+    parser.add_argument("--artifacts-dir", default="artifacts", help="Artifacts directory.")
+    parser.add_argument(
+        "--metrics-file",
+        default=None,
+        help="Optional explicit metrics.csv path. Defaults to <artifacts-dir>/metrics.csv",
+    )
+    return parser.parse_args(argv)
 
 
 def _build_markdown_table(table_df: pd.DataFrame) -> str:
@@ -189,7 +206,6 @@ def _summary_at_1x(subset: pd.DataFrame) -> Tuple[Dict[str, object], str]:
                 f"At 1x, direct and bounce are tied (direct/bounce={direct_over_bounce:.6f}). "
                 f"Bounce is dominated by `{dominant_bounce}`, direct by `{dominant_direct}`."
             )
-
     return summary, interpretation
 
 
@@ -243,12 +259,20 @@ def _profile_variant_section(
     return [makespan_plot, energy_plot, makespan_pim_plot, energy_pim_plot], summary, interpretation
 
 
-def main() -> None:
-    metrics_path = Path("artifacts/metrics.csv")
-    if not metrics_path.exists():
-        raise FileNotFoundError("artifacts/metrics.csv not found. Run `python run.py` first.")
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _parse_args(argv)
+    config_path = Path(args.config)
+    if not config_path.exists():
+        raise FileNotFoundError(f"config file not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        yaml.safe_load(handle)
 
-    report_dir = Path("artifacts/report")
+    artifacts_dir = Path(args.artifacts_dir)
+    metrics_path = Path(args.metrics_file) if args.metrics_file else artifacts_dir / "metrics.csv"
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"metrics file not found: {metrics_path}. Run `python run.py` first.")
+
+    report_dir = artifacts_dir / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
     for stale_plot in report_dir.glob("plot_*.png"):
         stale_plot.unlink()

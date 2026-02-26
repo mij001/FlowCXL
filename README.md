@@ -47,7 +47,6 @@ The high-intermediate TPCH profile is configured to expose host-bounce penalties
   - `cpu_baseline_system` and `pim_system` are configured separately
   - DeepVariant defaults to `enabled: false` (compute-only behavior preserved)
   - TPC-H defaults to `enabled: true`
-  - legacy memory keys are accepted only as deprecated compatibility input when `memory_system_by_template` is absent
 - Memory service model (when enabled):
   - `T_stage = max(T_compute, T_mem)`
   - service BW from access pattern + miss behavior + peak BW
@@ -69,6 +68,7 @@ The high-intermediate TPCH profile is configured to expose host-bounce penalties
 - Split host H2D topology: ingress vs stage channels
 - Directional host links for host staging (`host_h2d_link`, `host_d2h_link`)
   - Legacy `host_link` is still accepted and mapped to both directions
+- Symmetric processor-sharing CXL direct model for overlapping transfers
 - CPU materialization policy is baseline-engine gated:
   - `baseline_engine=vectorized_pipeline` (default): no forced barriers
   - `baseline_engine=blocking_volcano`: configured breaker boundaries (default `[1,2]`)
@@ -98,11 +98,15 @@ The high-intermediate TPCH profile is configured to expose host-bounce penalties
 - `tests/test_simulator.py`: model checks
 - `docs/`: equations, modeling notes, sources
 
+Model contract details:
+
+- `docs/model_contract.md`
+
 ## Run
 
 ```bash
-python run.py
-python report.py
+python run.py --config configs/runs.yaml --artifacts-dir artifacts
+python report.py --config configs/runs.yaml --artifacts-dir artifacts
 ```
 
 Artifacts:
