@@ -1,0 +1,4 @@
+name: fig_validation
+description: Validation appendix artifacts (calibration, cross-check, sweeps, tornado, ablations).
+base_config: ../../configs/runs.yaml
+validation_output_dir: ../../artifacts/validation

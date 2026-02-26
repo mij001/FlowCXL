@@ -1,0 +1,67 @@
+ablations:
+  - name: full_model
+    overrides:
+      workload_variants:
+        - name: base
+          overrides: {}
+      size_multipliers: [1.0]
+
+  - name: no_host_touch
+    overrides:
+      workload_variants:
+        - name: base
+          overrides: {}
+      size_multipliers: [1.0]
+      stage_defaults:
+        host_touch_Bps: 1.0e30
+      transfer_power_W:
+        host_touch_channel: 0.0
+
+  - name: no_retention
+    overrides:
+      workload_variants:
+        - name: base
+          overrides: {}
+      size_multipliers: [1.0]
+      pim_retention:
+        enabled: false
+
+  - name: no_striping
+    overrides:
+      workload_variants:
+        - name: base
+          overrides: {}
+      size_multipliers: [1.0]
+      cxl_topology:
+        enabled: false
+
+  - name: bounce_only
+    overrides:
+      workload_variants:
+        - name: base
+          overrides: {}
+      size_multipliers: [1.0]
+      scenarios: [cpu_only, pim_host_bounce]
+
+  - name: no_ingressless
+    overrides:
+      workload_variants:
+        - name: base
+          overrides: {}
+      size_multipliers: [1.0]
+      ingress_resident_scenarios_by_template:
+        deepvariant_3stage: []
+        tpch_3op: []
+
+  - name: no_queueing
+    overrides:
+      workload_variants:
+        - name: base
+          overrides: {}
+      size_multipliers: [1.0]
+      memory_system_by_template:
+        tpch_3op:
+          cpu_baseline_system:
+            queue_alpha: 0.0
+          pim_system:
+            queue_alpha: 0.0

@@ -198,6 +198,21 @@ class SimulatorInvariantChecks(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(math.isfinite(scheduler.next_completion_time(at_t=0.0)))
 
+    def test_direct_trace_effective_bw_matches_completion_duration(self) -> None:
+        direct_rows = [
+            row
+            for row in self.traces
+            if row.get("op_type") == "TRANSFER" and row.get("transfer_path") == "cxl_direct"
+        ]
+        self.assertTrue(direct_rows)
+        for row in direct_rows[:200]:
+            duration = float(row["duration_s"])
+            if duration <= 0:
+                continue
+            expected = float(row["bytes"]) / duration
+            actual = float(row.get("cxl_effective_bw_Bps", 0.0))
+            self.assertAlmostEqual(actual, expected, places=6)
+
     def test_config_requires_memory_system_by_template_only(self) -> None:
         cfg = copy.deepcopy(self.config)
         cfg.pop("memory_system_by_template", None)

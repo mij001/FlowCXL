@@ -280,3 +280,19 @@ E_{transfer}=E_{h2d\_ingress}+E_{h2d\_stage}+E_{d2h}+E_{cxl\_direct}+E_{host\_to
 \[
 E_{total}=E_{compute}+E_{transfer}
 \]
+
+## 8) Validation Residual Metrics
+
+For measured vs simulated timings:
+
+\[
+error_i = T^{measured}_i - T^{sim}_i
+\]
+\[
+MAE = \frac{1}{N}\sum_i |error_i|
+\]
+\[
+MAPE = \frac{100}{N}\sum_i \left|\frac{T^{measured}_i - T^{sim}_i}{max(T^{measured}_i,\epsilon)}\right|
+\]
+
+Cross-check acceptance compares scheduler MAPE against configured tolerance.

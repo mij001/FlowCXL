@@ -1,0 +1,4 @@
+name: fig_main
+description: Canonical grouped absolute plots for TPCH + DeepVariant (all default variants).
+base_config: ../../configs/runs.yaml
+artifacts_dir: ../../artifacts

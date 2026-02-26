@@ -1516,6 +1516,7 @@ def _validate_config(
         "cpu_stage_unit_compute_Bps_by_template",
         "bytes_touched_factors_by_stage_by_template",
         "memory_system_by_template",
+        "validation",
     ]
     missing = [key for key in required_top_level if key not in config]
     if missing:
@@ -1724,6 +1725,15 @@ def _validate_config(
         raise ValueError("tile_size_bytes must be > 0")
     if int(config["max_inflight_tiles"]) <= 0:
         raise ValueError("max_inflight_tiles must be > 0")
+
+    validation_cfg = config["validation"]
+    if not isinstance(validation_cfg, Mapping):
+        raise ValueError("validation must be a map")
+    if not str(validation_cfg.get("system_id", "")).strip():
+        raise ValueError("validation.system_id is required")
+    for key in ["calibration", "crosscheck", "sensitivity", "energy"]:
+        if key not in validation_cfg or not isinstance(validation_cfg[key], Mapping):
+            raise ValueError(f"validation.{key} must be a map")
 
     return memory_system_by_template
 
@@ -2080,6 +2090,11 @@ def simulate_configuration(
                         "retention_capacity_blocked": bool(direct_record["retention_capacity_blocked"]),
                         "cxl_active_streams": int(direct_record["cxl_active_streams"]),
                         "cxl_bw_share_Bps": float(direct_record["cxl_bw_share_Bps"]),
+                        "cxl_effective_bw_Bps": (
+                            float(direct_record["bytes"]) / max(duration_s, 1e-12)
+                            if duration_s > 0
+                            else 0.0
+                        ),
                         "cxl_issue_overhead_s": float(direct_record["cxl_issue_overhead_s"]),
                         "cxl_striping_factor": int(direct_record["cxl_striping_factor"]),
                     }
@@ -2570,6 +2585,13 @@ def simulate_configuration(
                         "retention_capacity_blocked": retention_capacity_blocked,
                         "cxl_active_streams": cxl_active_streams,
                         "cxl_bw_share_Bps": cxl_bw_share_Bps,
+                        "cxl_effective_bw_Bps": (
+                            (event_bytes / duration_s)
+                            if event_op_type == "TRANSFER"
+                            and transfer_path == "cxl_direct"
+                            and duration_s > 0
+                            else 0.0
+                        ),
                         "cxl_issue_overhead_s": cxl_issue_overhead_s,
                         "cxl_striping_factor": cxl_striping_factor_trace,
                     }

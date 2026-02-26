@@ -209,6 +209,87 @@ def _summary_at_1x(subset: pd.DataFrame) -> Tuple[Dict[str, object], str]:
     return summary, interpretation
 
 
+def _plot_validation_measured_vs_sim(
+    raw_df: pd.DataFrame,
+    report_dir: Path,
+) -> List[str]:
+    artifacts: List[str] = []
+    if raw_df.empty:
+        return artifacts
+    for path_name in sorted(raw_df["path"].dropna().unique()):
+        subset = raw_df[raw_df["path"] == path_name].copy()
+        if subset.empty:
+            continue
+        grouped = (
+            subset.groupby("payload_bytes", as_index=False)[["measured_s", "simulated_s"]]
+            .median()
+            .sort_values("payload_bytes")
+        )
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(grouped["payload_bytes"], grouped["measured_s"], marker="o", label="Measured (median)")
+        ax.plot(grouped["payload_bytes"], grouped["simulated_s"], marker="x", label="Simulated")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Payload (bytes)")
+        ax.set_ylabel("Time (s)")
+        ax.set_title(f"Measured vs Simulated: {path_name}")
+        ax.grid(alpha=0.3)
+        ax.legend()
+        filename = f"plot_validation_measured_vs_sim_{_sanitize_token(path_name)}.png"
+        plt.tight_layout()
+        plt.savefig(report_dir / filename, dpi=160)
+        plt.close(fig)
+        artifacts.append(filename)
+    return artifacts
+
+
+def _plot_sweep_bands(
+    sensitivity_df: pd.DataFrame,
+    report_dir: Path,
+) -> List[str]:
+    artifacts: List[str] = []
+    if sensitivity_df.empty:
+        return artifacts
+
+    target = sensitivity_df[
+        (sensitivity_df["workload_profile"] == sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE)
+        & (sensitivity_df["workload_variant"] == "base")
+        & (sensitivity_df["sweep_family"] != "baseline")
+    ].copy()
+    if target.empty:
+        return artifacts
+
+    for family in sorted(target["sweep_family"].dropna().unique()):
+        fam = target[target["sweep_family"] == family].copy()
+        if fam.empty:
+            continue
+        grouped = (
+            fam.groupby("multiplier", as_index=False)["bounce_over_direct_makespan"]
+            .agg(["min", "median", "max"])
+            .reset_index()
+            .sort_values("multiplier")
+        )
+        if grouped.empty:
+            continue
+        fig, ax = plt.subplots(figsize=(7, 4))
+        x_vals = grouped["multiplier"].astype(float)
+        ax.plot(x_vals, grouped["median"], marker="o", label="Median")
+        ax.fill_between(x_vals, grouped["min"], grouped["max"], alpha=0.25, label="Min/Max band")
+        ax.set_xticks(x_vals)
+        ax.set_xticklabels([_format_multiplier(v) for v in x_vals])
+        ax.set_xlabel("Stage data size multiplier")
+        ax.set_ylabel("Bounce/Direct Makespan Ratio")
+        ax.set_title(f"Sensitivity Band: {family}")
+        ax.grid(alpha=0.3)
+        ax.legend()
+        filename = f"plot_validation_sweep_band_{_sanitize_token(family)}.png"
+        plt.tight_layout()
+        plt.savefig(report_dir / filename, dpi=160)
+        plt.close(fig)
+        artifacts.append(filename)
+    return artifacts
+
+
 def _profile_variant_section(
     *,
     subset: pd.DataFrame,
@@ -340,27 +421,135 @@ def main(argv: Sequence[str] | None = None) -> None:
     appendix_diag["scenario"] = appendix_diag["scenario"].map(SCENARIO_LABELS)
     appendix_diag = _format_metric_fields(appendix_diag)
 
-    report_text = (
-        "# FlowCXL Tiled Stage-Capacity Report\n\n"
-        "## Main Results\n"
-        "Main body includes only `base` and `ingressless` variants for each profile.\n\n"
-        f"{_build_markdown_table(main_summary_df)}\n\n"
-        f"{chr(10).join(main_sections) if main_sections else '- No main sections generated.'}\n\n"
-        "## Appendix: Additional Variants\n"
-        "Appendix includes `retention_colocated` and `switch_striping`.\n\n"
-        f"{_build_markdown_table(appendix_summary_df)}\n\n"
-        f"{chr(10).join(appendix_sections) if appendix_sections else '- No appendix sections generated.'}\n\n"
-        "## Appendix Diagnostics (1x)\n"
-        f"{_build_markdown_table(appendix_diag)}\n\n"
-        "## Plot Artifacts\n"
-        f"{chr(10).join(f'- {plot}' for plot in all_plots)}\n\n"
-        "## Citations\n"
-        + "\n".join(
+    validation_dir = artifacts_dir / "validation"
+    validation_sections: List[str] = []
+    validation_plots: List[str] = []
+    if validation_dir.exists():
+        raw_path = validation_dir / "microbench_raw.csv"
+        fit_path = validation_dir / "microbench_fit.yaml"
+        cross_path = validation_dir / "cxl_ps_crosscheck.csv"
+        sensitivity_path = validation_dir / "sensitivity_results.csv"
+        tornado_path = validation_dir / "tornado_top8.csv"
+        ablations_path = validation_dir / "ablations.csv"
+
+        if raw_path.exists():
+            raw_df = pd.read_csv(raw_path)
+            validation_plots.extend(_plot_validation_measured_vs_sim(raw_df, report_dir))
+            validation_sections.append(
+                "### Microbenchmark Calibration\n\n"
+                f"- Source: `{raw_path}`\n"
+                + "\n".join(f"- {p}" for p in validation_plots if "measured_vs_sim" in p)
+            )
+        if fit_path.exists():
+            with fit_path.open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            fit_rows: List[Dict[str, object]] = []
+            for path_name, values in (fit_payload.get("paths", {}) or {}).items():
+                fit_rows.append(
+                    {
+                        "path": path_name,
+                        "bandwidth_Bps": values.get("bandwidth_Bps", ""),
+                        "latency_s": values.get("latency_s", ""),
+                        "mape_percent": values.get("mape_percent", ""),
+                        "r2": values.get("r2", ""),
+                    }
+                )
+            fit_df = pd.DataFrame(fit_rows)
+            validation_sections.append(
+                "### Calibration Fit Summary\n\n"
+                f"{_build_markdown_table(_format_metric_fields(fit_df))}"
+            )
+        if cross_path.exists():
+            cross_df = pd.read_csv(cross_path)
+            show_cols = [
+                "pattern",
+                "payload_bytes",
+                "concurrency",
+                "mape_percent",
+                "max_abs_error_s",
+                "passes_tolerance",
+            ]
+            cross_show = cross_df[show_cols] if not cross_df.empty else cross_df
+            validation_sections.append(
+                "### Processor-Share Cross-Check\n\n"
+                f"- Source: `{cross_path}`\n\n"
+                f"{_build_markdown_table(_format_metric_fields(cross_show.head(16)))}"
+            )
+        if sensitivity_path.exists():
+            sensitivity_df = pd.read_csv(sensitivity_path)
+            validation_plots.extend(_plot_sweep_bands(sensitivity_df, report_dir))
+            sensitivity_head = sensitivity_df.head(20)
+            validation_sections.append(
+                "### Sensitivity Sweeps\n\n"
+                f"- Source: `{sensitivity_path}`\n"
+                + "\n".join(f"- {p}" for p in validation_plots if "sweep_band" in p)
+                + "\n\n"
+                + _build_markdown_table(_format_metric_fields(sensitivity_head))
+            )
+        if tornado_path.exists():
+            tornado_df = pd.read_csv(tornado_path)
+            validation_sections.append(
+                "### Tornado Top 8\n\n"
+                f"- Source: `{tornado_path}`\n\n"
+                f"{_build_markdown_table(_format_metric_fields(tornado_df))}"
+            )
+        if ablations_path.exists():
+            ablations_df = pd.read_csv(ablations_path)
+            ablation_show = ablations_df[
+                [
+                    "ablation",
+                    "workload_profile",
+                    "multiplier",
+                    "bounce_over_direct_makespan",
+                    "bounce_over_direct_energy",
+                    "cpu_over_direct_makespan",
+                ]
+            ].head(32)
+            validation_sections.append(
+                "### Ablation Summary\n\n"
+                f"- Source: `{ablations_path}`\n\n"
+                f"{_build_markdown_table(_format_metric_fields(ablation_show))}"
+            )
+
+    provenance_rows = []
+    for key, value in sorted(sources.PARAMETER_PROVENANCE.items()):
+        provenance_rows.append(
+            {
+                "parameter": key,
+                "class": value.get("class", ""),
+                "source": value.get("source", ""),
+                "config_key": value.get("config_key", ""),
+                "note": value.get("note", ""),
+            }
+        )
+    provenance_df = pd.DataFrame(provenance_rows)
+
+    report_chunks = [
+        "# FlowCXL Tiled Stage-Capacity Report\n\n",
+        "## Main Results\n",
+        "Main body includes only `base` and `ingressless` variants for each profile.\n\n",
+        f"{_build_markdown_table(main_summary_df)}\n\n",
+        f"{chr(10).join(main_sections) if main_sections else '- No main sections generated.'}\n\n",
+        "## Appendix: Additional Variants\n",
+        "Appendix includes `retention_colocated` and `switch_striping`.\n\n",
+        f"{_build_markdown_table(appendix_summary_df)}\n\n",
+        f"{chr(10).join(appendix_sections) if appendix_sections else '- No appendix sections generated.'}\n\n",
+        "## Appendix Diagnostics (1x)\n",
+        f"{_build_markdown_table(appendix_diag)}\n\n",
+        "## Validation Appendix\n",
+        f"{chr(10).join(validation_sections)}\n\n" if validation_sections else "- No validation artifacts found.\n\n",
+        "## Parameter Provenance\n",
+        f"{_build_markdown_table(provenance_df)}\n\n",
+        "## Plot Artifacts\n",
+        f"{chr(10).join(f'- {plot}' for plot in (all_plots + validation_plots))}\n\n",
+        "## Citations\n",
+        "\n".join(
             f"- `{name}`: {entry['url']}\n  Quote: \"{entry['quote']}\"\n  Used as: {entry['how_used']}"
             for name, entry in sources.CITED_VALUES.items()
-        )
-        + "\n"
-    )
+        ),
+        "\n",
+    ]
+    report_text = "".join(report_chunks)
 
     report_path = report_dir / "report.md"
     report_path.write_text(report_text, encoding="utf-8")

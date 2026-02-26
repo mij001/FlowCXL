@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from pathlib import Path
 from typing import Dict, List, Sequence
 
 import pandas as pd
 import yaml
 
+import sources
 from simulator import generate_runs_from_config, resolve_variant_configs
 
 BASE_METRICS_COLUMNS = [
@@ -111,6 +113,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_TRACE_YAML_MAX_EVENTS,
         help="Maximum number of trace events stored in traces.yaml.",
     )
+    parser.add_argument(
+        "--validation-overlay",
+        default=None,
+        help="Optional YAML overlay with config/link-constant overrides from validation.",
+    )
     return parser.parse_args(argv)
 
 
@@ -126,6 +133,36 @@ def load_config(config_path: Path) -> Dict[str, object]:
     return config
 
 
+def _deep_merge(base: Dict[str, object], patch: Dict[str, object]) -> Dict[str, object]:
+    merged = copy.deepcopy(base)
+    for key, value in patch.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _apply_validation_overlay(
+    config: Dict[str, object],
+    overlay: Dict[str, object],
+) -> Dict[str, object]:
+    effective_overlay = copy.deepcopy(overlay)
+    link_overrides = effective_overlay.pop("link_constant_overrides", {})
+    if link_overrides:
+        if not isinstance(link_overrides, dict):
+            raise ValueError("validation overlay link_constant_overrides must be a map")
+        for link_id, link_patch in link_overrides.items():
+            if link_id not in sources.LINKS:
+                raise ValueError(f"validation overlay references unknown link id: {link_id}")
+            if not isinstance(link_patch, dict):
+                raise ValueError(f"validation overlay for {link_id} must be a map")
+            current = dict(sources.LINKS[link_id])
+            current.update(link_patch)
+            sources.LINKS[link_id] = current
+    return _deep_merge(config, effective_overlay)
+
+
 def _write_yaml(path: Path, payload: Dict[str, object]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
@@ -138,10 +175,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise FileNotFoundError(f"config file not found: {config_path}")
 
     config = load_config(config_path)
+    config_input_snapshot = copy.deepcopy(config)
+    overlay_payload: Dict[str, object] | None = None
+    if args.validation_overlay:
+        overlay_path = Path(args.validation_overlay)
+        if not overlay_path.exists():
+            raise FileNotFoundError(f"validation overlay not found: {overlay_path}")
+        with overlay_path.open("r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError("validation overlay root must be a mapping")
+        overlay_payload = loaded
+        config = _apply_validation_overlay(config=config, overlay=overlay_payload)
+
     artifacts_dir = Path(args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    _write_yaml(artifacts_dir / "config_input.yaml", config)
+    _write_yaml(artifacts_dir / "config_input.yaml", config_input_snapshot)
+    if overlay_payload is not None:
+        _write_yaml(artifacts_dir / "config_validation_overlay.yaml", overlay_payload)
     resolved_variant_configs = resolve_variant_configs(config)
     for variant_name, resolved_cfg in resolved_variant_configs.items():
         resolved_name = variant_name.replace("/", "_").replace(" ", "_")

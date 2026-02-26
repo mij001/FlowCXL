@@ -37,6 +37,25 @@ Trace semantics:
 - Run matrix expansion and IDs are deterministic for a fixed config.
 - Floating-point values may differ at sub-ulp scales; tests should use tolerances for timing equality.
 
+## Processor-Sharing Approximation
+
+Direct CXL scheduling uses a fluid processor-sharing approximation:
+
+- fair sharing among active flows,
+- instantaneous rate reallocation at arrivals/completions,
+- single-bottleneck link abstraction.
+
+This is not packet-level simulation and does not model burstiness/HOL details.
+
+## Ingressless Semantics
+
+`ingressless` skips only the first host->PIM transfer per tile.
+
+- TPCH (PIM stage-1): skips `host_h2d_ingress`.
+- DeepVariant (CPU frontend then PIM): skips first `host_h2d_stage`.
+
+Physical interpretation is resident/pinned stage-1 input placement, not free additional link bandwidth.
+
 ## Non-goals
 
 The model does not implement:

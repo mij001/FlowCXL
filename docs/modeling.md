@@ -70,6 +70,8 @@ Ingressless:
 
 - For configured scenarios, the first host->PIM transfer per tile is skipped.
 - This can be `host_h2d_ingress` (PIM stage-1) or first `host_h2d_stage` (CPU frontend -> first PIM stage).
+- Interpretation: stage-1 input is resident/pinned on the destination PIM endpoint before timed execution.
+- It does not alter subsequent inter-stage transfer semantics or add extra direct bandwidth.
 
 ## Memory Systems
 

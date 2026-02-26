@@ -109,6 +109,12 @@ python run.py --config configs/runs.yaml --artifacts-dir artifacts
 python report.py --config configs/runs.yaml --artifacts-dir artifacts
 ```
 
+Validation pipeline:
+
+```bash
+python tools/validation/run_validation.py --config configs/runs.yaml --artifacts-dir artifacts
+```
+
 Artifacts:
 
 - `artifacts/metrics.csv`

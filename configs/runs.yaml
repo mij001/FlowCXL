@@ -281,3 +281,22 @@ transfer_power_W:
   cpu_materialize_channel: 22.0
 
 stage_overrides: {}
+
+validation:
+  system_id: system_x_2026q1
+  calibration:
+    enabled: true
+    payload_bytes: [4194304, 33554432, 268435456]
+    concurrency_levels: [1, 2, 4, 8]
+    repetitions: 10
+    paths: [host_h2d, host_d2h, bounce, direct]
+  crosscheck:
+    enabled: true
+    reference_model: processor_share
+    tolerance_mape_percent: 5.0
+  sensitivity:
+    enabled: true
+    families: [cxl_link, pim_speedup, tpch_memory]
+  energy:
+    mode: relative_sweep
+    power_scale_factors: [0.7, 1.0, 1.3]
