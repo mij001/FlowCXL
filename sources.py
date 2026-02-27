@@ -22,6 +22,60 @@ SCENARIOS = (
 DEVICE_CPU = "cpu"
 DEVICE_PIM = "pim"
 
+MAPPING_IDENTITY = "IDENTITY"
+MAPPING_GROUP_K_TO_1 = "GROUP_K_TO_1"
+MAPPING_SPLIT_1_TO_M = "SPLIT_1_TO_M"
+MAPPING_REPARTITION_HASH = "REPARTITION_HASH"
+MAPPING_TYPES = (
+    MAPPING_IDENTITY,
+    MAPPING_GROUP_K_TO_1,
+    MAPPING_SPLIT_1_TO_M,
+    MAPPING_REPARTITION_HASH,
+)
+
+GLUE_COPY = "GLUE_COPY"
+GLUE_REDUCE = "GLUE_REDUCE"
+GLUE_SHUFFLE = "GLUE_SHUFFLE"
+GLUE_TYPES = (
+    GLUE_COPY,
+    GLUE_REDUCE,
+    GLUE_SHUFFLE,
+)
+
+KERNEL_CLASS_STREAM_SIMD = "STREAM_SIMD"
+KERNEL_CLASS_HASH_SHUFFLE = "HASH_SHUFFLE"
+KERNEL_CLASS_HASH_JOIN_BUILD = "HASH_JOIN_BUILD"
+KERNEL_CLASS_HASH_JOIN_PROBE = "HASH_JOIN_PROBE"
+KERNEL_CLASS_REDUCE_PARTIAL = "REDUCE_PARTIAL"
+KERNEL_CLASS_REDUCE_FINAL = "REDUCE_FINAL"
+KERNEL_CLASS_PACK_TENSORIZE = "PACK_TENSORIZE"
+KERNEL_CLASS_BATCHIFY = "BATCHIFY"
+KERNEL_CLASS_CNN_INFER = "CNN_INFER"
+KERNEL_CLASS_POSTPROC = "POSTPROC"
+KERNEL_CLASSES = (
+    KERNEL_CLASS_STREAM_SIMD,
+    KERNEL_CLASS_HASH_SHUFFLE,
+    KERNEL_CLASS_HASH_JOIN_BUILD,
+    KERNEL_CLASS_HASH_JOIN_PROBE,
+    KERNEL_CLASS_REDUCE_PARTIAL,
+    KERNEL_CLASS_REDUCE_FINAL,
+    KERNEL_CLASS_PACK_TENSORIZE,
+    KERNEL_CLASS_BATCHIFY,
+    KERNEL_CLASS_CNN_INFER,
+    KERNEL_CLASS_POSTPROC,
+)
+
+PIM_MODE_NONE = "NONE"
+PIM_MODE_BANK = "BANK"
+PIM_MODE_BANK_GROUP = "BANK_GROUP"
+PIM_MODE_BUFFER = "BUFFER"
+PIM_MODES = (
+    PIM_MODE_NONE,
+    PIM_MODE_BANK,
+    PIM_MODE_BANK_GROUP,
+    PIM_MODE_BUFFER,
+)
+
 ACCESS_PATTERN_SEQUENTIAL_SCAN = "sequential_scan"
 ACCESS_PATTERN_HASH_PROBE = "hash_probe"
 ACCESS_PATTERN_HASH_BUILD = "hash_build"
@@ -642,5 +696,23 @@ PARAMETER_PROVENANCE = {
         "source": "configs/runs.yaml",
         "note": "Retention shortcut model and capacity guard configuration.",
         "config_key": "pim_retention",
+    },
+    "tiling_model_by_template": {
+        "class": "assumed_sweepable",
+        "source": "configs/runs.yaml",
+        "note": "Optional boundary retiling, mapping, and glue/barrier model.",
+        "config_key": "tiling_model_by_template",
+    },
+    "pim_mode_by_stage_by_template": {
+        "class": "assumed_sweepable",
+        "source": "configs/runs.yaml",
+        "note": "Mode-dependent PIM execution policy per stage.",
+        "config_key": "pim_mode_by_stage_by_template",
+    },
+    "pim_mode_effects": {
+        "class": "assumed_sweepable",
+        "source": "configs/runs.yaml",
+        "note": "PIM mode multipliers and command-overhead assumptions.",
+        "config_key": "pim_mode_effects",
     },
 }

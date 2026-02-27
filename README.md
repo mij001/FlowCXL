@@ -107,6 +107,22 @@ Model contract details:
 ```bash
 python run.py --config configs/runs.yaml --artifacts-dir artifacts
 python report.py --config configs/runs.yaml --artifacts-dir artifacts
+
+## Optional Retiling + Glue/Barrier Model
+
+The simulator now supports an optional boundary retiling layer (`tiling_model_by_template`) with:
+
+- tile-domain remapping (`IDENTITY`, `GROUP_K_TO_1`, `SPLIT_1_TO_M`, `REPARTITION_HASH`)
+- boundary glue costs (`GLUE_COPY`, `GLUE_REDUCE`, `GLUE_SHUFFLE`)
+- barrier wait accounting before downstream stage release
+
+Defaults keep `enabled: false` for both templates, preserving the previous linear tile-chain behavior.
+
+## Optional PIM Mode Effects
+
+`pim_mode_by_stage_by_template` and `pim_mode_effects` let each PIM stage run in one of
+`NONE`, `BANK`, `BANK_GROUP`, `BUFFER` modes with deterministic compute/memory multipliers and
+optional per-kernel command overhead.
 ```
 
 Validation pipeline:

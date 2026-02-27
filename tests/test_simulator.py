@@ -56,6 +56,9 @@ class SimulatorInvariantChecks(unittest.TestCase):
             writer.writerows(self.metrics)
         report.main([])
 
+    def _run_custom(self, cfg: dict) -> tuple[list[dict], list[dict]]:
+        return generate_runs_from_config(cfg)
+
     def test_deepvariant_doc_model_consistency(self) -> None:
         equations = Path("docs/equations.md").read_text(encoding="utf-8")
         self.assertIn("X0..X5", equations)
@@ -350,6 +353,338 @@ class SimulatorInvariantChecks(unittest.TestCase):
             self.assertEqual(str(row["baseline_id"]), expected)
             self.assertNotIn("|new|", str(row["baseline_id"]))
             self.assertNotIn("|legacy|", str(row["baseline_id"]))
+
+    def test_tiling_model_schema_validation(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        cfg["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"]["1"]["mapping_type"] = "INVALID"
+        with self.assertRaises(ValueError):
+            generate_runs_from_config(cfg)
+
+    def test_trace_contains_domain_mapping_and_barrier_fields(self) -> None:
+        row = self.traces[0]
+        for key in [
+            "domain_in_id",
+            "domain_out_id",
+            "domain_in_tile_id",
+            "domain_out_tile_id",
+            "mapping_type",
+            "kernel_class",
+            "glue_type",
+            "barrier_wait_s",
+            "aggregation_expected",
+            "aggregation_received",
+            "pim_mode",
+            "pim_mode_compute_multiplier",
+            "pim_mode_mem_multiplier",
+            "pim_mode_command_overhead_s",
+        ]:
+            self.assertIn(key, row)
+
+    def test_new_metrics_columns_append_only(self) -> None:
+        row = self.metrics[0]
+        for key in [
+            "retile_enabled",
+            "num_tile_domains",
+            "total_glue_copy_bytes",
+            "total_glue_reduce_bytes",
+            "total_glue_shuffle_bytes",
+            "total_glue_time_component_s",
+            "total_glue_transfer_time_component_s",
+            "total_barrier_wait_time_component_s",
+            "lb_glue_s",
+            "total_pim_mode_command_overhead_s",
+        ]:
+            self.assertIn(key, row)
+
+    def test_group_k_to_1_barrier_blocks_until_all_contributors_and_glue_done(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        metrics, traces = self._run_custom(cfg)
+        self.assertTrue(metrics[0]["retile_enabled"])
+        glue_rows = [t for t in traces if t["op_type"] == "GLUE_REDUCE"]
+        stage3_rows = [t for t in traces if t["op_type"] == "COMPUTE" and int(t["stage_id"]) == 3]
+        self.assertTrue(glue_rows)
+        self.assertTrue(stage3_rows)
+        glue_end_by_tile = {int(r["domain_out_tile_id"]): float(r["t_end"]) for r in glue_rows}
+        for row in stage3_rows:
+            out_tile = int(row["domain_in_tile_id"])
+            self.assertIn(out_tile, glue_end_by_tile)
+            self.assertGreaterEqual(float(row["t_req"]), glue_end_by_tile[out_tile])
+
+    def test_repartition_hash_conservation_and_partition_readiness(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        metrics, traces = self._run_custom(cfg)
+        row = metrics[0]
+        self.assertGreater(float(row["total_glue_shuffle_bytes"]), 0.0)
+        stage2_compute = [t for t in traces if t["op_type"] == "COMPUTE" and int(t["stage_id"]) == 2]
+        shuffle = [t for t in traces if t["op_type"] == "GLUE_SHUFFLE"]
+        self.assertTrue(stage2_compute)
+        self.assertTrue(shuffle)
+        shuffle_end_by_tile = {int(r["domain_out_tile_id"]): float(r["t_end"]) for r in shuffle}
+        for row2 in stage2_compute:
+            in_tile = int(row2["domain_in_tile_id"])
+            self.assertIn(in_tile, shuffle_end_by_tile)
+            self.assertGreaterEqual(float(row2["t_req"]), shuffle_end_by_tile[in_tile])
+
+    def test_no_consumer_ready_before_expected_contributions(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        _, traces = self._run_custom(cfg)
+        glue_rows = [t for t in traces if str(t["op_type"]).startswith("GLUE_")]
+        self.assertTrue(glue_rows)
+        for row in glue_rows:
+            self.assertEqual(int(row["aggregation_received"]), int(row["aggregation_expected"]))
+
+    def test_retile_disabled_identity_matches_legacy_makespan_within_tolerance(self) -> None:
+        cfg_a = copy.deepcopy(self.config)
+        cfg_a["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE]
+        cfg_a["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg_a["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg_a["size_multipliers"] = [1.0]
+        cfg_a["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg_a["tiling_model_by_template"]["tpch_3op"]["enabled"] = False
+
+        cfg_b = copy.deepcopy(cfg_a)
+        cfg_b["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        cfg_b["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"] = {
+            "1": {"mapping_type": "IDENTITY"},
+            "2": {"mapping_type": "IDENTITY"},
+        }
+        metrics_a, _ = self._run_custom(cfg_a)
+        metrics_b, _ = self._run_custom(cfg_b)
+        a = float(metrics_a[0]["makespan_s"])
+        b = float(metrics_b[0]["makespan_s"])
+        self.assertLess(abs(a - b) / max(a, 1e-9), 0.02)
+
+    def test_existing_transfer_paths_unchanged_under_identity_mapping(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_HOST_BOUNCE]
+
+        cfg_disabled = copy.deepcopy(cfg)
+        cfg_disabled["tiling_model_by_template"]["tpch_3op"]["enabled"] = False
+        cfg_identity = copy.deepcopy(cfg)
+        cfg_identity["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        cfg_identity["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"] = {
+            "1": {"mapping_type": "IDENTITY"},
+            "2": {"mapping_type": "IDENTITY"},
+        }
+        m0, _ = self._run_custom(cfg_disabled)
+        m1, _ = self._run_custom(cfg_identity)
+        self.assertAlmostEqual(float(m0[0]["total_bytes_host_link"]), float(m1[0]["total_bytes_host_link"]), places=6)
+
+    def test_multi_pim_scaling_improves_compute_heavy_kernel_throughput(self) -> None:
+        cfg_small = copy.deepcopy(self.config)
+        cfg_small["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE]
+        cfg_small["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg_small["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg_small["size_multipliers"] = [1.0]
+        cfg_small["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg_small["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        cfg_small["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"] = {
+            "1": {"mapping_type": "IDENTITY"},
+            "2": {"mapping_type": "IDENTITY"},
+        }
+        cfg_small["memory_system_by_template"]["tpch_3op"]["enabled"] = False
+        cfg_small["scenario_stage_endpoint_map_by_template"]["tpch_3op"]["pim_flowcxl_direct"] = [
+            "pim0",
+            "pim0",
+            "pim0",
+        ]
+        cfg_big = copy.deepcopy(cfg_small)
+        cfg_small["stage_defaults"]["pim_units"] = 8
+        cfg_big["stage_defaults"]["pim_units"] = 64
+        m_small, _ = self._run_custom(cfg_small)
+        m_big, _ = self._run_custom(cfg_big)
+        self.assertGreater(float(m_small[0]["makespan_s"]), float(m_big[0]["makespan_s"]))
+
+    def test_barrier_heavy_mapping_shows_diminishing_returns_with_more_pim_units(self) -> None:
+        cfg_id8 = copy.deepcopy(self.config)
+        cfg_id8["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE]
+        cfg_id8["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg_id8["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg_id8["size_multipliers"] = [1.0]
+        cfg_id8["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg_id8["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        cfg_id8["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"] = {
+            "1": {"mapping_type": "IDENTITY"},
+            "2": {"mapping_type": "IDENTITY"},
+        }
+        cfg_id8["memory_system_by_template"]["tpch_3op"]["enabled"] = False
+        cfg_id8["scenario_stage_endpoint_map_by_template"]["tpch_3op"]["pim_flowcxl_direct"] = [
+            "pim0",
+            "pim0",
+            "pim0",
+        ]
+        cfg_id64 = copy.deepcopy(cfg_id8)
+        cfg_id8["stage_defaults"]["pim_units"] = 8
+        cfg_id64["stage_defaults"]["pim_units"] = 64
+        m_id8, _ = self._run_custom(cfg_id8)
+        m_id64, _ = self._run_custom(cfg_id64)
+        speedup_identity = float(m_id8[0]["makespan_s"]) / float(m_id64[0]["makespan_s"])
+
+        cfg_bar8 = copy.deepcopy(cfg_id8)
+        cfg_bar64 = copy.deepcopy(cfg_id64)
+        # Default TPCH mapping includes shuffle + reduce barriers.
+        cfg_bar8["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"] = copy.deepcopy(
+            self.config["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"]
+        )
+        cfg_bar64["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"] = copy.deepcopy(
+            self.config["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"]
+        )
+        m_bar8, _ = self._run_custom(cfg_bar8)
+        m_bar64, _ = self._run_custom(cfg_bar64)
+        speedup_barrier = float(m_bar8[0]["makespan_s"]) / float(m_bar64[0]["makespan_s"])
+        self.assertGreater(speedup_barrier, 1.0)
+        self.assertLess(speedup_barrier, 2.5)
+        self.assertGreater(float(m_bar8[0]["total_barrier_wait_time_component_s"]), 0.0)
+
+    def test_stage0_refill_policy_prevents_many_to_one_admission_starvation(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["max_inflight_tiles"] = 1
+        cfg["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        cfg["tiling_model_by_template"]["tpch_3op"]["admission_refill_policy"] = "stage0_output"
+        cfg["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"]["1"] = {
+            "mapping_type": "GROUP_K_TO_1",
+            "group_k": 4,
+            "glue_type": "GLUE_COPY",
+            "glue_device": "pim",
+            "glue_fixed_s": 1e-7,
+            "glue_compute_Bps": 8e10,
+            "glue_mem_Bps": 2e11,
+            "glue_transfer_path": "none",
+        }
+        _, traces = self._run_custom(cfg)
+        stage1_compute = [t for t in traces if t["op_type"] == "COMPUTE" and int(t["stage_id"]) == 1]
+        stage2_compute = [t for t in traces if t["op_type"] == "COMPUTE" and int(t["stage_id"]) == 2]
+        self.assertTrue(stage1_compute)
+        self.assertTrue(stage2_compute)
+        expected_stage2 = math.ceil(len(stage1_compute) / 4.0)
+        self.assertEqual(len(stage2_compute), expected_stage2)
+
+    def test_pim_mode_bank_vs_buffer_changes_service_time_deterministically(self) -> None:
+        cfg_bank = copy.deepcopy(self.config)
+        cfg_bank["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg_bank["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg_bank["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg_bank["size_multipliers"] = [1.0]
+        cfg_bank["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg_bank["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        cfg_bank["memory_system_by_template"]["tpch_3op"]["enabled"] = False
+        cfg_bank["scenario_stage_endpoint_map_by_template"]["tpch_3op"]["pim_flowcxl_direct"] = [
+            "pim0",
+            "pim0",
+            "pim0",
+        ]
+        cfg_buffer = copy.deepcopy(cfg_bank)
+        for stage in ["scan_filter_project", "join", "groupby_agg"]:
+            cfg_bank["pim_mode_by_stage_by_template"]["tpch_3op"][stage] = "BANK"
+            cfg_buffer["pim_mode_by_stage_by_template"]["tpch_3op"][stage] = "BUFFER"
+        m_bank, _ = self._run_custom(cfg_bank)
+        m_buffer, _ = self._run_custom(cfg_buffer)
+        self.assertLess(float(m_bank[0]["makespan_s"]), float(m_buffer[0]["makespan_s"]))
+
+    def test_pim_mode_multipliers_affect_compute_and_mem_components(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_HIGH_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        cfg["scenario_stage_endpoint_map_by_template"]["tpch_3op"]["pim_flowcxl_direct"] = [
+            "pim0",
+            "pim0",
+            "pim0",
+        ]
+        cfg["memory_system_by_template"]["tpch_3op"]["enabled"] = True
+        cfg["memory_system_by_template"]["tpch_3op"]["pim_system"]["queue_alpha"] = 0.0
+        for stage in ["scan_filter_project", "join", "groupby_agg"]:
+            cfg["memory_system_by_template"]["tpch_3op"]["pim_system"]["stages"][stage]["peak_bw_Bps"] = 1e14
+        cfg_a = copy.deepcopy(cfg)
+        cfg_b = copy.deepcopy(cfg)
+        cfg_a["pim_mode_effects"]["BANK_GROUP"]["compute_multiplier"] = 0.9
+        cfg_a["pim_mode_effects"]["BANK_GROUP"]["mem_multiplier"] = 0.9
+        cfg_b["pim_mode_effects"]["BANK_GROUP"]["compute_multiplier"] = 0.5
+        cfg_b["pim_mode_effects"]["BANK_GROUP"]["mem_multiplier"] = 0.5
+        for stage in ["scan_filter_project", "join", "groupby_agg"]:
+            cfg_a["pim_mode_by_stage_by_template"]["tpch_3op"][stage] = "BANK_GROUP"
+            cfg_b["pim_mode_by_stage_by_template"]["tpch_3op"][stage] = "BANK_GROUP"
+        m_a, _ = self._run_custom(cfg_a)
+        m_b, _ = self._run_custom(cfg_b)
+        self.assertLess(float(m_a[0]["makespan_s"]), float(m_b[0]["makespan_s"]))
+
+    def test_mode_command_overhead_accounted_in_metrics(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [sources.PROFILE_TPCH_SF100_MODERATE_INTERMEDIATE],
+            "deepvariant_profiles": [],
+        }
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["tiling_model_by_template"]["tpch_3op"]["enabled"] = True
+        for stage in ["scan_filter_project", "join", "groupby_agg"]:
+            cfg["pim_mode_by_stage_by_template"]["tpch_3op"][stage] = "BANK"
+        cfg["pim_mode_effects"]["BANK"]["command_overhead_s"] = 5e-7
+        metrics, _ = self._run_custom(cfg)
+        self.assertGreater(float(metrics[0]["total_pim_mode_command_overhead_s"]), 0.0)
 
 
 if __name__ == "__main__":

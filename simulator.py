@@ -106,6 +106,54 @@ class CXLTopologyConfig:
     applies_to_links: Tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PIMModeEffect:
+    compute_multiplier: float
+    mem_multiplier: float
+    command_overhead_s: float
+
+
+@dataclass(frozen=True)
+class TileDomain:
+    domain_id: str
+    boundary_index: int
+    tile_count: int
+    tile_bytes: Tuple[int, ...]
+    logical_kind: str = ""
+
+
+@dataclass(frozen=True)
+class BoundaryMappingSpec:
+    mapping_type: str
+    group_k: int
+    split_m: int
+    partitions: int | str
+    glue_type: str
+    glue_device: str
+    glue_fixed_s: float
+    glue_compute_Bps: float
+    glue_mem_Bps: float
+    glue_transfer_path: str
+    output_amplification: float
+
+
+@dataclass(frozen=True)
+class TilingTemplateConfig:
+    enabled: bool
+    admission_refill_policy: str
+    stage_kernel_class: Dict[str, str]
+    kernel_tiling_policy_by_class: Dict[str, Dict[str, float]]
+    boundary_mappings: Dict[int, BoundaryMappingSpec]
+
+
+@dataclass
+class BoundaryAggregationState:
+    expected_count: int
+    received_count: int = 0
+    first_contrib_t: float = math.inf
+    latest_contrib_t: float = 0.0
+    bytes_in: float = 0.0
+
 @dataclass
 class ResourcePool:
     name: str
@@ -714,6 +762,354 @@ def _normalize_ingress_resident_scenarios_by_template(
                 scenarios.append(scenario)
         normalized[template] = tuple(scenarios)
     return normalized
+
+
+def _normalize_pim_mode_effects(config: Mapping[str, object]) -> Dict[str, PIMModeEffect]:
+    defaults: Dict[str, Dict[str, float]] = {
+        sources.PIM_MODE_NONE: {"compute_multiplier": 1.0, "mem_multiplier": 1.0, "command_overhead_s": 0.0},
+        sources.PIM_MODE_BANK: {"compute_multiplier": 1.0, "mem_multiplier": 1.0, "command_overhead_s": 0.0},
+        sources.PIM_MODE_BANK_GROUP: {
+            "compute_multiplier": 0.8,
+            "mem_multiplier": 0.85,
+            "command_overhead_s": 1e-7,
+        },
+        sources.PIM_MODE_BUFFER: {
+            "compute_multiplier": 0.6,
+            "mem_multiplier": 0.65,
+            "command_overhead_s": 2e-7,
+        },
+    }
+    raw = config.get("pim_mode_effects")
+    if raw is None:
+        raw = defaults
+    if not isinstance(raw, Mapping):
+        raise ValueError("pim_mode_effects must be a map")
+    normalized: Dict[str, PIMModeEffect] = {}
+    for mode in sources.PIM_MODES:
+        merged = dict(defaults[mode])
+        mode_raw = raw.get(mode, {})
+        if mode_raw:
+            if not isinstance(mode_raw, Mapping):
+                raise ValueError(f"pim_mode_effects[{mode}] must be a map")
+            merged.update(mode_raw)
+        effect = PIMModeEffect(
+            compute_multiplier=float(merged["compute_multiplier"]),
+            mem_multiplier=float(merged["mem_multiplier"]),
+            command_overhead_s=float(merged["command_overhead_s"]),
+        )
+        if effect.compute_multiplier <= 0:
+            raise ValueError(f"pim_mode_effects[{mode}].compute_multiplier must be > 0")
+        if effect.mem_multiplier <= 0:
+            raise ValueError(f"pim_mode_effects[{mode}].mem_multiplier must be > 0")
+        if effect.command_overhead_s < 0:
+            raise ValueError(f"pim_mode_effects[{mode}].command_overhead_s must be >= 0")
+        normalized[mode] = effect
+    return normalized
+
+
+def _normalize_pim_mode_by_stage_by_template(
+    *,
+    config: Mapping[str, object],
+    template_to_stage_names: Mapping[str, Sequence[str]],
+) -> Dict[str, Dict[str, str]]:
+    raw = config.get("pim_mode_by_stage_by_template")
+    normalized: Dict[str, Dict[str, str]] = {}
+    for template, stage_names in template_to_stage_names.items():
+        normalized[template] = {stage_name: sources.PIM_MODE_NONE for stage_name in stage_names}
+    if raw is None:
+        return normalized
+    if not isinstance(raw, Mapping):
+        raise ValueError("pim_mode_by_stage_by_template must be a map")
+    for template, stage_names in template_to_stage_names.items():
+        template_raw = raw.get(template, {})
+        if not isinstance(template_raw, Mapping):
+            raise ValueError(f"pim_mode_by_stage_by_template[{template}] must be a map")
+        for stage_name in stage_names:
+            mode = str(template_raw.get(stage_name, sources.PIM_MODE_NONE))
+            if mode not in sources.PIM_MODES:
+                raise ValueError(
+                    f"pim_mode_by_stage_by_template[{template}][{stage_name}] has invalid mode {mode}"
+                )
+            normalized[template][stage_name] = mode
+    return normalized
+
+
+def _default_kernel_class_for_stage(stage_name: str) -> str:
+    lower = stage_name.lower()
+    if "scan" in lower or "make_examples_frontend" in lower:
+        return sources.KERNEL_CLASS_STREAM_SIMD
+    if "tensorize" in lower:
+        return sources.KERNEL_CLASS_PACK_TENSORIZE
+    if "infer" in lower:
+        return sources.KERNEL_CLASS_CNN_INFER
+    if "join" in lower:
+        return sources.KERNEL_CLASS_HASH_JOIN_PROBE
+    if "groupby" in lower or "reduce" in lower:
+        return sources.KERNEL_CLASS_REDUCE_PARTIAL
+    if "post" in lower:
+        return sources.KERNEL_CLASS_POSTPROC
+    return sources.KERNEL_CLASS_STREAM_SIMD
+
+
+def _identity_boundary_mapping() -> BoundaryMappingSpec:
+    return BoundaryMappingSpec(
+        mapping_type=sources.MAPPING_IDENTITY,
+        group_k=1,
+        split_m=1,
+        partitions=1,
+        glue_type=sources.GLUE_COPY,
+        glue_device=sources.DEVICE_PIM,
+        glue_fixed_s=0.0,
+        glue_compute_Bps=1e30,
+        glue_mem_Bps=1e30,
+        glue_transfer_path="none",
+        output_amplification=1.0,
+    )
+
+
+def _normalize_tiling_model_by_template(
+    *,
+    config: Mapping[str, object],
+    template_to_stage_names: Mapping[str, Sequence[str]],
+) -> Dict[str, TilingTemplateConfig]:
+    raw = config.get("tiling_model_by_template", {})
+    if not isinstance(raw, Mapping):
+        raise ValueError("tiling_model_by_template must be a map")
+
+    normalized: Dict[str, TilingTemplateConfig] = {}
+    for template, stage_names in template_to_stage_names.items():
+        template_raw = raw.get(template, {})
+        if template_raw and not isinstance(template_raw, Mapping):
+            raise ValueError(f"tiling_model_by_template[{template}] must be a map")
+        template_raw = dict(template_raw) if isinstance(template_raw, Mapping) else {}
+        enabled = bool(template_raw.get("enabled", False))
+        refill = str(template_raw.get("admission_refill_policy", "stage0_output"))
+        if refill not in {"stage0_output", "pipeline_complete"}:
+            raise ValueError(
+                f"tiling_model_by_template[{template}].admission_refill_policy must be "
+                "stage0_output or pipeline_complete"
+            )
+
+        stage_kernel_raw = template_raw.get("stage_kernel_class", {})
+        if stage_kernel_raw and not isinstance(stage_kernel_raw, Mapping):
+            raise ValueError(f"tiling_model_by_template[{template}].stage_kernel_class must be a map")
+        stage_kernel_class: Dict[str, str] = {}
+        for stage_name in stage_names:
+            kernel_class = str(
+                (stage_kernel_raw.get(stage_name) if isinstance(stage_kernel_raw, Mapping) else None)
+                or _default_kernel_class_for_stage(stage_name)
+            )
+            if kernel_class not in sources.KERNEL_CLASSES:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].stage_kernel_class[{stage_name}] invalid: {kernel_class}"
+                )
+            stage_kernel_class[stage_name] = kernel_class
+
+        kernel_policy_raw = template_raw.get("kernel_tiling_policy_by_class", {})
+        if kernel_policy_raw and not isinstance(kernel_policy_raw, Mapping):
+            raise ValueError(f"tiling_model_by_template[{template}].kernel_tiling_policy_by_class must be a map")
+        kernel_tiling_policy_by_class: Dict[str, Dict[str, float]] = {}
+        for kernel_class in sources.KERNEL_CLASSES:
+            class_policy_raw = kernel_policy_raw.get(kernel_class, {}) if isinstance(kernel_policy_raw, Mapping) else {}
+            if class_policy_raw and not isinstance(class_policy_raw, Mapping):
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].kernel_tiling_policy_by_class[{kernel_class}] must be a map"
+                )
+            target_tile_bytes = float(class_policy_raw.get("target_tile_bytes", 268_435_456.0))
+            if target_tile_bytes <= 0:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].kernel_tiling_policy_by_class[{kernel_class}] "
+                    "target_tile_bytes must be > 0"
+                )
+            kernel_tiling_policy_by_class[kernel_class] = {"target_tile_bytes": target_tile_bytes}
+
+        boundary_raw = template_raw.get("boundary_mappings", {})
+        if boundary_raw and not isinstance(boundary_raw, Mapping):
+            raise ValueError(f"tiling_model_by_template[{template}].boundary_mappings must be a map")
+        boundary_mappings: Dict[int, BoundaryMappingSpec] = {}
+        num_stages = len(stage_names)
+        for boundary_idx in range(1, num_stages):
+            entry_raw = boundary_raw.get(str(boundary_idx), boundary_raw.get(boundary_idx, {}))
+            if entry_raw and not isinstance(entry_raw, Mapping):
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] must be a map"
+                )
+            if not entry_raw:
+                boundary_mappings[boundary_idx] = _identity_boundary_mapping()
+                continue
+            mapping_type = str(entry_raw.get("mapping_type", sources.MAPPING_IDENTITY))
+            if mapping_type not in sources.MAPPING_TYPES:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] invalid mapping_type "
+                    f"{mapping_type}"
+                )
+            group_k = int(entry_raw.get("group_k", 1))
+            split_m = int(entry_raw.get("split_m", 1))
+            partitions: int | str = entry_raw.get("partitions", 1)
+            if isinstance(partitions, str):
+                partitions = partitions.strip()
+                if partitions != "pim_units":
+                    raise ValueError(
+                        f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].partitions "
+                        "must be integer or 'pim_units'"
+                    )
+            else:
+                partitions = int(partitions)
+                if partitions <= 0:
+                    raise ValueError(
+                        f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].partitions "
+                        "must be > 0"
+                    )
+            glue_type = str(entry_raw.get("glue_type", sources.GLUE_COPY))
+            if glue_type not in sources.GLUE_TYPES:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] invalid glue_type "
+                    f"{glue_type}"
+                )
+            glue_device = str(entry_raw.get("glue_device", sources.DEVICE_PIM)).lower()
+            if glue_device not in {sources.DEVICE_CPU, sources.DEVICE_PIM}:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] invalid glue_device "
+                    f"{glue_device}"
+                )
+            glue_transfer_path = str(entry_raw.get("glue_transfer_path", "none"))
+            if glue_transfer_path not in {"none", "host_h2d_stage", "host_d2h", "cxl_direct"}:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] invalid glue_transfer_path "
+                    f"{glue_transfer_path}"
+                )
+            spec = BoundaryMappingSpec(
+                mapping_type=mapping_type,
+                group_k=group_k,
+                split_m=split_m,
+                partitions=partitions,
+                glue_type=glue_type,
+                glue_device=glue_device,
+                glue_fixed_s=float(entry_raw.get("glue_fixed_s", 0.0)),
+                glue_compute_Bps=float(entry_raw.get("glue_compute_Bps", 1e30)),
+                glue_mem_Bps=float(entry_raw.get("glue_mem_Bps", 1e30)),
+                glue_transfer_path=glue_transfer_path,
+                output_amplification=float(entry_raw.get("output_amplification", 1.0)),
+            )
+            if spec.group_k <= 0:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].group_k must be > 0"
+                )
+            if spec.split_m <= 0:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].split_m must be > 0"
+                )
+            if spec.glue_fixed_s < 0:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].glue_fixed_s "
+                    "must be >= 0"
+                )
+            if spec.glue_compute_Bps <= 0 or spec.glue_mem_Bps <= 0:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] glue Bps must be > 0"
+                )
+            if spec.output_amplification <= 0:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].output_amplification "
+                    "must be > 0"
+                )
+            boundary_mappings[boundary_idx] = spec
+
+        normalized[template] = TilingTemplateConfig(
+            enabled=enabled,
+            admission_refill_policy=refill,
+            stage_kernel_class=stage_kernel_class,
+            kernel_tiling_policy_by_class=kernel_tiling_policy_by_class,
+            boundary_mappings=boundary_mappings,
+        )
+    return normalized
+
+
+def _resolve_boundary_partition_count(
+    *,
+    partitions: int | str,
+    producer_count: int,
+    src_stage_cfg: StageConfig,
+) -> int:
+    if isinstance(partitions, str):
+        if partitions != "pim_units":
+            raise ValueError(f"unsupported partitions token {partitions}")
+        resolved = int(src_stage_cfg.pim_units)
+    else:
+        resolved = int(partitions)
+    resolved = max(1, resolved)
+    return min(resolved, max(1, producer_count))
+
+
+def _build_tile_domains_and_mappings(
+    *,
+    scaled_boundaries: Sequence[int],
+    stage_names: Sequence[str],
+    tiling_cfg: TilingTemplateConfig,
+    stage_configs: Sequence[StageConfig],
+) -> Tuple[List[TileDomain], Dict[int, BoundaryMappingSpec]]:
+    num_stages = len(stage_names)
+    if len(scaled_boundaries) != num_stages + 1:
+        raise ValueError("scaled_boundaries must have len(stage_names)+1")
+    boundary_domains: List[TileDomain] = []
+    boundary_mappings: Dict[int, BoundaryMappingSpec] = {}
+
+    stage0_class = tiling_cfg.stage_kernel_class[stage_names[0]]
+    stage0_target_bytes = float(
+        tiling_cfg.kernel_tiling_policy_by_class[stage0_class]["target_tile_bytes"]
+    )
+    input_tile_count = max(1, int(math.ceil(float(scaled_boundaries[0]) / stage0_target_bytes)))
+    boundary_domains.append(
+        TileDomain(
+            domain_id="d0",
+            boundary_index=0,
+            tile_count=input_tile_count,
+            tile_bytes=tuple(tile_boundary_bytes(scaled_boundaries[0], input_tile_count)),
+            logical_kind="boundary_0",
+        )
+    )
+
+    for boundary_idx in range(1, num_stages):
+        producer_count = boundary_domains[boundary_idx - 1].tile_count
+        mapping = tiling_cfg.boundary_mappings.get(boundary_idx, _identity_boundary_mapping())
+        if mapping.mapping_type == sources.MAPPING_IDENTITY:
+            consumer_count = producer_count
+        elif mapping.mapping_type == sources.MAPPING_GROUP_K_TO_1:
+            consumer_count = max(1, int(math.ceil(float(producer_count) / float(mapping.group_k))))
+        elif mapping.mapping_type == sources.MAPPING_SPLIT_1_TO_M:
+            consumer_count = max(1, int(producer_count * mapping.split_m))
+        elif mapping.mapping_type == sources.MAPPING_REPARTITION_HASH:
+            consumer_count = _resolve_boundary_partition_count(
+                partitions=mapping.partitions,
+                producer_count=producer_count,
+                src_stage_cfg=stage_configs[boundary_idx - 1],
+            )
+        else:
+            raise ValueError(f"unknown mapping type {mapping.mapping_type}")
+
+        boundary_domains.append(
+            TileDomain(
+                domain_id=f"d{boundary_idx}",
+                boundary_index=boundary_idx,
+                tile_count=consumer_count,
+                tile_bytes=tuple(tile_boundary_bytes(scaled_boundaries[boundary_idx], consumer_count)),
+                logical_kind=f"boundary_{boundary_idx}",
+            )
+        )
+        boundary_mappings[boundary_idx] = mapping
+
+    final_boundary_idx = num_stages
+    final_producer_count = boundary_domains[-1].tile_count
+    boundary_domains.append(
+        TileDomain(
+            domain_id=f"d{final_boundary_idx}",
+            boundary_index=final_boundary_idx,
+            tile_count=final_producer_count,
+            tile_bytes=tuple(tile_boundary_bytes(scaled_boundaries[final_boundary_idx], final_producer_count)),
+            logical_kind=f"boundary_{final_boundary_idx}",
+        )
+    )
+    return boundary_domains, boundary_mappings
 
 
 def _workload_family_from_template(pipeline_template: str) -> str:
@@ -1531,6 +1927,8 @@ def _validate_config(
         "cpu_stage_unit_compute_Bps_by_template",
         "bytes_touched_factors_by_stage_by_template",
         "memory_system_by_template",
+        "pim_mode_by_stage_by_template",
+        "pim_mode_effects",
         "validation",
     ]
     missing = [key for key in required_top_level if key not in config]
@@ -1735,6 +2133,15 @@ def _validate_config(
         config=config,
         template_to_stage_names=template_to_stage_names,
     )
+    _normalize_tiling_model_by_template(
+        config=config,
+        template_to_stage_names=template_to_stage_names,
+    )
+    _normalize_pim_mode_by_stage_by_template(
+        config=config,
+        template_to_stage_names=template_to_stage_names,
+    )
+    _normalize_pim_mode_effects(config)
 
     if int(config["tile_size_bytes"]) <= 0:
         raise ValueError("tile_size_bytes must be > 0")
@@ -1751,6 +2158,91 @@ def _validate_config(
             raise ValueError(f"validation.{key} must be a map")
 
     return memory_system_by_template
+
+
+def _glue_bytes_touched(glue_type: str, bytes_in: float, bytes_out: float) -> float:
+    if glue_type == sources.GLUE_REDUCE:
+        return max(0.0, bytes_in + bytes_out)
+    if glue_type == sources.GLUE_SHUFFLE:
+        return max(0.0, bytes_in + bytes_out)
+    return max(0.0, bytes_in + bytes_out)
+
+
+def _glue_core_duration_s(
+    *,
+    spec: BoundaryMappingSpec,
+    bytes_in: float,
+    bytes_out: float,
+) -> float:
+    touched = _glue_bytes_touched(spec.glue_type, bytes_in, bytes_out)
+    compute_s = touched / max(spec.glue_compute_Bps, 1e-12)
+    mem_s = touched / max(spec.glue_mem_Bps, 1e-12)
+    return spec.glue_fixed_s + max(compute_s, mem_s)
+
+
+def _mapping_contributions_for_producer(
+    *,
+    spec: BoundaryMappingSpec,
+    producer_tile_id: int,
+    producer_tile_count: int,
+    consumer_tile_count: int,
+    producer_bytes_out: int,
+    src_stage_cfg: StageConfig,
+) -> List[Tuple[int, int]]:
+    if spec.mapping_type == sources.MAPPING_IDENTITY:
+        consumer_id = min(producer_tile_id, consumer_tile_count - 1)
+        return [(consumer_id, int(producer_bytes_out))]
+
+    if spec.mapping_type == sources.MAPPING_GROUP_K_TO_1:
+        consumer_id = min(producer_tile_id // max(1, spec.group_k), consumer_tile_count - 1)
+        return [(consumer_id, int(producer_bytes_out))]
+
+    if spec.mapping_type == sources.MAPPING_SPLIT_1_TO_M:
+        split_m = max(1, spec.split_m)
+        split_bytes = tile_boundary_bytes(int(producer_bytes_out), split_m)
+        out: List[Tuple[int, int]] = []
+        base = producer_tile_id * split_m
+        for idx, value in enumerate(split_bytes):
+            consumer_id = min(base + idx, consumer_tile_count - 1)
+            out.append((consumer_id, int(value)))
+        return out
+
+    if spec.mapping_type == sources.MAPPING_REPARTITION_HASH:
+        partitions = _resolve_boundary_partition_count(
+            partitions=spec.partitions,
+            producer_count=producer_tile_count,
+            src_stage_cfg=src_stage_cfg,
+        )
+        amplified = int(round(float(producer_bytes_out) * spec.output_amplification))
+        split_bytes = tile_boundary_bytes(amplified, partitions)
+        out = []
+        for part_id, value in enumerate(split_bytes):
+            consumer_id = min(part_id, consumer_tile_count - 1)
+            out.append((consumer_id, int(value)))
+        return out
+
+    raise ValueError(f"unsupported mapping_type {spec.mapping_type}")
+
+
+def _expected_contributions_per_consumer(
+    *,
+    spec: BoundaryMappingSpec,
+    producer_tile_count: int,
+    consumer_tile_count: int,
+) -> List[int]:
+    if spec.mapping_type == sources.MAPPING_IDENTITY:
+        return [1 for _ in range(consumer_tile_count)]
+    if spec.mapping_type == sources.MAPPING_GROUP_K_TO_1:
+        out = [0 for _ in range(consumer_tile_count)]
+        for producer_id in range(producer_tile_count):
+            consumer_id = min(producer_id // max(1, spec.group_k), consumer_tile_count - 1)
+            out[consumer_id] += 1
+        return [max(1, value) for value in out]
+    if spec.mapping_type == sources.MAPPING_SPLIT_1_TO_M:
+        return [1 for _ in range(consumer_tile_count)]
+    if spec.mapping_type == sources.MAPPING_REPARTITION_HASH:
+        return [max(1, producer_tile_count) for _ in range(consumer_tile_count)]
+    raise ValueError(f"unsupported mapping_type {spec.mapping_type}")
 
 
 def _pool_lower_bound_s(resource: ResourcePool) -> float:
@@ -1773,7 +2265,7 @@ def _dominant_lb_component(
     return components[0][0]
 
 
-def simulate_configuration(
+def _simulate_configuration_linear(
     run_id: str,
     dataset_profile: str,
     boundaries_bytes: Sequence[int],
@@ -1801,6 +2293,9 @@ def simulate_configuration(
     cxl_direct_concurrency: CXLDirectConcurrencyConfig,
     cxl_topology: CXLTopologyConfig,
     bytes_touched_factors_by_stage_by_template: Mapping[str, Mapping[str, Mapping[str, object]]],
+    pim_mode_by_stage_by_template: Mapping[str, Mapping[str, str]],
+    pim_mode_effects: Mapping[str, PIMModeEffect],
+    tiling_model_by_template: Mapping[str, TilingTemplateConfig],
     workload_family: str,
     workload_profile: str,
     workload_variant: str,
@@ -1840,6 +2335,10 @@ def simulate_configuration(
         raise KeyError(f"missing memory system map for template {pipeline_template}")
     if pipeline_template not in bytes_touched_factors_by_stage_by_template:
         raise KeyError(f"missing bytes_touched map for template {pipeline_template}")
+    if pipeline_template not in pim_mode_by_stage_by_template:
+        raise KeyError(f"missing pim_mode map for template {pipeline_template}")
+    if pipeline_template not in tiling_model_by_template:
+        raise KeyError(f"missing tiling model map for template {pipeline_template}")
 
     stage_devices = _stage_device_map_for_scenario(
         scenario_stage_device_map=scenario_stage_device_map_by_template[pipeline_template],
@@ -1873,6 +2372,8 @@ def simulate_configuration(
         stage_names=stage_names,
     )
     bytes_touched_factors_by_stage = bytes_touched_factors_by_stage_by_template[pipeline_template]
+    stage_pim_modes = pim_mode_by_stage_by_template[pipeline_template]
+    stage_kernel_class = tiling_model_by_template[pipeline_template].stage_kernel_class
     cpu_baseline_engine = cpu_baseline_cfg.baseline_engine
     cxl_direct_stream_slots = int(resource_capacity["cxl_direct_channels"]) * int(
         cxl_direct_concurrency.virtual_channels_per_channel
@@ -2022,6 +2523,7 @@ def simulate_configuration(
     total_cpu_materialize_time_component_s = 0.0
     total_retain_handoff_time_component_s = 0.0
     total_cxl_dma_issue_time_component_s = 0.0
+    total_pim_mode_command_overhead_s = 0.0
 
     while request_heap or cxl_direct_completion_heap:
         next_req_t = request_heap[0][0] if request_heap else math.inf
@@ -2114,6 +2616,26 @@ def simulate_configuration(
                         ),
                         "cxl_issue_overhead_s": float(direct_record["cxl_issue_overhead_s"]),
                         "cxl_striping_factor": int(direct_record["cxl_striping_factor"]),
+                        "domain_in_id": str(direct_record.get("domain_in_id", "")),
+                        "domain_out_id": str(direct_record.get("domain_out_id", "")),
+                        "domain_in_tile_id": int(direct_record.get("domain_in_tile_id", tile_id)),
+                        "domain_out_tile_id": int(direct_record.get("domain_out_tile_id", tile_id)),
+                        "mapping_type": str(direct_record.get("mapping_type", sources.MAPPING_IDENTITY)),
+                        "kernel_class": str(direct_record.get("kernel_class", "")),
+                        "glue_type": str(direct_record.get("glue_type", "")),
+                        "barrier_wait_s": float(direct_record.get("barrier_wait_s", 0.0)),
+                        "aggregation_expected": int(direct_record.get("aggregation_expected", 0)),
+                        "aggregation_received": int(direct_record.get("aggregation_received", 0)),
+                        "pim_mode": str(direct_record.get("pim_mode", sources.PIM_MODE_NONE)),
+                        "pim_mode_compute_multiplier": float(
+                            direct_record.get("pim_mode_compute_multiplier", 1.0)
+                        ),
+                        "pim_mode_mem_multiplier": float(
+                            direct_record.get("pim_mode_mem_multiplier", 1.0)
+                        ),
+                        "pim_mode_command_overhead_s": float(
+                            direct_record.get("pim_mode_command_overhead_s", 0.0)
+                        ),
                     }
                 )
 
@@ -2163,6 +2685,20 @@ def simulate_configuration(
         cxl_bw_share_Bps = 0.0
         cxl_issue_overhead_s = 0.0
         cxl_striping_factor_trace = 1
+        domain_in_id = f"d{operation.boundary_index}"
+        domain_out_id = f"d{operation.boundary_index}"
+        domain_in_tile_id = tile_id
+        domain_out_tile_id = tile_id
+        mapping_type = sources.MAPPING_IDENTITY
+        kernel_class = stage_kernel_class.get(stage_names[operation.stage_id - 1], "")
+        glue_type = ""
+        barrier_wait_s = 0.0
+        aggregation_expected = 0
+        aggregation_received = 0
+        pim_mode = sources.PIM_MODE_NONE
+        pim_mode_compute_multiplier = 1.0
+        pim_mode_mem_multiplier = 1.0
+        pim_mode_command_overhead_s = 0.0
 
         event_specs: List[Dict[str, object]] = []
 
@@ -2181,10 +2717,24 @@ def simulate_configuration(
                 queue_alpha = cpu_baseline_cfg.queue_alpha
                 rho_cap = cpu_baseline_cfg.rho_cap
             else:
-                compute_rate = stage_cfg.pim_unit_compute_Bps
+                pim_mode = stage_pim_modes.get(stage_name, sources.PIM_MODE_NONE)
+                mode_effect = pim_mode_effects[pim_mode]
+                pim_mode_compute_multiplier = mode_effect.compute_multiplier
+                pim_mode_mem_multiplier = mode_effect.mem_multiplier
+                pim_mode_command_overhead_s = mode_effect.command_overhead_s
+                compute_rate = stage_cfg.pim_unit_compute_Bps * pim_mode_compute_multiplier
                 stage_units = stage_cfg.pim_units
                 memory_system_role = "pim_system"
                 stage_service_cfg = pim_system_cfg.stages.get(stage_name) if pim_system_cfg.enabled else None
+                if stage_service_cfg is not None and pim_mode_mem_multiplier != 1.0:
+                    stage_service_cfg = StageMemoryServiceConfig(
+                        access_pattern=stage_service_cfg.access_pattern,
+                        row_hit_rate=stage_service_cfg.row_hit_rate,
+                        mlp=stage_service_cfg.mlp,
+                        avg_miss_latency_ns=stage_service_cfg.avg_miss_latency_ns,
+                        peak_bw_Bps=stage_service_cfg.peak_bw_Bps * pim_mode_mem_multiplier,
+                        penalty_multiplier=stage_service_cfg.penalty_multiplier,
+                    )
                 cacheline_bytes = pim_system_cfg.cacheline_bytes
                 queueing_model = pim_system_cfg.queueing_model
                 queue_alpha = pim_system_cfg.queue_alpha
@@ -2230,6 +2780,9 @@ def simulate_configuration(
             else:
                 duration_s = compute_component_s
                 memory_component_s = 0.0
+            if stage_device == sources.DEVICE_PIM and pim_mode_command_overhead_s > 0:
+                duration_s += pim_mode_command_overhead_s
+                total_pim_mode_command_overhead_s += pim_mode_command_overhead_s
             total_compute_time_component_s += compute_component_s
             if memory_system_enabled and stage_service_cfg is not None:
                 if stage_device == sources.DEVICE_CPU:
@@ -2413,6 +2966,20 @@ def simulate_configuration(
                         "cxl_bw_share_Bps": cxl_bw_share_Bps,
                         "cxl_issue_overhead_s": cxl_issue_overhead_s,
                         "cxl_striping_factor": cxl_striping_factor_trace,
+                        "domain_in_id": domain_in_id,
+                        "domain_out_id": domain_out_id,
+                        "domain_in_tile_id": domain_in_tile_id,
+                        "domain_out_tile_id": domain_out_tile_id,
+                        "mapping_type": mapping_type,
+                        "kernel_class": kernel_class,
+                        "glue_type": glue_type,
+                        "barrier_wait_s": barrier_wait_s,
+                        "aggregation_expected": aggregation_expected,
+                        "aggregation_received": aggregation_received,
+                        "pim_mode": pim_mode,
+                        "pim_mode_compute_multiplier": pim_mode_compute_multiplier,
+                        "pim_mode_mem_multiplier": pim_mode_mem_multiplier,
+                        "pim_mode_command_overhead_s": pim_mode_command_overhead_s,
                     }
                     pending_direct_transfers.pop(pending_key, None)
                     for t_evt, tr_id, tr_token in new_completion_events:
@@ -2635,6 +3202,20 @@ def simulate_configuration(
                         ),
                         "cxl_issue_overhead_s": cxl_issue_overhead_s,
                         "cxl_striping_factor": cxl_striping_factor_trace,
+                        "domain_in_id": domain_in_id,
+                        "domain_out_id": domain_out_id,
+                        "domain_in_tile_id": domain_in_tile_id,
+                        "domain_out_tile_id": domain_out_tile_id,
+                        "mapping_type": mapping_type,
+                        "kernel_class": kernel_class,
+                        "glue_type": glue_type,
+                        "barrier_wait_s": barrier_wait_s,
+                        "aggregation_expected": aggregation_expected,
+                        "aggregation_received": aggregation_received,
+                        "pim_mode": pim_mode,
+                        "pim_mode_compute_multiplier": pim_mode_compute_multiplier,
+                        "pim_mode_mem_multiplier": pim_mode_mem_multiplier,
+                        "pim_mode_command_overhead_s": pim_mode_command_overhead_s,
                     }
                 )
 
@@ -2738,8 +3319,1684 @@ def simulate_configuration(
         "cxl_effective_striping_factor": cxl_striping_factor,
         "total_cxl_dma_issue_time_component_s": total_cxl_dma_issue_time_component_s,
         "cxl_bw_model": "processor_share",
+        "retile_enabled": False,
+        "num_tile_domains": num_stages + 1,
+        "total_glue_copy_bytes": 0,
+        "total_glue_reduce_bytes": 0,
+        "total_glue_shuffle_bytes": 0,
+        "total_glue_time_component_s": 0.0,
+        "total_glue_transfer_time_component_s": 0.0,
+        "total_barrier_wait_time_component_s": 0.0,
+        "lb_glue_s": 0.0,
+        "total_pim_mode_command_overhead_s": total_pim_mode_command_overhead_s,
     }
     return metrics_row, traces
+
+
+def _simulate_configuration_retile(
+    run_id: str,
+    dataset_profile: str,
+    boundaries_bytes: Sequence[int],
+    public_stage_names: Sequence[str],
+    stage_names: Sequence[str],
+    pipeline_template: str,
+    size_multiplier: float,
+    scenario: str,
+    tile_size_bytes: int,
+    max_inflight_tiles: int,
+    host_h2d_link: str,
+    host_d2h_link: str,
+    cxl_direct_link: str,
+    resource_capacity: Dict[str, object],
+    stage_defaults: Dict[str, object],
+    transfer_power_W: Dict[str, object],
+    stage_overrides: Dict[str, Dict[object, Dict[str, object]]],
+    scenario_stage_device_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
+    scenario_stage_endpoint_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
+    ingress_resident_scenarios_by_template: Mapping[str, Sequence[str]],
+    pim_speedup_vs_cpu_by_stage_by_template: Mapping[str, Mapping[str, object]],
+    cpu_stage_unit_compute_Bps_by_template: Mapping[str, Mapping[str, object]],
+    memory_system_by_template: Mapping[str, Mapping[str, object]],
+    pim_retention: PIMRetentionConfig,
+    cxl_direct_concurrency: CXLDirectConcurrencyConfig,
+    cxl_topology: CXLTopologyConfig,
+    bytes_touched_factors_by_stage_by_template: Mapping[str, Mapping[str, Mapping[str, object]]],
+    pim_mode_by_stage_by_template: Mapping[str, Mapping[str, str]],
+    pim_mode_effects: Mapping[str, PIMModeEffect],
+    tiling_model_by_template: Mapping[str, TilingTemplateConfig],
+    workload_family: str,
+    workload_profile: str,
+    workload_variant: str,
+    baseline_id: str,
+    links_catalog: Mapping[str, Mapping[str, object]] | None = None,
+    trace_max_tiles: int | None = None,
+) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    link_catalog = sources.LINKS if links_catalog is None else links_catalog
+    num_stages = len(boundaries_bytes) - 1
+    num_public_stages = len(public_stage_names)
+    stage_devices = _stage_device_map_for_scenario(
+        scenario_stage_device_map=scenario_stage_device_map_by_template[pipeline_template],
+        scenario=scenario,
+        num_stages=num_stages,
+    )
+    stage_endpoints = _stage_endpoint_map_for_scenario(
+        scenario_stage_endpoint_map=scenario_stage_endpoint_map_by_template[pipeline_template],
+        scenario=scenario,
+        num_stages=num_stages,
+    )
+    scaled_boundaries = scale_boundaries_exact(boundaries_bytes=boundaries_bytes, multiplier=size_multiplier)
+    stage_configs = _build_stage_configs(
+        dataset_profile=dataset_profile,
+        boundaries_bytes=boundaries_bytes,
+        stage_names=stage_names,
+        pipeline_template=pipeline_template,
+        stage_defaults=stage_defaults,
+        stage_overrides=stage_overrides,
+        pim_speedup_vs_cpu_by_stage=pim_speedup_vs_cpu_by_stage_by_template[pipeline_template],
+        cpu_stage_unit_compute_Bps=cpu_stage_unit_compute_Bps_by_template[pipeline_template],
+    )
+    memory_system_enabled, cpu_baseline_cfg, pim_system_cfg = _build_system_configs_for_template(
+        memory_system_cfg=memory_system_by_template[pipeline_template],
+        stage_names=stage_names,
+    )
+    tiling_cfg = tiling_model_by_template[pipeline_template]
+    boundary_domains, boundary_mappings = _build_tile_domains_and_mappings(
+        scaled_boundaries=scaled_boundaries,
+        stage_names=stage_names,
+        tiling_cfg=tiling_cfg,
+        stage_configs=stage_configs,
+    )
+    stage_pim_modes = pim_mode_by_stage_by_template[pipeline_template]
+    stage_kernel_class = tiling_cfg.stage_kernel_class
+    bytes_touched_factors_by_stage = bytes_touched_factors_by_stage_by_template[pipeline_template]
+
+    cxl_direct_stream_slots = int(resource_capacity["cxl_direct_channels"]) * int(
+        cxl_direct_concurrency.virtual_channels_per_channel
+    )
+    cxl_power_per_stream_slot = float(transfer_power_W["cxl_direct_channel"]) / float(
+        cxl_direct_concurrency.virtual_channels_per_channel
+    )
+    host_h2d_ingress_pool = ResourcePool(
+        name="host_h2d_ingress",
+        capacity=int(resource_capacity["host_h2d_ingress_channels"]),
+        power_W=float(transfer_power_W["host_h2d_ingress_channel"]),
+    )
+    host_h2d_stage_pool = ResourcePool(
+        name="host_h2d_stage",
+        capacity=int(resource_capacity["host_h2d_stage_channels"]),
+        power_W=float(transfer_power_W["host_h2d_stage_channel"]),
+    )
+    host_d2h_pool = ResourcePool(
+        name="host_d2h",
+        capacity=int(resource_capacity["host_d2h_channels"]),
+        power_W=float(transfer_power_W["host_d2h_channel"]),
+    )
+    cxl_direct_pool = ResourcePool(
+        name="cxl_direct",
+        capacity=cxl_direct_stream_slots,
+        power_W=cxl_power_per_stream_slot,
+    )
+    host_touch_pool = ResourcePool(
+        name="host_touch",
+        capacity=int(resource_capacity["host_touch_channels"]),
+        power_W=float(transfer_power_W["host_touch_channel"]),
+    )
+    cpu_materialize_pool = ResourcePool(
+        name="cpu_materialize",
+        capacity=int(resource_capacity["cpu_materialize_channels"]),
+        power_W=float(transfer_power_W["cpu_materialize_channel"]),
+    )
+    glue_cpu_pool = ResourcePool(
+        name="glue_cpu",
+        capacity=max(1, int(stage_defaults["cpu_units"])),
+        power_W=float(stage_defaults["cpu_unit_power_W"]),
+    )
+    glue_pim_pool = ResourcePool(
+        name="glue_pim",
+        capacity=max(1, int(stage_defaults["pim_units"])),
+        power_W=float(stage_defaults["pim_unit_power_W"]),
+    )
+    active_pim_endpoints = sorted(
+        {
+            stage_endpoints[stage_id - 1]
+            for stage_id in range(1, num_stages + 1)
+            if stage_devices[stage_id - 1] == sources.DEVICE_PIM
+        }
+    )
+    retain_pools: Dict[str, ResourcePool] = {
+        endpoint: ResourcePool(name=f"retain_{endpoint}", capacity=1, power_W=0.0)
+        for endpoint in active_pim_endpoints
+    }
+    compute_pools: List[ResourcePool] = []
+    for stage_id in range(1, num_stages + 1):
+        cfg = stage_configs[stage_id - 1]
+        if stage_devices[stage_id - 1] == sources.DEVICE_CPU:
+            compute_pools.append(
+                ResourcePool(
+                    name=f"cpu_stage_{stage_id}",
+                    capacity=cfg.cpu_units,
+                    power_W=cfg.cpu_unit_power_W,
+                )
+            )
+        else:
+            compute_pools.append(
+                ResourcePool(
+                    name=f"pim_stage_{stage_id}",
+                    capacity=cfg.pim_units,
+                    power_W=cfg.pim_unit_power_W,
+                )
+            )
+
+    # Topology/striping setup.
+    active_direct_endpoints: set[str] = set()
+    if scenario == sources.SCENARIO_PIM_FLOWCXL_DIRECT:
+        for boundary_idx in range(1, num_stages):
+            if stage_devices[boundary_idx - 1] == sources.DEVICE_PIM and stage_devices[boundary_idx] == sources.DEVICE_PIM:
+                src_endpoint = stage_endpoints[boundary_idx - 1]
+                dst_endpoint = stage_endpoints[boundary_idx]
+                if src_endpoint != dst_endpoint:
+                    active_direct_endpoints.add(src_endpoint)
+                    active_direct_endpoints.add(dst_endpoint)
+    active_direct_endpoint_count = len(active_direct_endpoints)
+    cxl_striping_factor = 1
+    cxl_link = link_catalog[cxl_direct_link]
+    supports_dynamic_striping = bool(cxl_link.get("supports_dynamic_striping", False))
+    if (
+        cxl_topology.enabled
+        and cxl_topology.mode == "dynamic_striping"
+        and supports_dynamic_striping
+        and cxl_direct_link in cxl_topology.applies_to_links
+    ):
+        cxl_striping_factor = min(
+            cxl_topology.max_stripes,
+            cxl_topology.num_physical_links,
+            max(1, active_direct_endpoint_count),
+        )
+    cxl_total_bw_Bps = float(cxl_link["bandwidth_Bps"]) * float(cxl_striping_factor)
+    cxl_processor_scheduler = CXLProcessorShareScheduler(
+        bw_total_Bps=cxl_total_bw_Bps,
+        slots=cxl_direct_stream_slots,
+    )
+
+    traces: List[Dict[str, object]] = []
+    stage_work_heap: List[Tuple[float, int, int, int]] = []
+    direct_request_heap: List[Tuple[float, int]] = []
+    direct_completion_heap: List[Tuple[float, int, int]] = []
+    pending_direct_transfers: Dict[int, Dict[str, object]] = {}
+    active_direct_transfers: Dict[int, Dict[str, object]] = {}
+    next_pending_direct_id = 1
+    next_direct_transfer_id = 1
+    heap_counter = 0
+
+    num_input_tiles = boundary_domains[0].tile_count
+    inflight_seed = min(max(1, int(max_inflight_tiles)), num_input_tiles)
+    next_tile_to_admit = inflight_seed
+    for tile_id in range(inflight_seed):
+        heap_counter += 1
+        heapq.heappush(stage_work_heap, (0.0, heap_counter, 1, tile_id))
+
+    stage_output_bytes: Dict[int, List[int]] = {}
+    for stage_id in range(1, num_stages + 1):
+        producer_count = boundary_domains[stage_id - 1].tile_count
+        stage_output_bytes[stage_id] = tile_boundary_bytes(
+            total_bytes=scaled_boundaries[stage_id], num_tiles=producer_count
+        )
+
+    boundary_states: Dict[int, List[BoundaryAggregationState]] = {}
+    for boundary_idx in range(1, num_stages):
+        spec = boundary_mappings[boundary_idx]
+        producer_count = boundary_domains[boundary_idx - 1].tile_count
+        consumer_count = boundary_domains[boundary_idx].tile_count
+        expected = _expected_contributions_per_consumer(
+            spec=spec,
+            producer_tile_count=producer_count,
+            consumer_tile_count=consumer_count,
+        )
+        boundary_states[boundary_idx] = [
+            BoundaryAggregationState(expected_count=expected[idx]) for idx in range(consumer_count)
+        ]
+
+    completed_terminal_items = 0
+    makespan_s = 0.0
+    cpu_baseline_engine = cpu_baseline_cfg.baseline_engine
+    ingress_resident = scenario in set(ingress_resident_scenarios_by_template[pipeline_template])
+    ingress_skip_seen: set[int] = set()
+
+    total_bytes_host_link = 0
+    total_bytes_cxl_direct = 0
+    total_bytes_host_touch = 0
+    total_bytes_host_h2d_ingress = 0
+    total_bytes_host_h2d_stage = 0
+    total_bytes_host_d2h = 0
+    total_bytes_pim_retained = 0
+    total_retain_fallback_bytes = 0
+    total_cpu_materialize_bytes = 0
+    total_compute_time_component_s = 0.0
+    total_cpu_mem_time_component_s = 0.0
+    total_cpu_mem_latency_bound_time_component_s = 0.0
+    total_cpu_mem_peak_bound_time_component_s = 0.0
+    total_pim_mem_time_component_s = 0.0
+    total_cpu_mem_service_time_component_s = 0.0
+    total_cpu_mem_queue_delay_component_s = 0.0
+    total_pim_mem_service_time_component_s = 0.0
+    total_pim_mem_queue_delay_component_s = 0.0
+    total_cpu_materialize_time_component_s = 0.0
+    total_retain_handoff_time_component_s = 0.0
+    total_cxl_dma_issue_time_component_s = 0.0
+    total_pim_mode_command_overhead_s = 0.0
+    total_glue_copy_bytes = 0
+    total_glue_reduce_bytes = 0
+    total_glue_shuffle_bytes = 0
+    total_glue_time_component_s = 0.0
+    total_glue_transfer_time_component_s = 0.0
+    total_barrier_wait_time_component_s = 0.0
+
+    def _trace_event(
+        *,
+        tile_id: int,
+        stage_id: int,
+        op_type: str,
+        bytes_value: int,
+        t_req: float,
+        t_start: float,
+        t_end: float,
+        wait_s: float,
+        duration_s: float,
+        stage_name: str,
+        stage_device: str,
+        transfer_path: str = "",
+        resource_name: str = "",
+        resource_slot: int = -1,
+        link_type: str = "",
+        compute_component_s: float = 0.0,
+        memory_component_s: float = 0.0,
+        bytes_touched: float = 0.0,
+        cpu_access_pattern: str = "",
+        cpu_row_hit_rate: float = 0.0,
+        cpu_mlp: float = 0.0,
+        cpu_avg_miss_latency_ns: float = 0.0,
+        cpu_bw_peak_Bps: float = 0.0,
+        cpu_bw_latency_Bps: float = 0.0,
+        cpu_bw_eff_stage_Bps: float = 0.0,
+        cpu_bw_eff_per_unit_Bps: float = 0.0,
+        cpu_mem_bound_mode: str = "",
+        memory_system_role: str = "",
+        mem_service_Bps: float = 0.0,
+        mem_queue_multiplier: float = 1.0,
+        mem_rho: float = 0.0,
+        mem_service_time_s: float = 0.0,
+        mem_queue_delay_s: float = 0.0,
+        stage_src_endpoint: str = "",
+        stage_dst_endpoint: str = "",
+        handoff_mode: str = "",
+        retention_capacity_blocked: bool = False,
+        cxl_active_streams: int = 0,
+        cxl_bw_share_Bps: float = 0.0,
+        cxl_issue_overhead_s: float = 0.0,
+        cxl_striping_factor_trace: int = 1,
+        domain_in_id: str = "",
+        domain_out_id: str = "",
+        domain_in_tile_id: int = 0,
+        domain_out_tile_id: int = 0,
+        mapping_type: str = sources.MAPPING_IDENTITY,
+        kernel_class: str = "",
+        glue_type: str = "",
+        barrier_wait_s: float = 0.0,
+        aggregation_expected: int = 0,
+        aggregation_received: int = 0,
+        pim_mode: str = sources.PIM_MODE_NONE,
+        pim_mode_compute_multiplier: float = 1.0,
+        pim_mode_mem_multiplier: float = 1.0,
+        pim_mode_command_overhead_s: float = 0.0,
+    ) -> None:
+        if trace_max_tiles is not None and tile_id >= trace_max_tiles:
+            return
+        traces.append(
+            {
+                "run_id": run_id,
+                "dataset_profile": dataset_profile,
+                "stage_size_multiplier": size_multiplier,
+                "scenario": scenario,
+                "pipeline_template": pipeline_template,
+                "workload_family": workload_family,
+                "workload_profile": workload_profile,
+                "workload_variant": workload_variant,
+                "baseline_id": baseline_id,
+                "tile_id": tile_id,
+                "op_index": 1,
+                "stage_id": stage_id,
+                "stage_name": stage_name,
+                "stage_device": stage_device,
+                "op_type": op_type,
+                "transfer_path": transfer_path,
+                "resource": resource_name,
+                "resource_slot": resource_slot,
+                "link_type": link_type,
+                "bytes": bytes_value,
+                "t_req": t_req,
+                "t_start": t_start,
+                "t_end": t_end,
+                "duration_s": duration_s,
+                "wait_s": wait_s,
+                "compute_component_s": compute_component_s,
+                "memory_component_s": memory_component_s,
+                "bytes_touched": bytes_touched,
+                "cpu_access_pattern": cpu_access_pattern,
+                "cpu_row_hit_rate": cpu_row_hit_rate,
+                "cpu_mlp": cpu_mlp,
+                "cpu_avg_miss_latency_ns": cpu_avg_miss_latency_ns,
+                "cpu_bw_peak_Bps": cpu_bw_peak_Bps,
+                "cpu_bw_latency_Bps": cpu_bw_latency_Bps,
+                "cpu_bw_eff_stage_Bps": cpu_bw_eff_stage_Bps,
+                "cpu_bw_eff_per_unit_Bps": cpu_bw_eff_per_unit_Bps,
+                "cpu_mem_bound_mode": cpu_mem_bound_mode,
+                "memory_ceiling_enabled": memory_system_enabled,
+                "memory_system_role": memory_system_role,
+                "mem_service_Bps": mem_service_Bps,
+                "mem_queue_multiplier": mem_queue_multiplier,
+                "mem_rho": mem_rho,
+                "mem_service_time_s": mem_service_time_s,
+                "mem_queue_delay_s": mem_queue_delay_s,
+                "cpu_baseline_engine": cpu_baseline_engine,
+                "stage_src_endpoint": stage_src_endpoint,
+                "stage_dst_endpoint": stage_dst_endpoint,
+                "handoff_mode": handoff_mode,
+                "retention_capacity_blocked": retention_capacity_blocked,
+                "cxl_active_streams": cxl_active_streams,
+                "cxl_bw_share_Bps": cxl_bw_share_Bps,
+                "cxl_effective_bw_Bps": (bytes_value / duration_s) if duration_s > 0 and transfer_path == "cxl_direct" else 0.0,
+                "cxl_issue_overhead_s": cxl_issue_overhead_s,
+                "cxl_striping_factor": cxl_striping_factor_trace,
+                "domain_in_id": domain_in_id,
+                "domain_out_id": domain_out_id,
+                "domain_in_tile_id": domain_in_tile_id,
+                "domain_out_tile_id": domain_out_tile_id,
+                "mapping_type": mapping_type,
+                "kernel_class": kernel_class,
+                "glue_type": glue_type,
+                "barrier_wait_s": barrier_wait_s,
+                "aggregation_expected": aggregation_expected,
+                "aggregation_received": aggregation_received,
+                "pim_mode": pim_mode,
+                "pim_mode_compute_multiplier": pim_mode_compute_multiplier,
+                "pim_mode_mem_multiplier": pim_mode_mem_multiplier,
+                "pim_mode_command_overhead_s": pim_mode_command_overhead_s,
+            }
+        )
+
+    def _schedule_pool_event(
+        *,
+        pool: ResourcePool,
+        t_req: float,
+        duration_s: float,
+    ) -> Tuple[float, float, float, int]:
+        return pool.schedule(t_req=t_req, duration_s=duration_s)
+
+    def _admit_next_input(admit_t: float) -> None:
+        nonlocal heap_counter, next_tile_to_admit
+        if next_tile_to_admit >= num_input_tiles:
+            return
+        heap_counter += 1
+        heapq.heappush(stage_work_heap, (admit_t, heap_counter, 1, next_tile_to_admit))
+        next_tile_to_admit += 1
+
+    def _release_stage_consumer(stage_id: int, tile_id: int, release_t: float) -> None:
+        nonlocal heap_counter
+        heap_counter += 1
+        heapq.heappush(stage_work_heap, (release_t, heap_counter, stage_id, tile_id))
+
+    def _handle_boundary_arrival(
+        *,
+        boundary_idx: int,
+        consumer_id: int,
+        bytes_in_value: int,
+        t_arrival: float,
+        producer_tile_id: int,
+        stage_id: int,
+        stage_name: str,
+        stage_device: str,
+        mapping: BoundaryMappingSpec,
+        kernel_class: str,
+        pim_mode: str,
+        pim_mode_compute_multiplier: float,
+        pim_mode_mem_multiplier: float,
+        pim_mode_command_overhead_s: float,
+        domain_in_id: str,
+        domain_out_id: str,
+    ) -> None:
+        nonlocal total_glue_time_component_s
+        nonlocal total_glue_transfer_time_component_s
+        nonlocal total_glue_copy_bytes, total_glue_reduce_bytes, total_glue_shuffle_bytes
+        nonlocal total_barrier_wait_time_component_s
+        state = boundary_states[boundary_idx][consumer_id]
+        state.received_count += 1
+        state.bytes_in += float(bytes_in_value)
+        state.first_contrib_t = min(state.first_contrib_t, t_arrival)
+        state.latest_contrib_t = max(state.latest_contrib_t, t_arrival)
+        if state.received_count < state.expected_count:
+            return
+
+        barrier_wait = max(0.0, state.latest_contrib_t - state.first_contrib_t)
+        total_barrier_wait_time_component_s += barrier_wait
+        glue_start_t = state.latest_contrib_t
+        bytes_out = int(boundary_domains[boundary_idx].tile_bytes[consumer_id])
+        need_glue = (
+            mapping.mapping_type != sources.MAPPING_IDENTITY
+            or mapping.glue_fixed_s > 0.0
+            or mapping.glue_transfer_path != "none"
+        )
+        glue_end_t = glue_start_t
+        if need_glue:
+            glue_pool = glue_pim_pool if mapping.glue_device == sources.DEVICE_PIM else glue_cpu_pool
+            glue_core_duration = _glue_core_duration_s(
+                spec=mapping,
+                bytes_in=float(state.bytes_in),
+                bytes_out=float(bytes_out),
+            )
+            t_glue_start, t_glue_end, glue_wait_s, glue_slot = _schedule_pool_event(
+                pool=glue_pool,
+                t_req=glue_start_t,
+                duration_s=glue_core_duration,
+            )
+            glue_end_t = t_glue_end
+            total_glue_time_component_s += glue_core_duration
+            if mapping.glue_type == sources.GLUE_COPY:
+                total_glue_copy_bytes += int(state.bytes_in)
+            elif mapping.glue_type == sources.GLUE_REDUCE:
+                total_glue_reduce_bytes += int(state.bytes_in)
+            elif mapping.glue_type == sources.GLUE_SHUFFLE:
+                total_glue_shuffle_bytes += int(state.bytes_in)
+            _trace_event(
+                tile_id=consumer_id,
+                stage_id=stage_id,
+                op_type=mapping.glue_type,
+                bytes_value=int(state.bytes_in),
+                t_req=glue_start_t,
+                t_start=t_glue_start,
+                t_end=t_glue_end,
+                wait_s=glue_wait_s,
+                duration_s=glue_core_duration,
+                stage_name=stage_name,
+                stage_device=mapping.glue_device,
+                transfer_path="",
+                resource_name=glue_pool.name,
+                resource_slot=glue_slot,
+                domain_in_id=domain_in_id,
+                domain_out_id=domain_out_id,
+                domain_in_tile_id=producer_tile_id,
+                domain_out_tile_id=consumer_id,
+                mapping_type=mapping.mapping_type,
+                kernel_class=kernel_class,
+                glue_type=mapping.glue_type,
+                barrier_wait_s=barrier_wait,
+                aggregation_expected=state.expected_count,
+                aggregation_received=state.received_count,
+                pim_mode=pim_mode,
+                pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+            )
+
+            if mapping.glue_transfer_path != "none":
+                if mapping.glue_transfer_path == "host_h2d_stage":
+                    transfer_pool = host_h2d_stage_pool
+                    transfer_link = host_h2d_link
+                elif mapping.glue_transfer_path == "host_d2h":
+                    transfer_pool = host_d2h_pool
+                    transfer_link = host_d2h_link
+                elif mapping.glue_transfer_path == "cxl_direct":
+                    transfer_pool = cxl_direct_pool
+                    transfer_link = cxl_direct_link
+                else:
+                    raise ValueError(f"unsupported glue_transfer_path {mapping.glue_transfer_path}")
+                transfer_duration = transfer_duration_s(
+                    bytes_moved=bytes_out,
+                    link_type=transfer_link,
+                    links_catalog=link_catalog,
+                )
+                t_tr_start, t_tr_end, tr_wait_s, tr_slot = _schedule_pool_event(
+                    pool=transfer_pool,
+                    t_req=glue_end_t,
+                    duration_s=transfer_duration,
+                )
+                glue_end_t = t_tr_end
+                total_glue_transfer_time_component_s += transfer_duration
+                _trace_event(
+                    tile_id=consumer_id,
+                    stage_id=stage_id,
+                    op_type="TRANSFER",
+                    bytes_value=bytes_out,
+                    t_req=t_glue_end,
+                    t_start=t_tr_start,
+                    t_end=t_tr_end,
+                    wait_s=tr_wait_s,
+                    duration_s=transfer_duration,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    transfer_path=mapping.glue_transfer_path,
+                    resource_name=transfer_pool.name,
+                    resource_slot=tr_slot,
+                    link_type=transfer_link,
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                    domain_in_tile_id=producer_tile_id,
+                    domain_out_tile_id=consumer_id,
+                    mapping_type=mapping.mapping_type,
+                    kernel_class=kernel_class,
+                    glue_type=mapping.glue_type,
+                    barrier_wait_s=0.0,
+                    aggregation_expected=state.expected_count,
+                    aggregation_received=state.received_count,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                )
+
+        _release_stage_consumer(stage_id=boundary_idx + 1, tile_id=consumer_id, release_t=glue_end_t)
+
+    while stage_work_heap or direct_request_heap or direct_completion_heap:
+        next_stage_t = stage_work_heap[0][0] if stage_work_heap else math.inf
+        next_req_t = direct_request_heap[0][0] if direct_request_heap else math.inf
+        next_done_t = direct_completion_heap[0][0] if direct_completion_heap else math.inf
+
+        if next_done_t <= next_req_t and next_done_t <= next_stage_t:
+            t_done, transfer_id, token = heapq.heappop(direct_completion_heap)
+            transfer_info = active_direct_transfers.get(transfer_id)
+            if transfer_info is None:
+                continue
+            valid, rescheduled = cxl_processor_scheduler.complete_if_valid(
+                transfer_id=transfer_id, token=token, at_t=t_done
+            )
+            if not valid:
+                continue
+            for t_evt, tr_id, tr_token in rescheduled:
+                heapq.heappush(direct_completion_heap, (t_evt, tr_id, tr_token))
+            active_direct_transfers.pop(transfer_id, None)
+            t_req = float(transfer_info["t_req"])
+            t_start = float(transfer_info["t_start"])
+            duration_s = max(0.0, float(t_done) - t_start)
+            _trace_event(
+                tile_id=int(transfer_info["producer_tile_id"]),
+                stage_id=int(transfer_info["stage_id"]),
+                op_type="TRANSFER",
+                bytes_value=int(transfer_info["bytes"]),
+                t_req=t_req,
+                t_start=t_start,
+                t_end=float(t_done),
+                wait_s=max(0.0, t_start - t_req),
+                duration_s=duration_s,
+                stage_name=str(transfer_info["stage_name"]),
+                stage_device=str(transfer_info["stage_device"]),
+                transfer_path="cxl_direct",
+                resource_name=cxl_direct_pool.name,
+                resource_slot=-1,
+                link_type=cxl_direct_link,
+                stage_src_endpoint=str(transfer_info["stage_src_endpoint"]),
+                stage_dst_endpoint=str(transfer_info["stage_dst_endpoint"]),
+                handoff_mode="transfer_direct",
+                retention_capacity_blocked=bool(transfer_info["retention_capacity_blocked"]),
+                cxl_active_streams=int(transfer_info["cxl_active_streams"]),
+                cxl_bw_share_Bps=float(transfer_info["cxl_bw_share_Bps"]),
+                cxl_issue_overhead_s=float(transfer_info["cxl_issue_overhead_s"]),
+                cxl_striping_factor_trace=int(transfer_info["cxl_striping_factor"]),
+                domain_in_id=str(transfer_info["domain_in_id"]),
+                domain_out_id=str(transfer_info["domain_out_id"]),
+                domain_in_tile_id=int(transfer_info["domain_in_tile_id"]),
+                domain_out_tile_id=int(transfer_info["domain_out_tile_id"]),
+                mapping_type=str(transfer_info["mapping_type"]),
+                kernel_class=str(transfer_info["kernel_class"]),
+                glue_type=str(transfer_info["glue_type"]),
+                barrier_wait_s=float(transfer_info["barrier_wait_s"]),
+                aggregation_expected=int(transfer_info["aggregation_expected"]),
+                aggregation_received=int(transfer_info["aggregation_received"]),
+                pim_mode=str(transfer_info["pim_mode"]),
+                pim_mode_compute_multiplier=float(transfer_info["pim_mode_compute_multiplier"]),
+                pim_mode_mem_multiplier=float(transfer_info["pim_mode_mem_multiplier"]),
+                pim_mode_command_overhead_s=float(transfer_info["pim_mode_command_overhead_s"]),
+            )
+            _handle_boundary_arrival(
+                boundary_idx=int(transfer_info["boundary_idx"]),
+                consumer_id=int(transfer_info["consumer_id"]),
+                bytes_in_value=int(transfer_info["bytes"]),
+                t_arrival=float(t_done),
+                producer_tile_id=int(transfer_info["producer_tile_id"]),
+                stage_id=int(transfer_info["stage_id"]),
+                stage_name=str(transfer_info["stage_name"]),
+                stage_device=str(transfer_info["stage_device"]),
+                mapping=boundary_mappings[int(transfer_info["boundary_idx"])],
+                kernel_class=str(transfer_info["kernel_class"]),
+                pim_mode=str(transfer_info["pim_mode"]),
+                pim_mode_compute_multiplier=float(transfer_info["pim_mode_compute_multiplier"]),
+                pim_mode_mem_multiplier=float(transfer_info["pim_mode_mem_multiplier"]),
+                pim_mode_command_overhead_s=float(transfer_info["pim_mode_command_overhead_s"]),
+                domain_in_id=str(transfer_info["domain_in_id"]),
+                domain_out_id=str(transfer_info["domain_out_id"]),
+            )
+            continue
+
+        if next_req_t <= next_stage_t:
+            t_ready, pending_id = heapq.heappop(direct_request_heap)
+            pending = pending_direct_transfers.get(pending_id)
+            if pending is None:
+                continue
+            admit_t = max(float(t_ready), float(pending["ready_t"]))
+            active_before = cxl_processor_scheduler.active_count(at_t=admit_t)
+            if active_before >= cxl_direct_stream_slots:
+                retry_t = cxl_processor_scheduler.next_completion_time(at_t=admit_t)
+                if not math.isfinite(retry_t):
+                    retry_t = admit_t
+                heapq.heappush(direct_request_heap, (max(admit_t, retry_t), pending_id))
+                continue
+            transfer_id = next_direct_transfer_id
+            next_direct_transfer_id += 1
+            admitted, rescheduled = cxl_processor_scheduler.try_admit(
+                transfer_id=transfer_id,
+                bytes_total=int(pending["bytes"]),
+                at_t=admit_t,
+            )
+            if not admitted:
+                retry_t = cxl_processor_scheduler.next_completion_time(at_t=admit_t)
+                if not math.isfinite(retry_t):
+                    retry_t = admit_t
+                heapq.heappush(direct_request_heap, (max(admit_t, retry_t), pending_id))
+                continue
+            for t_evt, tr_id, tr_token in rescheduled:
+                heapq.heappush(direct_completion_heap, (t_evt, tr_id, tr_token))
+            active_direct_transfers[transfer_id] = {
+                **pending,
+                "t_start": admit_t,
+                "cxl_active_streams": active_before + 1,
+                "cxl_bw_share_Bps": cxl_total_bw_Bps / float(max(1, active_before + 1)),
+            }
+            pending_direct_transfers.pop(pending_id, None)
+            total_bytes_cxl_direct += int(pending["bytes"])
+            continue
+
+        if not stage_work_heap:
+            break
+
+        t_req, _, stage_id, tile_id = heapq.heappop(stage_work_heap)
+        stage_name = stage_names[stage_id - 1]
+        stage_device = stage_devices[stage_id - 1]
+        kernel_class = stage_kernel_class.get(stage_name, _default_kernel_class_for_stage(stage_name))
+        bytes_in = int(boundary_domains[stage_id - 1].tile_bytes[tile_id])
+        bytes_out = int(stage_output_bytes[stage_id][tile_id])
+        stage_cfg = stage_configs[stage_id - 1]
+        stage_src_endpoint = stage_endpoints[stage_id - 1]
+
+        t_cursor = float(t_req)
+
+        if stage_id == 1 and stage_device == sources.DEVICE_PIM:
+            if not (ingress_resident and tile_id not in ingress_skip_seen):
+                ingress_duration = transfer_duration_s(
+                    bytes_moved=bytes_in,
+                    link_type=host_h2d_link,
+                    links_catalog=link_catalog,
+                )
+                t_start, t_end, wait_s, slot = _schedule_pool_event(
+                    pool=host_h2d_ingress_pool,
+                    t_req=t_cursor,
+                    duration_s=ingress_duration,
+                )
+                total_bytes_host_link += bytes_in
+                total_bytes_host_h2d_ingress += bytes_in
+                _trace_event(
+                    tile_id=tile_id,
+                    stage_id=stage_id,
+                    op_type="TRANSFER",
+                    bytes_value=bytes_in,
+                    t_req=t_cursor,
+                    t_start=t_start,
+                    t_end=t_end,
+                    wait_s=wait_s,
+                    duration_s=ingress_duration,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    transfer_path="host_h2d_ingress",
+                    resource_name=host_h2d_ingress_pool.name,
+                    resource_slot=slot,
+                    link_type=host_h2d_link,
+                    stage_src_endpoint="host0",
+                    stage_dst_endpoint=stage_src_endpoint,
+                    domain_in_id=boundary_domains[0].domain_id,
+                    domain_out_id=boundary_domains[0].domain_id,
+                    domain_in_tile_id=tile_id,
+                    domain_out_tile_id=tile_id,
+                    mapping_type=sources.MAPPING_IDENTITY,
+                    kernel_class=kernel_class,
+                )
+                t_cursor = t_end
+            else:
+                ingress_skip_seen.add(tile_id)
+
+        factors = bytes_touched_factors_by_stage[stage_name]
+        compute_rate = stage_cfg.cpu_unit_compute_Bps if stage_device == sources.DEVICE_CPU else stage_cfg.pim_unit_compute_Bps
+        stage_units = stage_cfg.cpu_units if stage_device == sources.DEVICE_CPU else stage_cfg.pim_units
+        memory_system_role = "cpu_baseline" if stage_device == sources.DEVICE_CPU else "pim_system"
+        stage_service_cfg = (
+            cpu_baseline_cfg.stages.get(stage_name)
+            if stage_device == sources.DEVICE_CPU
+            else (pim_system_cfg.stages.get(stage_name) if pim_system_cfg.enabled else None)
+        )
+        cacheline_bytes = cpu_baseline_cfg.cacheline_bytes if stage_device == sources.DEVICE_CPU else pim_system_cfg.cacheline_bytes
+        queueing_model = cpu_baseline_cfg.queueing_model if stage_device == sources.DEVICE_CPU else pim_system_cfg.queueing_model
+        queue_alpha = cpu_baseline_cfg.queue_alpha if stage_device == sources.DEVICE_CPU else pim_system_cfg.queue_alpha
+        rho_cap = cpu_baseline_cfg.rho_cap if stage_device == sources.DEVICE_CPU else pim_system_cfg.rho_cap
+        pim_mode = stage_pim_modes.get(stage_name, sources.PIM_MODE_NONE)
+        mode_effect = pim_mode_effects[pim_mode]
+        pim_mode_compute_multiplier = mode_effect.compute_multiplier
+        pim_mode_mem_multiplier = mode_effect.mem_multiplier
+        pim_mode_command_overhead_s = mode_effect.command_overhead_s if stage_device == sources.DEVICE_PIM else 0.0
+        if stage_device == sources.DEVICE_PIM:
+            compute_rate *= pim_mode_compute_multiplier
+            if stage_service_cfg is not None:
+                stage_service_cfg = StageMemoryServiceConfig(
+                    access_pattern=stage_service_cfg.access_pattern,
+                    row_hit_rate=stage_service_cfg.row_hit_rate,
+                    mlp=stage_service_cfg.mlp,
+                    avg_miss_latency_ns=stage_service_cfg.avg_miss_latency_ns,
+                    peak_bw_Bps=stage_service_cfg.peak_bw_Bps * pim_mode_mem_multiplier,
+                    penalty_multiplier=stage_service_cfg.penalty_multiplier,
+                )
+
+        compute_component_s = compute_duration_s(bytes_moved=bytes_in, compute_rate_Bps=compute_rate)
+        bytes_touched = compute_bytes_touched(
+            bytes_in=bytes_in,
+            bytes_out=bytes_out,
+            input_factor=float(factors["input_factor"]),
+            output_factor=float(factors["output_factor"]),
+            amplification_factor=float(factors["amplification_factor"]),
+        )
+        memory_component_s = 0.0
+        mem_service_time_s = 0.0
+        mem_queue_delay_s = 0.0
+        mem_service_Bps = 0.0
+        mem_queue_multiplier = 1.0
+        mem_rho = 0.0
+        cpu_access_pattern = ""
+        cpu_row_hit_rate = 0.0
+        cpu_mlp = 0.0
+        cpu_avg_miss_latency_ns = 0.0
+        cpu_bw_peak_Bps = 0.0
+        cpu_bw_latency_Bps = 0.0
+        cpu_bw_eff_stage_Bps = 0.0
+        cpu_bw_eff_per_unit_Bps = 0.0
+        cpu_mem_bound_mode = ""
+
+        if memory_system_enabled and stage_service_cfg is not None:
+            mem_stats = _compute_stage_memory_service(
+                stage_cfg=stage_service_cfg,
+                stage_units=stage_units,
+                bytes_touched=bytes_touched,
+                compute_component_s=compute_component_s,
+                cacheline_bytes=cacheline_bytes,
+                queueing_model=queueing_model,
+                queue_alpha=queue_alpha,
+                rho_cap=rho_cap,
+            )
+            memory_component_s = float(mem_stats["mem_total_time_s"])
+            mem_service_time_s = float(mem_stats["mem_service_time_s"])
+            mem_queue_delay_s = float(mem_stats["mem_queue_delay_s"])
+            mem_service_Bps = float(mem_stats["bw_service_Bps"])
+            mem_queue_multiplier = float(mem_stats["queue_multiplier"])
+            mem_rho = float(mem_stats["rho"])
+            if stage_device == sources.DEVICE_CPU:
+                cpu_access_pattern = stage_service_cfg.access_pattern
+                cpu_row_hit_rate = stage_service_cfg.row_hit_rate
+                cpu_mlp = stage_service_cfg.mlp
+                cpu_avg_miss_latency_ns = stage_service_cfg.avg_miss_latency_ns
+                cpu_bw_peak_Bps = stage_service_cfg.peak_bw_Bps
+                cpu_bw_latency_Bps = float(mem_stats["bw_latency_Bps"])
+                cpu_bw_eff_stage_Bps = float(mem_stats["bw_eff_stage_Bps"])
+                cpu_bw_eff_per_unit_Bps = float(mem_stats["bw_eff_per_unit_Bps"])
+                cpu_mem_bound_mode = str(mem_stats["mem_bound_mode"])
+
+        duration_s = max(compute_component_s, memory_component_s)
+        if stage_device == sources.DEVICE_PIM and pim_mode_command_overhead_s > 0:
+            duration_s += pim_mode_command_overhead_s
+            total_pim_mode_command_overhead_s += pim_mode_command_overhead_s
+        total_compute_time_component_s += compute_component_s
+        if memory_system_enabled and stage_service_cfg is not None:
+            if stage_device == sources.DEVICE_CPU:
+                total_cpu_mem_time_component_s += memory_component_s
+                total_cpu_mem_service_time_component_s += mem_service_time_s
+                total_cpu_mem_queue_delay_component_s += mem_queue_delay_s
+                if cpu_mem_bound_mode == "latency_limited":
+                    total_cpu_mem_latency_bound_time_component_s += memory_component_s
+                else:
+                    total_cpu_mem_peak_bound_time_component_s += memory_component_s
+            else:
+                total_pim_mem_time_component_s += memory_component_s
+                total_pim_mem_service_time_component_s += mem_service_time_s
+                total_pim_mem_queue_delay_component_s += mem_queue_delay_s
+
+        t_start, t_end, wait_s, slot = _schedule_pool_event(
+            pool=compute_pools[stage_id - 1],
+            t_req=t_cursor,
+            duration_s=duration_s,
+        )
+        _trace_event(
+            tile_id=tile_id,
+            stage_id=stage_id,
+            op_type="COMPUTE",
+            bytes_value=bytes_in,
+            t_req=t_cursor,
+            t_start=t_start,
+            t_end=t_end,
+            wait_s=wait_s,
+            duration_s=duration_s,
+            stage_name=stage_name,
+            stage_device=stage_device,
+            transfer_path="",
+            resource_name=compute_pools[stage_id - 1].name,
+            resource_slot=slot,
+            compute_component_s=compute_component_s,
+            memory_component_s=memory_component_s,
+            bytes_touched=bytes_touched,
+            cpu_access_pattern=cpu_access_pattern,
+            cpu_row_hit_rate=cpu_row_hit_rate,
+            cpu_mlp=cpu_mlp,
+            cpu_avg_miss_latency_ns=cpu_avg_miss_latency_ns,
+            cpu_bw_peak_Bps=cpu_bw_peak_Bps,
+            cpu_bw_latency_Bps=cpu_bw_latency_Bps,
+            cpu_bw_eff_stage_Bps=cpu_bw_eff_stage_Bps,
+            cpu_bw_eff_per_unit_Bps=cpu_bw_eff_per_unit_Bps,
+            cpu_mem_bound_mode=cpu_mem_bound_mode,
+            memory_system_role=memory_system_role,
+            mem_service_Bps=mem_service_Bps,
+            mem_queue_multiplier=mem_queue_multiplier,
+            mem_rho=mem_rho,
+            mem_service_time_s=mem_service_time_s,
+            mem_queue_delay_s=mem_queue_delay_s,
+            stage_src_endpoint=stage_src_endpoint,
+            stage_dst_endpoint=stage_src_endpoint,
+            domain_in_id=boundary_domains[stage_id - 1].domain_id,
+            domain_out_id=boundary_domains[stage_id].domain_id,
+            domain_in_tile_id=tile_id,
+            domain_out_tile_id=tile_id,
+            mapping_type=sources.MAPPING_IDENTITY,
+            kernel_class=kernel_class,
+            pim_mode=pim_mode,
+            pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+            pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+            pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+        )
+        t_cursor = t_end
+
+        if (
+            scenario in set(cpu_baseline_cfg.materialization_policy.scenarios)
+            and stage_id in set(cpu_baseline_cfg.materialization_policy.boundaries_by_engine.get(cpu_baseline_engine, []))
+            and stage_id < num_stages
+        ):
+            mat_duration = materialize_duration_s(
+                bytes_moved=bytes_out,
+                materialize_Bps=cpu_baseline_cfg.materialization_policy.materialize_Bps,
+                fixed_s=cpu_baseline_cfg.materialization_policy.fixed_s,
+            )
+            t_m_start, t_m_end, m_wait_s, m_slot = _schedule_pool_event(
+                pool=cpu_materialize_pool,
+                t_req=t_cursor,
+                duration_s=mat_duration,
+            )
+            total_cpu_materialize_bytes += bytes_out
+            total_cpu_materialize_time_component_s += mat_duration
+            _trace_event(
+                tile_id=tile_id,
+                stage_id=stage_id,
+                op_type="MATERIALIZE",
+                bytes_value=bytes_out,
+                t_req=t_cursor,
+                t_start=t_m_start,
+                t_end=t_m_end,
+                wait_s=m_wait_s,
+                duration_s=mat_duration,
+                stage_name=stage_name,
+                stage_device=stage_device,
+                transfer_path="cpu_materialize",
+                resource_name=cpu_materialize_pool.name,
+                resource_slot=m_slot,
+                stage_src_endpoint=stage_src_endpoint,
+                stage_dst_endpoint=stage_src_endpoint,
+                domain_in_id=boundary_domains[stage_id].domain_id,
+                domain_out_id=boundary_domains[stage_id].domain_id,
+                domain_in_tile_id=tile_id,
+                domain_out_tile_id=tile_id,
+                mapping_type=sources.MAPPING_IDENTITY,
+                kernel_class=kernel_class,
+                pim_mode=pim_mode,
+                pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+            )
+            t_cursor = t_m_end
+
+        if stage_id == num_stages:
+            terminal_end = t_cursor
+            if stage_device == sources.DEVICE_PIM:
+                d2h_duration = transfer_duration_s(
+                    bytes_moved=bytes_out,
+                    link_type=host_d2h_link,
+                    links_catalog=link_catalog,
+                )
+                t_tr_start, t_tr_end, tr_wait_s, tr_slot = _schedule_pool_event(
+                    pool=host_d2h_pool,
+                    t_req=t_cursor,
+                    duration_s=d2h_duration,
+                )
+                total_bytes_host_link += bytes_out
+                total_bytes_host_d2h += bytes_out
+                _trace_event(
+                    tile_id=tile_id,
+                    stage_id=stage_id,
+                    op_type="TRANSFER",
+                    bytes_value=bytes_out,
+                    t_req=t_cursor,
+                    t_start=t_tr_start,
+                    t_end=t_tr_end,
+                    wait_s=tr_wait_s,
+                    duration_s=d2h_duration,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    transfer_path="host_d2h",
+                    resource_name=host_d2h_pool.name,
+                    resource_slot=tr_slot,
+                    link_type=host_d2h_link,
+                    stage_src_endpoint=stage_src_endpoint,
+                    stage_dst_endpoint="host0",
+                    domain_in_id=boundary_domains[stage_id].domain_id,
+                    domain_out_id=boundary_domains[stage_id].domain_id,
+                    domain_in_tile_id=tile_id,
+                    domain_out_tile_id=tile_id,
+                    mapping_type=sources.MAPPING_IDENTITY,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                )
+                terminal_end = t_tr_end
+            makespan_s = max(makespan_s, terminal_end)
+            completed_terminal_items += 1
+            if tiling_cfg.admission_refill_policy == "pipeline_complete":
+                _admit_next_input(terminal_end)
+            continue
+
+        boundary_idx = stage_id
+        mapping = boundary_mappings[boundary_idx]
+        src_device = stage_devices[stage_id - 1]
+        dst_device = stage_devices[stage_id]
+        src_endpoint = stage_endpoints[stage_id - 1]
+        dst_endpoint = stage_endpoints[stage_id]
+        domain_in_id = boundary_domains[boundary_idx - 1].domain_id
+        domain_out_id = boundary_domains[boundary_idx].domain_id
+        contributions = _mapping_contributions_for_producer(
+            spec=mapping,
+            producer_tile_id=tile_id,
+            producer_tile_count=boundary_domains[boundary_idx - 1].tile_count,
+            consumer_tile_count=boundary_domains[boundary_idx].tile_count,
+            producer_bytes_out=bytes_out,
+            src_stage_cfg=stage_cfg,
+        )
+
+        for consumer_id, contribution_bytes in contributions:
+            t_contrib_req = t_cursor
+            if src_device == sources.DEVICE_CPU and dst_device == sources.DEVICE_CPU:
+                _handle_boundary_arrival(
+                    boundary_idx=boundary_idx,
+                    consumer_id=consumer_id,
+                    bytes_in_value=contribution_bytes,
+                    t_arrival=t_contrib_req,
+                    producer_tile_id=tile_id,
+                    stage_id=stage_id,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    mapping=mapping,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                )
+                continue
+
+            if src_device == sources.DEVICE_CPU and dst_device == sources.DEVICE_PIM:
+                skip_first = ingress_resident and tile_id not in ingress_skip_seen
+                if skip_first:
+                    ingress_skip_seen.add(tile_id)
+                    _handle_boundary_arrival(
+                        boundary_idx=boundary_idx,
+                        consumer_id=consumer_id,
+                        bytes_in_value=contribution_bytes,
+                        t_arrival=t_contrib_req,
+                        producer_tile_id=tile_id,
+                        stage_id=stage_id,
+                        stage_name=stage_name,
+                        stage_device=stage_device,
+                        mapping=mapping,
+                        kernel_class=kernel_class,
+                        pim_mode=pim_mode,
+                        pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                        pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                        pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                        domain_in_id=domain_in_id,
+                        domain_out_id=domain_out_id,
+                    )
+                    continue
+                h2d_duration = transfer_duration_s(
+                    bytes_moved=contribution_bytes,
+                    link_type=host_h2d_link,
+                    links_catalog=link_catalog,
+                )
+                t_tr_start, t_tr_end, tr_wait_s, tr_slot = _schedule_pool_event(
+                    pool=host_h2d_stage_pool,
+                    t_req=t_contrib_req,
+                    duration_s=h2d_duration,
+                )
+                total_bytes_host_link += contribution_bytes
+                total_bytes_host_h2d_stage += contribution_bytes
+                _trace_event(
+                    tile_id=tile_id,
+                    stage_id=stage_id + 1,
+                    op_type="TRANSFER",
+                    bytes_value=contribution_bytes,
+                    t_req=t_contrib_req,
+                    t_start=t_tr_start,
+                    t_end=t_tr_end,
+                    wait_s=tr_wait_s,
+                    duration_s=h2d_duration,
+                    stage_name=stage_names[stage_id],
+                    stage_device=dst_device,
+                    transfer_path="host_h2d_stage",
+                    resource_name=host_h2d_stage_pool.name,
+                    resource_slot=tr_slot,
+                    link_type=host_h2d_link,
+                    stage_src_endpoint="host0",
+                    stage_dst_endpoint=dst_endpoint,
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                    domain_in_tile_id=tile_id,
+                    domain_out_tile_id=consumer_id,
+                    mapping_type=mapping.mapping_type,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                )
+                _handle_boundary_arrival(
+                    boundary_idx=boundary_idx,
+                    consumer_id=consumer_id,
+                    bytes_in_value=contribution_bytes,
+                    t_arrival=t_tr_end,
+                    producer_tile_id=tile_id,
+                    stage_id=stage_id,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    mapping=mapping,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                )
+                continue
+
+            if src_device == sources.DEVICE_PIM and dst_device == sources.DEVICE_CPU:
+                d2h_duration = transfer_duration_s(
+                    bytes_moved=contribution_bytes,
+                    link_type=host_d2h_link,
+                    links_catalog=link_catalog,
+                )
+                t_tr_start, t_tr_end, tr_wait_s, tr_slot = _schedule_pool_event(
+                    pool=host_d2h_pool,
+                    t_req=t_contrib_req,
+                    duration_s=d2h_duration,
+                )
+                total_bytes_host_link += contribution_bytes
+                total_bytes_host_d2h += contribution_bytes
+                _trace_event(
+                    tile_id=tile_id,
+                    stage_id=stage_id,
+                    op_type="TRANSFER",
+                    bytes_value=contribution_bytes,
+                    t_req=t_contrib_req,
+                    t_start=t_tr_start,
+                    t_end=t_tr_end,
+                    wait_s=tr_wait_s,
+                    duration_s=d2h_duration,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    transfer_path="host_d2h",
+                    resource_name=host_d2h_pool.name,
+                    resource_slot=tr_slot,
+                    link_type=host_d2h_link,
+                    stage_src_endpoint=src_endpoint,
+                    stage_dst_endpoint="host0",
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                    domain_in_tile_id=tile_id,
+                    domain_out_tile_id=consumer_id,
+                    mapping_type=mapping.mapping_type,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                )
+                _handle_boundary_arrival(
+                    boundary_idx=boundary_idx,
+                    consumer_id=consumer_id,
+                    bytes_in_value=contribution_bytes,
+                    t_arrival=t_tr_end,
+                    producer_tile_id=tile_id,
+                    stage_id=stage_id,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    mapping=mapping,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                )
+                continue
+
+            # PIM->PIM
+            retain_allowed = (
+                pim_retention.enabled
+                and pim_retention.same_endpoint_short_circuit
+                and scenario in pim_retention.applies_to_scenarios
+                and src_endpoint == dst_endpoint
+            )
+            retention_capacity_blocked = False
+            if retain_allowed:
+                boundary_total_bytes = int(scaled_boundaries[boundary_idx])
+                if boundary_total_bytes <= pim_retention.pim_retention_capacity_bytes:
+                    retain_duration = retain_duration_s(
+                        retain_fixed_s=pim_retention.retain_fixed_s,
+                        retain_metadata_bytes=pim_retention.retain_metadata_bytes,
+                        retain_local_BW_Bps=pim_retention.retain_local_BW_Bps,
+                    )
+                    retain_pool = retain_pools[src_endpoint]
+                    t_rt_start, t_rt_end, rt_wait_s, rt_slot = _schedule_pool_event(
+                        pool=retain_pool,
+                        t_req=t_contrib_req,
+                        duration_s=retain_duration,
+                    )
+                    total_bytes_pim_retained += contribution_bytes
+                    total_retain_handoff_time_component_s += retain_duration
+                    _trace_event(
+                        tile_id=tile_id,
+                        stage_id=stage_id,
+                        op_type="PIM_HANDOFF",
+                        bytes_value=contribution_bytes,
+                        t_req=t_contrib_req,
+                        t_start=t_rt_start,
+                        t_end=t_rt_end,
+                        wait_s=rt_wait_s,
+                        duration_s=retain_duration,
+                        stage_name=stage_name,
+                        stage_device=stage_device,
+                        transfer_path="retain",
+                        resource_name=retain_pool.name,
+                        resource_slot=rt_slot,
+                        stage_src_endpoint=src_endpoint,
+                        stage_dst_endpoint=dst_endpoint,
+                        handoff_mode="retain",
+                        domain_in_id=domain_in_id,
+                        domain_out_id=domain_out_id,
+                        domain_in_tile_id=tile_id,
+                        domain_out_tile_id=consumer_id,
+                        mapping_type=mapping.mapping_type,
+                        kernel_class=kernel_class,
+                        pim_mode=pim_mode,
+                        pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                        pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                        pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                    )
+                    _handle_boundary_arrival(
+                        boundary_idx=boundary_idx,
+                        consumer_id=consumer_id,
+                        bytes_in_value=contribution_bytes,
+                        t_arrival=t_rt_end,
+                        producer_tile_id=tile_id,
+                        stage_id=stage_id,
+                        stage_name=stage_name,
+                        stage_device=stage_device,
+                        mapping=mapping,
+                        kernel_class=kernel_class,
+                        pim_mode=pim_mode,
+                        pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                        pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                        pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                        domain_in_id=domain_in_id,
+                        domain_out_id=domain_out_id,
+                    )
+                    continue
+                retention_capacity_blocked = True
+                total_retain_fallback_bytes += contribution_bytes
+
+            if scenario == sources.SCENARIO_PIM_HOST_BOUNCE:
+                d2h_duration = transfer_duration_s(
+                    bytes_moved=contribution_bytes,
+                    link_type=host_d2h_link,
+                    links_catalog=link_catalog,
+                )
+                touch_duration = host_touch_duration_s(
+                    bytes_moved=contribution_bytes,
+                    touch_Bps=stage_cfg.host_touch_Bps,
+                    touch_fixed_s=stage_cfg.host_touch_fixed_s,
+                )
+                h2d_duration = transfer_duration_s(
+                    bytes_moved=contribution_bytes,
+                    link_type=host_h2d_link,
+                    links_catalog=link_catalog,
+                )
+                t_d2h_s, t_d2h_e, d2h_wait, d2h_slot = _schedule_pool_event(
+                    pool=host_d2h_pool,
+                    t_req=t_contrib_req,
+                    duration_s=d2h_duration,
+                )
+                t_touch_s, t_touch_e, touch_wait, touch_slot = _schedule_pool_event(
+                    pool=host_touch_pool,
+                    t_req=t_d2h_e,
+                    duration_s=touch_duration,
+                )
+                t_h2d_s, t_h2d_e, h2d_wait, h2d_slot = _schedule_pool_event(
+                    pool=host_h2d_stage_pool,
+                    t_req=t_touch_e,
+                    duration_s=h2d_duration,
+                )
+                total_bytes_host_link += contribution_bytes * 2
+                total_bytes_host_d2h += contribution_bytes
+                total_bytes_host_h2d_stage += contribution_bytes
+                total_bytes_host_touch += contribution_bytes
+                _trace_event(
+                    tile_id=tile_id,
+                    stage_id=stage_id,
+                    op_type="TRANSFER",
+                    bytes_value=contribution_bytes,
+                    t_req=t_contrib_req,
+                    t_start=t_d2h_s,
+                    t_end=t_d2h_e,
+                    wait_s=d2h_wait,
+                    duration_s=d2h_duration,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    transfer_path="host_d2h",
+                    resource_name=host_d2h_pool.name,
+                    resource_slot=d2h_slot,
+                    link_type=host_d2h_link,
+                    stage_src_endpoint=src_endpoint,
+                    stage_dst_endpoint="host0",
+                    handoff_mode="transfer_bounce",
+                    retention_capacity_blocked=retention_capacity_blocked,
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                    domain_in_tile_id=tile_id,
+                    domain_out_tile_id=consumer_id,
+                    mapping_type=mapping.mapping_type,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                )
+                _trace_event(
+                    tile_id=tile_id,
+                    stage_id=stage_id,
+                    op_type="HOST_TOUCH",
+                    bytes_value=contribution_bytes,
+                    t_req=t_d2h_e,
+                    t_start=t_touch_s,
+                    t_end=t_touch_e,
+                    wait_s=touch_wait,
+                    duration_s=touch_duration,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    transfer_path="host_touch",
+                    resource_name=host_touch_pool.name,
+                    resource_slot=touch_slot,
+                    stage_src_endpoint="host0",
+                    stage_dst_endpoint="host0",
+                    handoff_mode="transfer_bounce",
+                    retention_capacity_blocked=retention_capacity_blocked,
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                    domain_in_tile_id=tile_id,
+                    domain_out_tile_id=consumer_id,
+                    mapping_type=mapping.mapping_type,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                )
+                _trace_event(
+                    tile_id=tile_id,
+                    stage_id=stage_id + 1,
+                    op_type="TRANSFER",
+                    bytes_value=contribution_bytes,
+                    t_req=t_touch_e,
+                    t_start=t_h2d_s,
+                    t_end=t_h2d_e,
+                    wait_s=h2d_wait,
+                    duration_s=h2d_duration,
+                    stage_name=stage_names[stage_id],
+                    stage_device=dst_device,
+                    transfer_path="host_h2d_stage",
+                    resource_name=host_h2d_stage_pool.name,
+                    resource_slot=h2d_slot,
+                    link_type=host_h2d_link,
+                    stage_src_endpoint="host0",
+                    stage_dst_endpoint=dst_endpoint,
+                    handoff_mode="transfer_bounce",
+                    retention_capacity_blocked=retention_capacity_blocked,
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                    domain_in_tile_id=tile_id,
+                    domain_out_tile_id=consumer_id,
+                    mapping_type=mapping.mapping_type,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                )
+                _handle_boundary_arrival(
+                    boundary_idx=boundary_idx,
+                    consumer_id=consumer_id,
+                    bytes_in_value=contribution_bytes,
+                    t_arrival=t_h2d_e,
+                    producer_tile_id=tile_id,
+                    stage_id=stage_id,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    mapping=mapping,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                )
+            else:
+                u_out = min(
+                    1.0,
+                    float(cxl_direct_concurrency.dma_outstanding_per_vc)
+                    / float(cxl_direct_concurrency.full_bw_outstanding_threshold),
+                )
+                issue_overhead_s = cxl_direct_concurrency.dma_issue_fixed_s / max(u_out, 1e-6)
+                ready_t = t_contrib_req + float(cxl_link["latency_s"]) + issue_overhead_s
+                total_cxl_dma_issue_time_component_s += issue_overhead_s
+                pending_id = next_pending_direct_id
+                next_pending_direct_id += 1
+                pending_direct_transfers[pending_id] = {
+                    "ready_t": ready_t,
+                    "t_req": t_contrib_req,
+                    "bytes": contribution_bytes,
+                    "producer_tile_id": tile_id,
+                    "consumer_id": consumer_id,
+                    "boundary_idx": boundary_idx,
+                    "stage_id": stage_id,
+                    "stage_name": stage_name,
+                    "stage_device": stage_device,
+                    "stage_src_endpoint": src_endpoint,
+                    "stage_dst_endpoint": dst_endpoint,
+                    "retention_capacity_blocked": retention_capacity_blocked,
+                    "cxl_issue_overhead_s": issue_overhead_s,
+                    "cxl_striping_factor": cxl_striping_factor,
+                    "domain_in_id": domain_in_id,
+                    "domain_out_id": domain_out_id,
+                    "domain_in_tile_id": tile_id,
+                    "domain_out_tile_id": consumer_id,
+                    "mapping_type": mapping.mapping_type,
+                    "kernel_class": kernel_class,
+                    "glue_type": "",
+                    "barrier_wait_s": 0.0,
+                    "aggregation_expected": boundary_states[boundary_idx][consumer_id].expected_count,
+                    "aggregation_received": boundary_states[boundary_idx][consumer_id].received_count,
+                    "pim_mode": pim_mode,
+                    "pim_mode_compute_multiplier": pim_mode_compute_multiplier,
+                    "pim_mode_mem_multiplier": pim_mode_mem_multiplier,
+                    "pim_mode_command_overhead_s": pim_mode_command_overhead_s,
+                }
+                heapq.heappush(direct_request_heap, (ready_t, pending_id))
+
+        if tiling_cfg.admission_refill_policy == "stage0_output" and stage_id == 1:
+            _admit_next_input(t_cursor)
+
+    if active_direct_transfers:
+        raise AssertionError("direct transfer state left active at simulation end")
+    cxl_direct_pool.busy_time_s = cxl_processor_scheduler.busy_slot_time_s
+
+    compute_energy_J = sum(pool.busy_time_s * pool.power_W for pool in compute_pools)
+    compute_energy_J += cpu_materialize_pool.busy_time_s * cpu_materialize_pool.power_W
+    compute_energy_J += glue_cpu_pool.busy_time_s * glue_cpu_pool.power_W
+    compute_energy_J += glue_pim_pool.busy_time_s * glue_pim_pool.power_W
+    cpu_materialize_energy_J = cpu_materialize_pool.busy_time_s * cpu_materialize_pool.power_W
+    host_touch_energy_J = host_touch_pool.busy_time_s * host_touch_pool.power_W
+    transfer_energy_J = (
+        host_h2d_ingress_pool.busy_time_s * host_h2d_ingress_pool.power_W
+        + host_h2d_stage_pool.busy_time_s * host_h2d_stage_pool.power_W
+        + host_d2h_pool.busy_time_s * host_d2h_pool.power_W
+        + cxl_direct_pool.busy_time_s * cxl_direct_pool.power_W
+        + host_touch_energy_J
+    )
+    total_energy_J = compute_energy_J + transfer_energy_J
+
+    compute_lbs = [_pool_lower_bound_s(pool) for pool in compute_pools]
+    compute_lbs.append(_pool_lower_bound_s(cpu_materialize_pool))
+    lb_compute_stage_max_s = max(compute_lbs) if compute_lbs else 0.0
+    lb_glue_s = max(_pool_lower_bound_s(glue_cpu_pool), _pool_lower_bound_s(glue_pim_pool))
+    lb_host_h2d_ingress_s = _pool_lower_bound_s(host_h2d_ingress_pool)
+    lb_host_h2d_stage_s = _pool_lower_bound_s(host_h2d_stage_pool)
+    lb_host_d2h_s = _pool_lower_bound_s(host_d2h_pool)
+    lb_host_link_s = max(lb_host_h2d_ingress_s, lb_host_h2d_stage_s, lb_host_d2h_s)
+    lb_host_touch_s = _pool_lower_bound_s(host_touch_pool)
+    lb_cxl_direct_s = _pool_lower_bound_s(cxl_direct_pool)
+    dominant_candidates = [
+        ("compute_stage_max", lb_compute_stage_max_s),
+        ("host_link", lb_host_link_s),
+        ("host_touch", lb_host_touch_s),
+        ("cxl_direct", lb_cxl_direct_s),
+        ("glue", lb_glue_s),
+    ]
+    dominant_lb_component = sorted(dominant_candidates, key=lambda item: item[1], reverse=True)[0][0]
+
+    metrics_row: Dict[str, object] = {
+        "run_id": run_id,
+        "dataset_profile": dataset_profile,
+        "stage_size_multiplier": size_multiplier,
+        "scenario": scenario,
+        "num_stages": num_public_stages,
+        "num_kernels": num_stages,
+        "num_tiles": num_input_tiles,
+        "makespan_s": makespan_s,
+        "total_energy_J": total_energy_J,
+        "compute_energy_J": compute_energy_J,
+        "transfer_energy_J": transfer_energy_J,
+        "host_touch_energy_J": host_touch_energy_J,
+        "cpu_materialize_energy_J": cpu_materialize_energy_J,
+        "total_bytes_host_link": total_bytes_host_link,
+        "total_bytes_cxl_direct": total_bytes_cxl_direct,
+        "total_bytes_host_touch": total_bytes_host_touch,
+        "total_bytes_host_h2d_ingress": total_bytes_host_h2d_ingress,
+        "total_bytes_host_h2d_stage": total_bytes_host_h2d_stage,
+        "total_bytes_host_d2h": total_bytes_host_d2h,
+        "total_bytes_pim_retained": total_bytes_pim_retained,
+        "total_retain_fallback_bytes": total_retain_fallback_bytes,
+        "total_cpu_materialize_bytes": total_cpu_materialize_bytes,
+        "total_bytes_moved": total_bytes_host_link + total_bytes_cxl_direct,
+        "lb_compute_stage_max_s": lb_compute_stage_max_s,
+        "lb_host_h2d_ingress_s": lb_host_h2d_ingress_s,
+        "lb_host_h2d_stage_s": lb_host_h2d_stage_s,
+        "lb_host_d2h_s": lb_host_d2h_s,
+        "lb_host_link_s": lb_host_link_s,
+        "lb_host_touch_s": lb_host_touch_s,
+        "lb_cxl_direct_s": lb_cxl_direct_s,
+        "dominant_lb_component": dominant_lb_component,
+        "pipeline_template": pipeline_template,
+        "workload_family": workload_family,
+        "workload_profile": workload_profile,
+        "workload_variant": workload_variant,
+        "baseline_id": baseline_id,
+        "memory_ceiling_enabled": memory_system_enabled,
+        "cpu_baseline_engine": cpu_baseline_engine,
+        "total_cpu_mem_time_component_s": total_cpu_mem_time_component_s,
+        "total_cpu_mem_latency_bound_time_component_s": total_cpu_mem_latency_bound_time_component_s,
+        "total_cpu_mem_peak_bound_time_component_s": total_cpu_mem_peak_bound_time_component_s,
+        "total_pim_mem_time_component_s": total_pim_mem_time_component_s,
+        "total_cpu_mem_service_time_component_s": total_cpu_mem_service_time_component_s,
+        "total_cpu_mem_queue_delay_component_s": total_cpu_mem_queue_delay_component_s,
+        "total_pim_mem_service_time_component_s": total_pim_mem_service_time_component_s,
+        "total_pim_mem_queue_delay_component_s": total_pim_mem_queue_delay_component_s,
+        "total_compute_time_component_s": total_compute_time_component_s,
+        "total_cpu_materialize_time_component_s": total_cpu_materialize_time_component_s,
+        "total_retain_handoff_time_component_s": total_retain_handoff_time_component_s,
+        "cxl_direct_stream_slots": cxl_direct_stream_slots,
+        "cxl_active_direct_endpoints": active_direct_endpoint_count,
+        "cxl_effective_striping_factor": cxl_striping_factor,
+        "total_cxl_dma_issue_time_component_s": total_cxl_dma_issue_time_component_s,
+        "cxl_bw_model": "processor_share",
+        "retile_enabled": True,
+        "num_tile_domains": len(boundary_domains),
+        "total_glue_copy_bytes": total_glue_copy_bytes,
+        "total_glue_reduce_bytes": total_glue_reduce_bytes,
+        "total_glue_shuffle_bytes": total_glue_shuffle_bytes,
+        "total_glue_time_component_s": total_glue_time_component_s,
+        "total_glue_transfer_time_component_s": total_glue_transfer_time_component_s,
+        "total_barrier_wait_time_component_s": total_barrier_wait_time_component_s,
+        "lb_glue_s": lb_glue_s,
+        "total_pim_mode_command_overhead_s": total_pim_mode_command_overhead_s,
+    }
+    return metrics_row, traces
+
+
+def simulate_configuration(
+    run_id: str,
+    dataset_profile: str,
+    boundaries_bytes: Sequence[int],
+    public_stage_names: Sequence[str],
+    stage_names: Sequence[str],
+    pipeline_template: str,
+    size_multiplier: float,
+    scenario: str,
+    tile_size_bytes: int,
+    max_inflight_tiles: int,
+    host_h2d_link: str,
+    host_d2h_link: str,
+    cxl_direct_link: str,
+    resource_capacity: Dict[str, object],
+    stage_defaults: Dict[str, object],
+    transfer_power_W: Dict[str, object],
+    stage_overrides: Dict[str, Dict[object, Dict[str, object]]],
+    scenario_stage_device_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
+    scenario_stage_endpoint_map_by_template: Mapping[str, Mapping[str, Sequence[str]]],
+    ingress_resident_scenarios_by_template: Mapping[str, Sequence[str]],
+    pim_speedup_vs_cpu_by_stage_by_template: Mapping[str, Mapping[str, object]],
+    cpu_stage_unit_compute_Bps_by_template: Mapping[str, Mapping[str, object]],
+    memory_system_by_template: Mapping[str, Mapping[str, object]],
+    pim_retention: PIMRetentionConfig,
+    cxl_direct_concurrency: CXLDirectConcurrencyConfig,
+    cxl_topology: CXLTopologyConfig,
+    bytes_touched_factors_by_stage_by_template: Mapping[str, Mapping[str, Mapping[str, object]]],
+    pim_mode_by_stage_by_template: Mapping[str, Mapping[str, str]],
+    pim_mode_effects: Mapping[str, PIMModeEffect],
+    tiling_model_by_template: Mapping[str, TilingTemplateConfig],
+    workload_family: str,
+    workload_profile: str,
+    workload_variant: str,
+    baseline_id: str,
+    links_catalog: Mapping[str, Mapping[str, object]] | None = None,
+    trace_max_tiles: int | None = None,
+) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    tiling_cfg = tiling_model_by_template[pipeline_template]
+    if tiling_cfg.enabled:
+        return _simulate_configuration_retile(
+            run_id=run_id,
+            dataset_profile=dataset_profile,
+            boundaries_bytes=boundaries_bytes,
+            public_stage_names=public_stage_names,
+            stage_names=stage_names,
+            pipeline_template=pipeline_template,
+            size_multiplier=size_multiplier,
+            scenario=scenario,
+            tile_size_bytes=tile_size_bytes,
+            max_inflight_tiles=max_inflight_tiles,
+            host_h2d_link=host_h2d_link,
+            host_d2h_link=host_d2h_link,
+            cxl_direct_link=cxl_direct_link,
+            resource_capacity=resource_capacity,
+            stage_defaults=stage_defaults,
+            transfer_power_W=transfer_power_W,
+            stage_overrides=stage_overrides,
+            scenario_stage_device_map_by_template=scenario_stage_device_map_by_template,
+            scenario_stage_endpoint_map_by_template=scenario_stage_endpoint_map_by_template,
+            ingress_resident_scenarios_by_template=ingress_resident_scenarios_by_template,
+            pim_speedup_vs_cpu_by_stage_by_template=pim_speedup_vs_cpu_by_stage_by_template,
+            cpu_stage_unit_compute_Bps_by_template=cpu_stage_unit_compute_Bps_by_template,
+            memory_system_by_template=memory_system_by_template,
+            pim_retention=pim_retention,
+            cxl_direct_concurrency=cxl_direct_concurrency,
+            cxl_topology=cxl_topology,
+            bytes_touched_factors_by_stage_by_template=bytes_touched_factors_by_stage_by_template,
+            pim_mode_by_stage_by_template=pim_mode_by_stage_by_template,
+            pim_mode_effects=pim_mode_effects,
+            tiling_model_by_template=tiling_model_by_template,
+            workload_family=workload_family,
+            workload_profile=workload_profile,
+            workload_variant=workload_variant,
+            baseline_id=baseline_id,
+            links_catalog=links_catalog,
+            trace_max_tiles=trace_max_tiles,
+        )
+    return _simulate_configuration_linear(
+        run_id=run_id,
+        dataset_profile=dataset_profile,
+        boundaries_bytes=boundaries_bytes,
+        public_stage_names=public_stage_names,
+        stage_names=stage_names,
+        pipeline_template=pipeline_template,
+        size_multiplier=size_multiplier,
+        scenario=scenario,
+        tile_size_bytes=tile_size_bytes,
+        max_inflight_tiles=max_inflight_tiles,
+        host_h2d_link=host_h2d_link,
+        host_d2h_link=host_d2h_link,
+        cxl_direct_link=cxl_direct_link,
+        resource_capacity=resource_capacity,
+        stage_defaults=stage_defaults,
+        transfer_power_W=transfer_power_W,
+        stage_overrides=stage_overrides,
+        scenario_stage_device_map_by_template=scenario_stage_device_map_by_template,
+        scenario_stage_endpoint_map_by_template=scenario_stage_endpoint_map_by_template,
+        ingress_resident_scenarios_by_template=ingress_resident_scenarios_by_template,
+        pim_speedup_vs_cpu_by_stage_by_template=pim_speedup_vs_cpu_by_stage_by_template,
+        cpu_stage_unit_compute_Bps_by_template=cpu_stage_unit_compute_Bps_by_template,
+        memory_system_by_template=memory_system_by_template,
+        pim_retention=pim_retention,
+        cxl_direct_concurrency=cxl_direct_concurrency,
+        cxl_topology=cxl_topology,
+        bytes_touched_factors_by_stage_by_template=bytes_touched_factors_by_stage_by_template,
+        pim_mode_by_stage_by_template=pim_mode_by_stage_by_template,
+        pim_mode_effects=pim_mode_effects,
+        tiling_model_by_template=tiling_model_by_template,
+        workload_family=workload_family,
+        workload_profile=workload_profile,
+        workload_variant=workload_variant,
+        baseline_id=baseline_id,
+        links_catalog=links_catalog,
+        trace_max_tiles=trace_max_tiles,
+    )
 
 
 def resolve_variant_configs(
@@ -2811,6 +5068,15 @@ def generate_runs_from_config(
             config=merged_config,
             template_to_stage_names=template_to_stage_names,
         )
+        tiling_model_by_template = _normalize_tiling_model_by_template(
+            config=merged_config,
+            template_to_stage_names=template_to_stage_names,
+        )
+        pim_mode_by_stage_by_template = _normalize_pim_mode_by_stage_by_template(
+            config=merged_config,
+            template_to_stage_names=template_to_stage_names,
+        )
+        pim_mode_effects = _normalize_pim_mode_effects(merged_config)
         pim_retention_cfg = _normalize_pim_retention_config(config=merged_config, warn_defaults=True)
         cxl_direct_concurrency_cfg = _normalize_cxl_direct_concurrency_config(
             config=merged_config,
@@ -2880,6 +5146,9 @@ def generate_runs_from_config(
                         cxl_direct_concurrency=cxl_direct_concurrency_cfg,
                         cxl_topology=cxl_topology_cfg,
                         bytes_touched_factors_by_stage_by_template=bytes_touched_factors_by_stage_by_template,
+                        pim_mode_by_stage_by_template=pim_mode_by_stage_by_template,
+                        pim_mode_effects=pim_mode_effects,
+                        tiling_model_by_template=tiling_model_by_template,
                         workload_family=workload_family,
                         workload_profile=workload_profile,
                         workload_variant=variant_name,

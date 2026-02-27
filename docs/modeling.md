@@ -107,3 +107,28 @@ Metrics include:
 - transfer/retention/topology diagnostics
 - memory service and queue-delay components
 - lower-bound families and `dominant_lb_component`
+
+## Optional Retiling/Glue Layer
+
+When `tiling_model_by_template.<template>.enabled` is true, scheduling switches from a single global
+tile chain to boundary-domain aggregation:
+
+- each boundary has its own tile domain (`domain_id`, tile count, tile bytes)
+- producer contributions are mapped with `IDENTITY`, `GROUP_K_TO_1`, `SPLIT_1_TO_M`, or `REPARTITION_HASH`
+- downstream stage work is released only after mapping readiness and glue completion
+
+Glue ops (`GLUE_COPY`, `GLUE_REDUCE`, `GLUE_SHUFFLE`) run on configured CPU/PIM glue pools.
+Barrier wait is tracked explicitly as the gap between first and last required contribution arrivals
+for each consumer tile.
+
+Defaults keep this layer disabled for both templates to preserve backward comparability.
+
+## PIM Mode-Dependent Parallelism
+
+Per-stage PIM mode (`NONE`, `BANK`, `BANK_GROUP`, `BUFFER`) applies deterministic multipliers to:
+
+- effective compute rate
+- effective memory service bandwidth
+- fixed per-kernel command overhead
+
+CPU stages always use `NONE` semantics.

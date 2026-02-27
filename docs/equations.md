@@ -131,6 +131,44 @@ Streaming admission:
 - initial admitted tiles: `min(K, max_inflight_tiles)`
 - each final tile completion admits exactly one next tile.
 
+Optional retiling model (`tiling_model_by_template.<template>.enabled=true`) replaces global `K`
+with boundary-local tile domains:
+
+\[
+D_b = \{tile\_count_b,\;bytes_{b,t}\}
+\]
+
+Boundary mappings:
+
+- `IDENTITY`: `producer(i) -> consumer(i)`
+- `GROUP_K_TO_1`: `consumer(j)` waits on producers `j*K ... j*K+K-1`
+- `SPLIT_1_TO_M`: producer `i` emits `M` split contributions
+- `REPARTITION_HASH`: each producer contributes to materialized partition consumers
+
+Materialized partition readiness (Level-1):
+
+\[
+ready(partition\ p)\iff received_p = expected_p
+\]
+
+Barrier wait for a consumer tile:
+
+\[
+T_{barrier}=max(0,\;t_{latest\_contrib}-t_{first\_contrib})
+\]
+
+Glue core cost:
+
+\[
+T_{glue}=glue\_fixed + max\left(\frac{bytes_{touched}}{glue\_compute\_Bps},\frac{bytes_{touched}}{glue\_mem\_Bps}\right)
+\]
+
+and optional glue transfer addend:
+
+\[
+T_{glue,total}=T_{glue}+T_{glue,transfer}
+\]
+
 ## 3) Compute And Memory Service
 
 Per stage `s`, tile `k`:
@@ -184,6 +222,18 @@ T_{mem}=\frac{bytes\_touched}{BW_{eff,unit}}
 \]
 \[
 T_{stage}=max(T_{compute},T_{mem})
+\]
+
+PIM mode-dependent adjustment (`NONE`, `BANK`, `BANK_GROUP`, `BUFFER`) for PIM stages:
+
+\[
+R'_{pim,s}=R_{pim,s}\cdot m^{compute}_{mode}
+\]
+\[
+BW'_{pim,s}=BW_{pim,s}\cdot m^{mem}_{mode}
+\]
+\[
+T'_{stage}=T_{stage}+overhead^{cmd}_{mode}
 \]
 
 When memory system is disabled for template: `T_stage = T_compute`.
