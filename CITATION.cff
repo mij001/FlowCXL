@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+title: "FlowCXL-PY.V2"
+message: "If you use this artifact, please cite it using the metadata below."
+type: software
+authors:
+  - family-names: "Inomal"
+    given-names: "M"
+repository-code: "https://github.com/placeholder/FlowCXL-PY.V2"
+abstract: >-
+  FlowCXL-PY.V2 is a pipeline-level simulator for CPU/PIM OLAP and DeepVariant-style
+  workloads with host-bounce vs direct-transfer modeling, validation tooling, and
+  reproducible reporting artifacts.
+keywords:
+  - CXL
+  - PIM
+  - OLAP
+  - DeepVariant
+  - simulation
+license: "MIT"
+version: "v2.2"
+date-released: "2026-03-01"
+doi: "10.0000/PLACEHOLDER-DOI-NONFINAL"
+identifiers:
+  - type: doi
+    value: "10.0000/PLACEHOLDER-DOI-NONFINAL"
+    description: "Placeholder DOI; replace with archival release DOI before final publication."

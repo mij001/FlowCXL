@@ -149,7 +149,7 @@ optional per-kernel command overhead.
 
 - `tools/validation/calibrate_microbench.py`: measured CSV ingest, calibration fit, host-touch derivation/provenance, and overlay generation.
 - `tools/validation/crosscheck_ps.py`: direct-link scheduler cross-check against an independent fluid processor-sharing reference model.
-- `tools/validation/sensitivity.py`: sweep families (`cxl_link`, `pim_speedup`, `tpch_memory`, `energy`), top-8 tornado export, and ablation export.
+- `tools/validation/sensitivity.py`: sweep families (`cxl_link`, `pim_speedup`, `tpch_memory`, `glue_fixed_cost`, `glue_roofline_factor`, `pim_mode_effects_scale`, `energy`), top-8 tornado export, and ablation export.
 - `tools/validation/run_validation.py`: orchestrates calibration + cross-check + sensitivity and writes `validation_summary.yaml`.
 
 ### 2) End-to-End Workflow
@@ -210,7 +210,7 @@ python run.py --config configs/runs.yaml --artifacts-dir artifacts --validation-
 python report.py --config configs/runs.yaml --artifacts-dir artifacts --metrics-file artifacts/metrics.csv
 ```
 
-### 4) Validation Config Schema (validation.\*)
+### 4) Validation Config Schema (validation.*)
 
 ```yaml
 validation:
@@ -248,6 +248,9 @@ validation:
       allow_cited_sweep_only: true
       cited_latency_ns_range: [214, 394]
       cited_bandwidth_GBps_range: [18, 52]
+      cited_switch_latency_ns: 600
+      cited_switch_hop_latency_ns_sweep: [50, 150, 300]
+      cited_switch_bottleneck_factor_sweep: [0.5, 0.75, 1.0]
     payload_bytes: [4194304, 33554432, 268435456]
     concurrency_levels: [1, 2, 4, 8]
     repetitions: 10
@@ -266,7 +269,7 @@ validation:
     tolerance_mape_percent: 5.0
   sensitivity:
     enabled: true
-    families: [cxl_link, pim_speedup, tpch_memory]
+    families: [cxl_link, pim_speedup, tpch_memory, glue_fixed_cost, glue_roofline_factor, pim_mode_effects_scale, energy]
   energy:
     mode: relative_sweep
     power_scale_factors: [0.7, 1.0, 1.3]
@@ -315,6 +318,7 @@ Default sample inputs (for local exercisability):
 ### 6) Calibration Semantics
 
 - Aggregate-first comparison: measured rows are aggregated by `(path,payload_bytes,concurrency)` with `aggregate_stat`.
+- Aggregate output also reports robust percentiles per group: `p50_s`, `p95_s`, `p99_s`.
 - `repetition` is sample-id only and is not used as a join key for prediction.
 - Fit model per path:
   - `T = latency_s + bytes / bandwidth_Bps`
@@ -333,6 +337,8 @@ Default sample inputs (for local exercisability):
 - `measured`: direct path has measured CSV and fitted parameters.
 - `crosscheck_only`: direct path not measured; validated against PS cross-check results. This is validated, not calibrated.
 - `cited_sweep_only`: direct path not measured and treated as cited+sweep envelope only.
+  - Melody envelope defaults: latency `214-394 ns`, bandwidth `18-52 GB/s`.
+  - Switch posture is modeled as additional-latency/bottleneck sweep (default switch latency `~600 ns`).
 
 Only `direct_status=measured` can write direct link overrides into `microbench_overlay.yaml`.
 
@@ -351,7 +357,7 @@ Only `direct_status=measured` can write direct link overrides into `microbench_o
 | Artifact                                       | Producer                  | Purpose                                                    | Key fields                                                                                     | Downstream usage                       |
 | ---------------------------------------------- | ------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------- |
 | `artifacts/validation/microbench_raw.csv`      | `calibrate_microbench.py` | normalized measured rows + per-row predictions             | `measured_s`, `simulated_s`, `error_s`, context columns                                        | audit raw ingestion                    |
-| `artifacts/validation/microbench_agg.csv`      | `calibrate_microbench.py` | aggregate-level measured vs simulated comparison           | `path,payload_bytes,concurrency,sample_count,measured_s,simulated_s`                           | report measured-vs-sim plots           |
+| `artifacts/validation/microbench_agg.csv`      | `calibrate_microbench.py` | aggregate-level measured vs simulated comparison           | `path,payload_bytes,concurrency,sample_count,measured_s,simulated_s,p50_s,p95_s,p99_s`         | report measured-vs-sim plots           |
 | `artifacts/validation/microbench_fit.yaml`     | `calibrate_microbench.py` | fit parameters, statuses, coverage/semantics/sanity audits | `paths`, `direct_status`, `host_touch_source`, `coverage_summary`, `negative_residual_summary` | report tables + audit record           |
 | `artifacts/validation/microbench_overlay.yaml` | `calibrate_microbench.py` | run-time overlay derived from measured host calibration    | `link_constant_overrides`, `stage_defaults`                                                    | input to `run.py --validation-overlay` |
 | `artifacts/validation/cxl_ps_crosscheck.csv`   | `crosscheck_ps.py`        | direct scheduler cross-check evidence                      | `mape_percent`, `passes_tolerance`                                                             | validates `crosscheck_only` posture    |
@@ -404,6 +410,7 @@ Reproducibility note: overlay link overrides are applied via an injected link ca
 
 ### 13) Reproducibility Checklist
 
+- Install pinned dependencies from `requirements.lock.txt`.
 - Set `validation.system_id` for the target machine.
 - Ensure measured CSVs exist and satisfy schema/policy.
 - Run full validation pipeline.
@@ -420,6 +427,8 @@ Reproducibility note: overlay link overrides are applied via an injected link ca
 - Run simulation with `--validation-overlay`.
 - Regenerate report and inspect the validation appendix.
 - Cross-check claims against `paper/CLAIMS.md`.
+- Use `ARTIFACT.md` for Figure/Table -> Command -> Output mapping.
+- Use `CITATION.cff` metadata for archival citation (placeholder DOI must be replaced for final release).
 
 ## Tests
 

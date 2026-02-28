@@ -364,6 +364,9 @@ g=(path,\ payload,\ concurrency)
 T^{measured}_{g}=Agg\left(\{time\_s\}_{g}\right),\quad Agg\in\{median,mean\}
 \]
 \[
+p50_g=Q_{0.50}(\{time_s\}_g),\quad p95_g=Q_{0.95}(\{time_s\}_g),\quad p99_g=Q_{0.99}(\{time_s\}_g)
+\]
+\[
 error_g = T^{measured}_g - T^{sim}_g
 \]
 \[
@@ -411,6 +414,14 @@ Direct-path provenance status:
 
 \[
 direct\_status \in \{measured,\ crosscheck\_only,\ cited\_sweep\_only\}
+\]
+
+For cited+sweep posture, the envelope is recorded as:
+\[
+latency_{ns}\in[214,394],\quad bandwidth_{GB/s}\in[18,52]
+\]
+\[
+switch\_latency_{ns}\approx 600,\quad hop\_latency\_sweep,\ bottleneck\_factor\_sweep \text{ configured}
 \]
 
 Cross-check acceptance compares direct scheduler MAPE against configured tolerance.

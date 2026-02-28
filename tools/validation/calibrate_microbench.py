@@ -441,9 +441,20 @@ def _build_aggregated_rows(
     aggregate_stat: str,
     config: Dict[str, object],
 ) -> pd.DataFrame:
-    grouped = measured_df.groupby(["path", "payload_bytes", "concurrency"], as_index=False).agg(
-        sample_count=("measured_s", "size"),
-        measured_s=("measured_s", lambda values: _aggregate_series(values, aggregate_stat)),
+    grouped = (
+        measured_df.groupby(["path", "payload_bytes", "concurrency"])["measured_s"]
+        .agg(
+            sample_count="size",
+            mean_s="mean",
+            p50_s=lambda s: float(s.quantile(0.50)),
+            p95_s=lambda s: float(s.quantile(0.95)),
+            p99_s=lambda s: float(s.quantile(0.99)),
+        )
+        .reset_index()
+    )
+    grouped["measured_s"] = grouped.apply(
+        lambda row: float(row["p50_s"]) if aggregate_stat == "median" else float(row["mean_s"]),
+        axis=1,
     )
     grouped = grouped.sort_values(["path", "payload_bytes", "concurrency"]).reset_index(drop=True)
     grouped["simulated_s"] = grouped.apply(
@@ -673,6 +684,7 @@ def _compute_host_touch_sanity(
         "source": host_touch_source,
         "ratio_min": ratio_min,
         "ratio_max": ratio_max,
+        "stream_methodology_note": "STREAM guidance: arrays >= 4x LLC sum (or >=1M elements).",
         "reference_source": "",
         "reference_bandwidth_Bps": None,
         "derived_bandwidth_Bps": float(host_touch_fit["host_touch_Bps"]),
@@ -864,6 +876,7 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
         "coverage_summary": coverage_summary,
         "measurement_semantics_summary": semantics_summary,
         "negative_residual_summary": {},
+        "direct_status_note": "",
         "overlay": {},
     }
 
@@ -984,6 +997,27 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
         raise ValueError(f"ceiling check violation for paths: {violations}")
 
     fit["direct_provenance_policy"] = dict(cal_cfg["direct_provenance_policy"])
+    if fit["direct_status"] == "measured":
+        fit["direct_status_note"] = "Direct path measured and calibrated from measured CSV."
+    elif fit["direct_status"] == "crosscheck_only":
+        fit["direct_status_note"] = (
+            "Direct path unmeasured; validated via processor-share cross-check and not calibrated."
+        )
+    elif fit["direct_status"] == "cited_sweep_only":
+        fit["direct_status_note"] = (
+            "Direct path unmeasured; treated as cited+swept envelope (Melody latency/BW range)."
+        )
+    fit["direct_cited_envelope"] = {
+        "latency_ns_range": list(cal_cfg["direct_provenance_policy"]["cited_latency_ns_range"]),
+        "bandwidth_GBps_range": list(cal_cfg["direct_provenance_policy"]["cited_bandwidth_GBps_range"]),
+        "switch_latency_ns": float(cal_cfg["direct_provenance_policy"]["cited_switch_latency_ns"]),
+        "switch_hop_latency_ns_sweep": list(
+            cal_cfg["direct_provenance_policy"]["cited_switch_hop_latency_ns_sweep"]
+        ),
+        "switch_bottleneck_factor_sweep": list(
+            cal_cfg["direct_provenance_policy"]["cited_switch_bottleneck_factor_sweep"]
+        ),
+    }
 
     link_profile = config["link_profile"]
     direct_link_id = str(link_profile["cxl_direct_link"])

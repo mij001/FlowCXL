@@ -3425,6 +3425,9 @@ def _simulate_configuration_linear(
         "total_glue_transfer_time_component_s": 0.0,
         "total_barrier_dependency_wait_time_component_s": 0.0,
         "total_glue_queue_wait_time_component_s": 0.0,
+        "barrier_wait_mass_s": 0.0,
+        "barrier_wait_critical_path_s": 0.0,
+        "barrier_wait_mean_s": 0.0,
         "total_barrier_wait_time_component_s": 0.0,
         "lb_glue_s": 0.0,
         "total_pim_mode_command_overhead_s": total_pim_mode_command_overhead_s,
@@ -3506,11 +3509,18 @@ def _simulate_configuration_retile(
         tiling_cfg=tiling_cfg,
         stage_configs=stage_configs,
     )
+    def _mapping_needs_glue(spec: BoundaryMappingSpec) -> bool:
+        return (
+            spec.mapping_type != sources.MAPPING_IDENTITY
+            or spec.glue_fixed_s > 0.0
+            or spec.glue_transfer_path != "none"
+        )
+
     for boundary_idx, mapping in boundary_mappings.items():
         if tiling_cfg.glue_resource_mode == sources.GLUE_RESOURCE_MODE_SHARED_CONSUMER_COMPUTE:
             consumer_stage_id = boundary_idx + 1
             consumer_device = stage_devices[consumer_stage_id - 1]
-            if mapping.glue_device != consumer_device:
+            if _mapping_needs_glue(mapping) and mapping.glue_device != consumer_device:
                 raise ValueError(
                     f"shared_consumer_compute requires glue_device={consumer_device} for "
                     f"mapping {mapping.transition_key} (mapping_id={mapping.mapping_id})"
@@ -3705,7 +3715,9 @@ def _simulate_configuration_retile(
     total_glue_transfer_time_component_s = 0.0
     total_barrier_dependency_wait_time_component_s = 0.0
     total_glue_queue_wait_time_component_s = 0.0
-    total_barrier_wait_time_component_s = 0.0
+    barrier_wait_mass_s = 0.0
+    barrier_wait_critical_path_s = 0.0
+    barrier_wait_event_count = 0
     mapping_ids_used = sorted({mapping.mapping_id for mapping in boundary_mappings.values()})
 
     def _trace_event(
@@ -3897,17 +3909,15 @@ def _simulate_configuration_retile(
         nonlocal total_glue_copy_bytes, total_glue_reduce_bytes, total_glue_shuffle_bytes
         nonlocal total_barrier_dependency_wait_time_component_s
         nonlocal total_glue_queue_wait_time_component_s
-        nonlocal total_barrier_wait_time_component_s
+        nonlocal barrier_wait_mass_s
+        nonlocal barrier_wait_critical_path_s
+        nonlocal barrier_wait_event_count
 
         barrier_dependency_wait_s = max(0.0, latest_contrib_t - first_contrib_t)
         total_barrier_dependency_wait_time_component_s += barrier_dependency_wait_s
         glue_req_t = latest_contrib_t
         bytes_out = int(boundary_domains[boundary_idx].tile_bytes[consumer_id])
-        need_glue = (
-            mapping.mapping_type != sources.MAPPING_IDENTITY
-            or mapping.glue_fixed_s > 0.0
-            or mapping.glue_transfer_path != "none"
-        )
+        need_glue = _mapping_needs_glue(mapping)
         glue_end_t = glue_req_t
         glue_queue_wait_s = 0.0
         barrier_total_wait_s = barrier_dependency_wait_s
@@ -4034,7 +4044,9 @@ def _simulate_configuration_retile(
         else:
             barrier_total_wait_s = barrier_dependency_wait_s
 
-        total_barrier_wait_time_component_s += barrier_total_wait_s
+        barrier_wait_mass_s += barrier_total_wait_s
+        barrier_wait_critical_path_s = max(barrier_wait_critical_path_s, barrier_total_wait_s)
+        barrier_wait_event_count += 1
         _release_stage_consumer(stage_id=boundary_idx + 1, tile_id=consumer_id, release_t=glue_end_t)
 
     def _handle_boundary_arrival(
@@ -5048,6 +5060,7 @@ def _simulate_configuration_retile(
         lb_glue_s = max(_pool_lower_bound_s(glue_cpu_pool), _pool_lower_bound_s(glue_pim_pool))
     else:
         lb_glue_s = 0.0
+    barrier_wait_mean_s = barrier_wait_mass_s / float(barrier_wait_event_count) if barrier_wait_event_count > 0 else 0.0
     lb_host_h2d_ingress_s = _pool_lower_bound_s(host_h2d_ingress_pool)
     lb_host_h2d_stage_s = _pool_lower_bound_s(host_h2d_stage_pool)
     lb_host_d2h_s = _pool_lower_bound_s(host_d2h_pool)
@@ -5127,7 +5140,10 @@ def _simulate_configuration_retile(
         "total_glue_transfer_time_component_s": total_glue_transfer_time_component_s,
         "total_barrier_dependency_wait_time_component_s": total_barrier_dependency_wait_time_component_s,
         "total_glue_queue_wait_time_component_s": total_glue_queue_wait_time_component_s,
-        "total_barrier_wait_time_component_s": total_barrier_wait_time_component_s,
+        "barrier_wait_mass_s": barrier_wait_mass_s,
+        "barrier_wait_critical_path_s": barrier_wait_critical_path_s,
+        "barrier_wait_mean_s": barrier_wait_mean_s,
+        "total_barrier_wait_time_component_s": barrier_wait_mass_s,
         "lb_glue_s": lb_glue_s,
         "total_pim_mode_command_overhead_s": total_pim_mode_command_overhead_s,
         "mapping_ids_used": "|".join(mapping_ids_used),

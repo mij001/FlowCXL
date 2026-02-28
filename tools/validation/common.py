@@ -238,11 +238,45 @@ def ensure_calibration_config(validation: Mapping[str, object]) -> Dict[str, obj
         raise ValueError(
             "validation.calibration.direct_provenance_policy.cited_bandwidth_GBps_range invalid"
         )
+    cited_switch_latency_ns = float(direct_policy_raw.get("cited_switch_latency_ns", 600.0))
+    if cited_switch_latency_ns <= 0.0:
+        raise ValueError(
+            "validation.calibration.direct_provenance_policy.cited_switch_latency_ns must be > 0"
+        )
+    hop_latency_sweep_raw = direct_policy_raw.get(
+        "cited_switch_hop_latency_ns_sweep",
+        [50.0, 150.0, 300.0],
+    )
+    if not isinstance(hop_latency_sweep_raw, list) or not hop_latency_sweep_raw:
+        raise ValueError(
+            "validation.calibration.direct_provenance_policy.cited_switch_hop_latency_ns_sweep must be a non-empty list"
+        )
+    hop_latency_sweep = [float(v) for v in hop_latency_sweep_raw]
+    if any(v <= 0.0 for v in hop_latency_sweep):
+        raise ValueError(
+            "validation.calibration.direct_provenance_policy.cited_switch_hop_latency_ns_sweep entries must be > 0"
+        )
+    bottleneck_sweep_raw = direct_policy_raw.get(
+        "cited_switch_bottleneck_factor_sweep",
+        [0.5, 0.75, 1.0],
+    )
+    if not isinstance(bottleneck_sweep_raw, list) or not bottleneck_sweep_raw:
+        raise ValueError(
+            "validation.calibration.direct_provenance_policy.cited_switch_bottleneck_factor_sweep must be a non-empty list"
+        )
+    bottleneck_sweep = [float(v) for v in bottleneck_sweep_raw]
+    if any(v <= 0.0 for v in bottleneck_sweep):
+        raise ValueError(
+            "validation.calibration.direct_provenance_policy.cited_switch_bottleneck_factor_sweep entries must be > 0"
+        )
     cal["direct_provenance_policy"] = {
         "allow_crosscheck_only": bool(direct_policy_raw.get("allow_crosscheck_only", True)),
         "allow_cited_sweep_only": bool(direct_policy_raw.get("allow_cited_sweep_only", True)),
         "cited_latency_ns_range": latency_range_f,
         "cited_bandwidth_GBps_range": bandwidth_range_f,
+        "cited_switch_latency_ns": cited_switch_latency_ns,
+        "cited_switch_hop_latency_ns_sweep": hop_latency_sweep,
+        "cited_switch_bottleneck_factor_sweep": bottleneck_sweep,
     }
 
     ceiling_raw = cal.get("ceiling_check", {})

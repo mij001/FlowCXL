@@ -166,7 +166,17 @@ class ValidationPipelineChecks(unittest.TestCase):
 
             with agg_path.open("r", encoding="utf-8", newline="") as handle:
                 agg_cols = csv.DictReader(handle).fieldnames or []
-            for col in ["path", "payload_bytes", "concurrency", "sample_count", "measured_s", "simulated_s"]:
+            for col in [
+                "path",
+                "payload_bytes",
+                "concurrency",
+                "sample_count",
+                "measured_s",
+                "simulated_s",
+                "p50_s",
+                "p95_s",
+                "p99_s",
+            ]:
                 self.assertIn(col, agg_cols)
 
     def test_calibration_requires_measured_inputs_for_required_paths(self) -> None:
@@ -406,6 +416,23 @@ class ValidationPipelineChecks(unittest.TestCase):
             negative = fit_payload.get("negative_residual_summary", {})
             for key in ["policy_mode", "negative_points_count", "affected_paths", "action_applied"]:
                 self.assertIn(key, negative)
+
+    def test_direct_cited_envelope_present(self) -> None:
+        cfg = self._small_config()
+        cfg["validation"]["calibration"]["direct_provenance_policy"]["allow_crosscheck_only"] = False
+        cfg["validation"]["calibration"]["direct_provenance_policy"]["allow_cited_sweep_only"] = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            measured_inputs = self._write_measured_inputs(tmp_path, cfg, include_direct=False)
+            measured_inputs["direct"] = str(tmp_path / "direct_missing.csv")
+            cfg["validation"]["calibration"]["measured_inputs"] = measured_inputs
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            envelope = fit_payload.get("direct_cited_envelope", {})
+            self.assertIn("latency_ns_range", envelope)
+            self.assertIn("bandwidth_GBps_range", envelope)
+            self.assertIn("switch_latency_ns", envelope)
 
     def test_direct_status_measured(self) -> None:
         cfg = self._small_config()
@@ -783,6 +810,20 @@ class ValidationPipelineChecks(unittest.TestCase):
         for snippet in required_snippets:
             self.assertIn(snippet, text)
 
+    def test_artifact_metadata_files_present(self) -> None:
+        artifact_doc = Path("ARTIFACT.md")
+        citation = Path("CITATION.cff")
+        lockfile = Path("requirements.lock.txt")
+        self.assertTrue(artifact_doc.exists())
+        self.assertTrue(citation.exists())
+        self.assertTrue(lockfile.exists())
+        citation_text = citation.read_text(encoding="utf-8")
+        self.assertIn("PLACEHOLDER-DOI-NONFINAL", citation_text)
+        lock_text = lockfile.read_text(encoding="utf-8")
+        self.assertIn("pandas", lock_text.lower())
+        self.assertIn("pyyaml", lock_text.lower())
+        self.assertIn("matplotlib", lock_text.lower())
+
     def test_run_validation_cli_emits_summary_and_overlay(self) -> None:
         import tools.validation.run_validation as run_validation_module
 
@@ -819,6 +860,11 @@ class ValidationPipelineChecks(unittest.TestCase):
 
             self.assertTrue((tmp_path / "validation" / "validation_summary.yaml").exists())
             self.assertTrue((tmp_path / "validation" / "microbench_overlay.yaml").exists())
+            summary = yaml.safe_load(
+                (tmp_path / "validation" / "validation_summary.yaml").read_text(encoding="utf-8")
+            ) or {}
+            self.assertIn("direct_status", summary)
+            self.assertIn("direct_cited_envelope", summary)
 
     def test_paper_config_discovery_and_run_matrix_determinism(self) -> None:
         self.assertTrue(Path("paper/configs/fig_main.yaml").exists())

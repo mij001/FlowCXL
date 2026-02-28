@@ -444,6 +444,9 @@ class SimulatorInvariantChecks(unittest.TestCase):
             "total_glue_transfer_time_component_s",
             "total_barrier_dependency_wait_time_component_s",
             "total_glue_queue_wait_time_component_s",
+            "barrier_wait_mass_s",
+            "barrier_wait_critical_path_s",
+            "barrier_wait_mean_s",
             "total_barrier_wait_time_component_s",
             "lb_glue_s",
             "total_pim_mode_command_overhead_s",
@@ -581,8 +584,13 @@ class SimulatorInvariantChecks(unittest.TestCase):
         row = metrics[0]
         total_dep = float(row["total_barrier_dependency_wait_time_component_s"])
         total_queue = float(row["total_glue_queue_wait_time_component_s"])
+        mass = float(row["barrier_wait_mass_s"])
+        critical = float(row["barrier_wait_critical_path_s"])
+        mean = float(row["barrier_wait_mean_s"])
         total_bar = float(row["total_barrier_wait_time_component_s"])
         self.assertAlmostEqual(total_dep + total_queue, total_bar, places=6)
+        self.assertAlmostEqual(total_bar, mass, places=6)
+        self.assertGreaterEqual(critical, mean)
         glue_rows = [t for t in traces if str(t["op_type"]).startswith("GLUE_")]
         self.assertTrue(glue_rows)
         for gr in glue_rows:
@@ -591,6 +599,9 @@ class SimulatorInvariantChecks(unittest.TestCase):
             total = float(gr["barrier_total_wait_s"])
             self.assertAlmostEqual(dep + q, total, places=6)
             self.assertAlmostEqual(float(gr["barrier_wait_s"]), total, places=6)
+        event_waits = [float(gr["barrier_total_wait_s"]) for gr in glue_rows]
+        self.assertAlmostEqual(critical, max(event_waits), places=6)
+        self.assertAlmostEqual(mean, sum(event_waits) / len(event_waits), places=6)
 
     def test_glue_queue_wait_positive_under_resource_contention(self) -> None:
         cfg = copy.deepcopy(self.config)
@@ -662,6 +673,32 @@ class SimulatorInvariantChecks(unittest.TestCase):
         cfg["tiling_model_by_template"]["tpch_3op"]["boundary_mappings"][join_key]["glue_device"] = "cpu"
         with self.assertRaises(ValueError):
             self._run_custom(cfg)
+
+    def test_shared_mode_allows_identity_no_glue_device_mismatch(self) -> None:
+        cfg = copy.deepcopy(self.config)
+        cfg["dataset_profiles"] = [sources.PROFILE_DV_ILLUMINA_WGS_30X]
+        cfg["workload_sweep"] = {
+            "tpch_profiles": [],
+            "deepvariant_profiles": [sources.PROFILE_DV_ILLUMINA_WGS_30X],
+        }
+        cfg["workload_variants"] = [{"name": "base", "overrides": {}}]
+        cfg["size_multipliers"] = [1.0]
+        cfg["scenarios"] = [sources.SCENARIO_PIM_FLOWCXL_DIRECT]
+        cfg["tiling_model_by_template"]["deepvariant_3stage"]["enabled"] = True
+        cfg["tiling_model_by_template"]["deepvariant_3stage"]["glue_resource_mode"] = "shared_consumer_compute"
+        # Force identity mappings with mismatched glue_device; should be ignored because no glue is scheduled.
+        stage_names = sources.DATASET_PROFILES[sources.PROFILE_DV_ILLUMINA_WGS_30X]["stage_names"]
+        boundary_map = {}
+        for idx in range(1, len(stage_names)):
+            key = f"{stage_names[idx - 1]}->{stage_names[idx]}"
+            boundary_map[key] = {
+                "mapping_id": f"identity_{idx}",
+                "mapping_type": "IDENTITY",
+                "glue_device": "pim",
+            }
+        cfg["tiling_model_by_template"]["deepvariant_3stage"]["boundary_mappings"] = boundary_map
+        metrics, _ = self._run_custom(cfg)
+        self.assertTrue(metrics)
 
     def test_retile_disabled_identity_matches_legacy_makespan_within_tolerance(self) -> None:
         cfg_a = copy.deepcopy(self.config)

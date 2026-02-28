@@ -141,6 +141,13 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
         "total_barrier_dependency_wait_time_component_s",
         "total_glue_queue_wait_time_component_s",
         "total_barrier_wait_time_component_s",
+        "barrier_wait_mass_s",
+        "barrier_wait_critical_path_s",
+        "barrier_wait_mean_s",
+        "p50_s",
+        "p95_s",
+        "p99_s",
+        "sample_count",
     ]
     for col in numeric_cols:
         if col in out.columns:
@@ -223,14 +230,27 @@ def _plot_validation_measured_vs_sim(
         subset = raw_df[raw_df["path"] == path_name].copy()
         if subset.empty:
             continue
-        grouped = (
-            subset.groupby("payload_bytes", as_index=False)[["measured_s", "simulated_s"]]
-            .median()
-            .sort_values("payload_bytes")
-        )
         fig, ax = plt.subplots(figsize=(7, 4))
-        ax.plot(grouped["payload_bytes"], grouped["measured_s"], marker="o", label="Measured (median)")
-        ax.plot(grouped["payload_bytes"], grouped["simulated_s"], marker="x", label="Simulated")
+        for conc in sorted(subset["concurrency"].dropna().unique()):
+            grouped = (
+                subset[subset["concurrency"] == conc]
+                .sort_values("payload_bytes")
+            )
+            if grouped.empty:
+                continue
+            ax.plot(
+                grouped["payload_bytes"],
+                grouped["measured_s"],
+                marker="o",
+                label=f"Measured c={int(conc)}",
+            )
+            ax.plot(
+                grouped["payload_bytes"],
+                grouped["simulated_s"],
+                marker="x",
+                linestyle="--",
+                label=f"Simulated c={int(conc)}",
+            )
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xlabel("Payload (bytes)")
@@ -424,6 +444,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "total_glue_transfer_time_component_s",
             "total_barrier_dependency_wait_time_component_s",
             "total_glue_queue_wait_time_component_s",
+            "barrier_wait_mass_s",
+            "barrier_wait_critical_path_s",
+            "barrier_wait_mean_s",
             "total_barrier_wait_time_component_s",
             "lb_glue_s",
             "total_pim_mode_command_overhead_s",
@@ -446,13 +469,32 @@ def main(argv: Sequence[str] | None = None) -> None:
         ablations_path = validation_dir / "ablations.csv"
         fit_payload: Dict[str, object] = {}
 
+        agg_df = pd.DataFrame()
         if agg_path.exists():
             agg_df = pd.read_csv(agg_path)
             validation_plots.extend(_plot_validation_measured_vs_sim(agg_df, report_dir))
+            agg_table_cols = [
+                col
+                for col in [
+                    "path",
+                    "payload_bytes",
+                    "concurrency",
+                    "sample_count",
+                    "measured_s",
+                    "simulated_s",
+                    "p50_s",
+                    "p95_s",
+                    "p99_s",
+                    "error_pct",
+                ]
+                if col in agg_df.columns
+            ]
             validation_sections.append(
                 "### Microbenchmark Calibration (Aggregated)\n\n"
                 f"- Source: `{agg_path}`\n\n"
                 + "\n".join(f"- {p}" for p in validation_plots if "measured_vs_sim" in p)
+                + "\n\n"
+                + _build_markdown_table(_format_metric_fields(agg_df[agg_table_cols].head(24)))
             )
         elif raw_path.exists():
             raw_df = pd.read_csv(raw_path)
@@ -512,6 +554,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             coverage_summary = fit_payload.get("coverage_summary", {}) or {}
             semantics_summary = fit_payload.get("measurement_semantics_summary", {}) or {}
             direct_status = str(fit_payload.get("direct_status", ""))
+            direct_note = str(fit_payload.get("direct_status_note", ""))
             host_touch_df = pd.DataFrame(
                 [
                     {
@@ -599,6 +642,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             else:
                 direct_status_text = f"- Direct status: `{direct_status or 'unknown'}`"
+            cited_env = fit_payload.get("direct_cited_envelope", {}) or {}
+            cited_env_text = ""
+            if direct_status == "cited_sweep_only" and cited_env:
+                cited_env_text = (
+                    "\n- Cited direct envelope: "
+                    f"latency_ns={cited_env.get('latency_ns_range', [])}, "
+                    f"bandwidth_GBps={cited_env.get('bandwidth_GBps_range', [])}, "
+                    f"switch_latency_ns={cited_env.get('switch_latency_ns', '')}, "
+                    f"switch_hop_latency_ns_sweep={cited_env.get('switch_hop_latency_ns_sweep', [])}, "
+                    f"switch_bottleneck_factor_sweep={cited_env.get('switch_bottleneck_factor_sweep', [])}."
+                )
             validation_sections.append(
                 "### Calibration Fit Summary\n\n"
                 f"{_build_markdown_table(_format_metric_fields(fit_df))}\n\n"
@@ -615,7 +669,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"{_build_markdown_table(_format_metric_fields(pd.DataFrame(ceiling_rows)))}\n\n"
                 "- One-way sanity check uses x16 bidirectional vendor-table approximation / 2 with "
                 "configured utilization cap.\n\n"
-                f"{direct_status_text}"
+                f"{direct_status_text}\n"
+                + (f"{direct_note}\n" if direct_note else "")
+                + cited_env_text
             )
         if cross_path.exists():
             cross_df = pd.read_csv(cross_path)

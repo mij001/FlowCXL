@@ -147,6 +147,11 @@ Barrier wait is decomposed and reported explicitly:
 - `barrier_dependency_wait_s` = latest minus first contribution arrival
 - `glue_queue_wait_s` = glue start minus latest contribution arrival
 - `barrier_total_wait_s` = dependency + queue (and `barrier_wait_s` alias for compatibility)
+- run-level barrier diagnostics:
+  - `barrier_wait_mass_s` (sum of barrier wait across released consumers)
+  - `barrier_wait_critical_path_s` (maximum per-consumer barrier wait)
+  - `barrier_wait_mean_s` (average per-consumer barrier wait)
+  - `total_barrier_wait_time_component_s` is retained as compatibility alias to `barrier_wait_mass_s`
 
 `GROUP_K_TO_1` tail rule is deterministic: the last consumer group may be smaller than `group_k`.
 

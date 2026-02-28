@@ -23,6 +23,7 @@ Validation calibration contract:
   - `measured`
   - `crosscheck_only` (validated via PS cross-check; not measured calibrated)
   - `cited_sweep_only` (no measured/crosscheck direct calibration path)
+  - cited+sweep envelope metadata is carried in `direct_cited_envelope` (Melody latency/BW ranges plus switch latency/bottleneck sweeps)
 
 Canonical measured CSV schema per path:
 
@@ -30,6 +31,7 @@ Canonical measured CSV schema per path:
 - `host_touch` required columns: `system_id`, `path=host_touch`, `payload_bytes`, `repetition`, `time_s` (`concurrency` defaults to 1 if omitted)
 - optional measurement semantics columns: `tool`, `numa_policy`, `dma_engine`, `percentile_source`, `timestamp`, `notes`
 - `repetition` is sample-id only; fit/residuals use aggregate groups `(path,payload_bytes,concurrency)`
+- aggregate rows include `sample_count`, `p50_s`, `p95_s`, `p99_s`
 
 ## Outputs
 
@@ -107,6 +109,7 @@ Bounce decomposition derives host-touch fit:
 - `T_touch_est = host_touch_fixed_s + bytes / host_touch_Bps`
 - `host_touch_source` is always explicit: `derived_from_bounce` or `measured_stream`
 - negative residual handling is policy-driven and audited (`drop`, `clamp_to_zero`, `clamp_to_epsilon`)
+- host-touch sanity output includes a STREAM methodology note (`arrays >= 4x LLC sum or >=1M elements`)
 
 PCIe sanity guard can flag suspicious one-way throughput using configured generation/lane width and utilization cap.
 It is a sanity approximation derived from a bidirectional table / 2, not a full throughput model.

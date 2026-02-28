@@ -668,6 +668,30 @@ PARAMETER_PROVENANCE = {
         "note": "PCIe generation/lane-width sanity envelope used to flag suspect measurements.",
         "config_key": "validation.calibration.ceiling_check",
     },
+    "validation.calibration.direct_provenance_policy": {
+        "class": "spec_or_literature_backed",
+        "source": "validation.calibration.direct_provenance_policy",
+        "note": "Direct-path provenance state machine and cited Melody envelope configuration.",
+        "config_key": "validation.calibration.direct_provenance_policy",
+    },
+    "validation.calibration.direct_provenance_policy.cited_switch_latency_ns": {
+        "class": "assumed_sweepable",
+        "source": "validation.calibration.direct_provenance_policy",
+        "note": "Switch-latency anchor used for cited+sweep direct posture when direct is unmeasured.",
+        "config_key": "validation.calibration.direct_provenance_policy.cited_switch_latency_ns",
+    },
+    "validation.calibration.direct_provenance_policy.cited_switch_hop_latency_ns_sweep": {
+        "class": "assumed_sweepable",
+        "source": "validation.calibration.direct_provenance_policy",
+        "note": "Per-hop switch latency sweep values for direct cited+sweep posture.",
+        "config_key": "validation.calibration.direct_provenance_policy.cited_switch_hop_latency_ns_sweep",
+    },
+    "validation.calibration.direct_provenance_policy.cited_switch_bottleneck_factor_sweep": {
+        "class": "assumed_sweepable",
+        "source": "validation.calibration.direct_provenance_policy",
+        "note": "Switch bottleneck-factor sweep values for direct cited+sweep posture.",
+        "config_key": "validation.calibration.direct_provenance_policy.cited_switch_bottleneck_factor_sweep",
+    },
     "LINK_CXL_SWITCH.bandwidth_Bps": {
         "class": "assumed_sweepable",
         "source": "CITED_VALUES.CXL_SWITCH_BW_Bps",
@@ -736,5 +760,23 @@ PARAMETER_PROVENANCE = {
             "compute/mem multipliers +/-20% to +/-40%, command_overhead_s x0.5 to x2.0."
         ),
         "config_key": "pim_mode_effects",
+    },
+    "validation.sensitivity.families.glue_fixed_cost": {
+        "class": "assumed_sweepable",
+        "source": "tools/validation/sensitivity.py",
+        "note": "Glue fixed-cost sweep family covering 0.05us to 5us.",
+        "config_key": "validation.sensitivity.families",
+    },
+    "validation.sensitivity.families.glue_roofline_factor": {
+        "class": "assumed_sweepable",
+        "source": "tools/validation/sensitivity.py",
+        "note": "Glue roofline-factor sweep (0.2x to 2.0x) anchored to calibrated host-touch baseline.",
+        "config_key": "validation.sensitivity.families",
+    },
+    "validation.sensitivity.families.pim_mode_effects_scale": {
+        "class": "assumed_sweepable",
+        "source": "tools/validation/sensitivity.py",
+        "note": "PIM mode effects scale sweep (0.6x to 1.4x) for multiplier/overhead robustness.",
+        "config_key": "validation.sensitivity.families",
     },
 }

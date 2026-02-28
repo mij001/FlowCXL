@@ -21,11 +21,13 @@ Use these classes consistently:
 - `validation.calibration.measured_inputs` is the authoritative source for host-path calibration.
 - `host_h2d`, `host_d2h`, and `bounce` are required measured paths.
 - `direct` uses explicit provenance status: `measured`, `crosscheck_only`, or `cited_sweep_only`.
+- `direct_cited_envelope` carries the cited sweep contract for unmeasured direct paths (Melody latency/BW range + switch sweeps).
 - `CXL_SWITCH_LAT_s` and `CXL_SWITCH_BW_Bps` are **assumed_sweepable** topology points, not directly measured constants from the cited CXL homepage.
 - `UPMEM_HOST_H2D_MEASURED_BW_Bps` and `UPMEM_HOST_D2H_MEASURED_BW_Bps` are literature-backed anchors and remain sweepable in sensitivity analyses.
 - DeepVariant internal 5-kernel split factors/byte factors are explicit modeling assumptions layered on cited public stage definitions.
 - `tiling_model_by_template`, `pim_mode_by_stage_by_template`, and `pim_mode_effects` are explicit **assumed_sweepable** controls for optional regroup/glue/barrier and mode-dependent PIM behavior.
 - Recommended `pim_mode_effects` sweeps: compute/mem multipliers in +/-20% to +/-40% bands and `command_overhead_s` in x0.5 to x2.0 bands.
+- Recommended glue sweeps: `glue_fixed_s` in `0.05-5 us` and glue roofline factors in `0.2x-2.0x` of calibrated host-touch baseline.
 - Validation overlay link constants are applied per run through an injected catalog; base `sources.LINKS` remains unchanged across runs/tests.
 
 ## How To Audit A Parameter

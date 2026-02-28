@@ -438,6 +438,9 @@ validation:
       allow_cited_sweep_only: true
       cited_latency_ns_range: [214, 394]
       cited_bandwidth_GBps_range: [18, 52]
+      cited_switch_latency_ns: 600
+      cited_switch_hop_latency_ns_sweep: [50, 150, 300]
+      cited_switch_bottleneck_factor_sweep: [0.5, 0.75, 1.0]
     payload_bytes: [4194304, 33554432, 268435456]
     concurrency_levels: [1, 2, 4, 8]
     repetitions: 10
@@ -457,7 +460,7 @@ validation:
     tolerance_mape_percent: 5.0
   sensitivity:
     enabled: true
-    families: [cxl_link, pim_speedup, tpch_memory]
+    families: [cxl_link, pim_speedup, tpch_memory, glue_fixed_cost, glue_roofline_factor, pim_mode_effects_scale, energy]
   energy:
     mode: relative_sweep
     power_scale_factors: [0.7, 1.0, 1.3]

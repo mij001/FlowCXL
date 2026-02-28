@@ -5,7 +5,7 @@ SHELL := /bin/bash
 all: validation simulate report
 
 validation:
-	python tools/validation/run_validation.py --config configs/runs.yaml --artifacts-dir artifacts
+	python tools/validation/run_validation.py --config configs/runs.yaml --artifacts-dir artifacts --ablations-config paper/configs/ablations.yaml
 
 simulate:
 	@if [[ -f artifacts/validation/microbench_overlay.yaml ]]; then \

@@ -32,10 +32,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _build_links_catalog(
+    *,
+    base_links_catalog: Mapping[str, Mapping[str, object]] | None,
     overrides: Mapping[str, Mapping[str, float]] | None,
 ) -> Dict[str, Dict[str, object]]:
+    source_catalog = sources.LINKS if base_links_catalog is None else base_links_catalog
     links_catalog: Dict[str, Dict[str, object]] = {
-        str(link_id): dict(link_cfg) for link_id, link_cfg in sources.LINKS.items()
+        str(link_id): dict(link_cfg) for link_id, link_cfg in source_catalog.items()
     }
     if not overrides:
         return links_catalog
@@ -125,6 +128,7 @@ def _apply_global_pim_speedup(config: Dict[str, object], factor: float) -> Dict[
 def _run_case(
     *,
     base_config: Dict[str, object],
+    base_links_catalog: Mapping[str, Mapping[str, object]] | None = None,
     patch: Mapping[str, object] | None = None,
     link_overrides: Mapping[str, Mapping[str, float]] | None = None,
 ) -> pd.DataFrame:
@@ -133,13 +137,73 @@ def _run_case(
     cfg["trace_max_tiles"] = 0
     if patch:
         cfg = deep_merge(cfg, patch)
-    links_catalog = _build_links_catalog(link_overrides)
+    links_catalog = _build_links_catalog(
+        base_links_catalog=base_links_catalog,
+        overrides=link_overrides,
+    )
     metrics, _ = generate_runs_from_config(cfg, links_catalog=links_catalog)
     return _compute_ratios(metrics)
 
 
+def _apply_glue_fixed_cost(config: Dict[str, object], fixed_s: float) -> Dict[str, object]:
+    cfg = copy.deepcopy(config)
+    models = cfg.get("tiling_model_by_template", {})
+    for model in models.values():
+        if not isinstance(model, Mapping):
+            continue
+        boundary_mappings = model.get("boundary_mappings", {})
+        if not isinstance(boundary_mappings, Mapping):
+            continue
+        for mapping in boundary_mappings.values():
+            if not isinstance(mapping, Mapping):
+                continue
+            if str(mapping.get("mapping_type", "IDENTITY")) != "IDENTITY":
+                mapping["glue_fixed_s"] = float(fixed_s)
+    return cfg
+
+
+def _apply_glue_roofline_factor(config: Dict[str, object], factor: float) -> Dict[str, object]:
+    cfg = copy.deepcopy(config)
+    base_bw = float(cfg["stage_defaults"]["host_touch_Bps"])
+    models = cfg.get("tiling_model_by_template", {})
+    for model in models.values():
+        if not isinstance(model, Mapping):
+            continue
+        boundary_mappings = model.get("boundary_mappings", {})
+        if not isinstance(boundary_mappings, Mapping):
+            continue
+        for mapping in boundary_mappings.values():
+            if not isinstance(mapping, Mapping):
+                continue
+            if str(mapping.get("mapping_type", "IDENTITY")) == "IDENTITY":
+                continue
+            if "glue_compute_Bps" in mapping:
+                mapping["glue_compute_Bps"] = max(1.0, base_bw * float(factor))
+            if "glue_mem_Bps" in mapping:
+                mapping["glue_mem_Bps"] = max(1.0, base_bw * float(factor))
+    return cfg
+
+
+def _apply_pim_mode_effects_scale(config: Dict[str, object], factor: float) -> Dict[str, object]:
+    cfg = copy.deepcopy(config)
+    effects = cfg.get("pim_mode_effects", {})
+    for mode_name, mode_cfg in effects.items():
+        if str(mode_name) in {"NONE"}:
+            continue
+        if not isinstance(mode_cfg, Mapping):
+            continue
+        if "compute_multiplier" in mode_cfg:
+            mode_cfg["compute_multiplier"] = max(0.01, float(mode_cfg["compute_multiplier"]) * float(factor))
+        if "mem_multiplier" in mode_cfg:
+            mode_cfg["mem_multiplier"] = max(0.01, float(mode_cfg["mem_multiplier"]) * float(factor))
+        if "command_overhead_s" in mode_cfg:
+            mode_cfg["command_overhead_s"] = max(0.0, float(mode_cfg["command_overhead_s"]) * float(factor))
+    return cfg
+
+
 def run_sensitivity(
     config: Dict[str, object],
+    links_catalog: Mapping[str, Mapping[str, object]] | None,
     out_dir: Path,
     ablations_config_path: Path,
 ) -> Dict[str, object]:
@@ -152,61 +216,130 @@ def run_sensitivity(
 
     records: List[Dict[str, object]] = []
 
-    baseline_df = _run_case(base_config=config)
+    enabled_families = {
+        str(v) for v in sens_cfg.get("families", ["cxl_link", "pim_speedup", "tpch_memory"])
+    }
+    baseline_df = _run_case(base_config=config, base_links_catalog=links_catalog)
     for _, row in baseline_df.iterrows():
         record = dict(row)
         record.update({"system_id": system_id, "sweep_family": "baseline", "sweep_case": "baseline"})
         records.append(record)
 
-    cxl_bw_values = [32e9, 64e9, 96e9]
-    cxl_lat_values = [250e-9, 350e-9, 500e-9]
-    for bw in cxl_bw_values:
-        for lat in cxl_lat_values:
-            case = f"bw_{int(bw)}__lat_{lat:.2e}"
-            link_overrides = {sources.LINK_CXL_SWITCH: {"bandwidth_Bps": bw, "latency_s": lat}}
-            patch = {"link_profile": {"cxl_direct_link": sources.LINK_CXL_SWITCH}}
-            case_df = _run_case(base_config=config, patch=patch, link_overrides=link_overrides)
+    if "cxl_link" in enabled_families:
+        cxl_bw_values = [32e9, 64e9, 96e9]
+        cxl_lat_values = [250e-9, 350e-9, 500e-9]
+        for bw in cxl_bw_values:
+            for lat in cxl_lat_values:
+                case = f"bw_{int(bw)}__lat_{lat:.2e}"
+                link_overrides = {sources.LINK_CXL_SWITCH: {"bandwidth_Bps": bw, "latency_s": lat}}
+                patch = {"link_profile": {"cxl_direct_link": sources.LINK_CXL_SWITCH}}
+                case_df = _run_case(
+                    base_config=config,
+                    base_links_catalog=links_catalog,
+                    patch=patch,
+                    link_overrides=link_overrides,
+                )
+                for _, row in case_df.iterrows():
+                    rec = dict(row)
+                    rec.update({"system_id": system_id, "sweep_family": "cxl_link", "sweep_case": case})
+                    records.append(rec)
+
+    if "pim_speedup" in enabled_families:
+        for factor in [0.75, 1.0, 1.25, 1.5]:
+            case_df = _run_case(
+                base_config=_apply_global_pim_speedup(config, factor),
+                base_links_catalog=links_catalog,
+            )
             for _, row in case_df.iterrows():
                 rec = dict(row)
-                rec.update({"system_id": system_id, "sweep_family": "cxl_link", "sweep_case": case})
+                rec.update(
+                    {
+                        "system_id": system_id,
+                        "sweep_family": "pim_speedup",
+                        "sweep_case": f"factor_{factor:.2f}",
+                    }
+                )
                 records.append(rec)
 
-    for factor in [0.75, 1.0, 1.25, 1.5]:
-        case_df = _run_case(base_config=_apply_global_pim_speedup(config, factor))
-        for _, row in case_df.iterrows():
-            rec = dict(row)
-            rec.update(
-                {
-                    "system_id": system_id,
-                    "sweep_family": "pim_speedup",
-                    "sweep_case": f"factor_{factor:.2f}",
-                }
+    if "tpch_memory" in enabled_families:
+        for preset in ["pessimistic", "baseline", "optimistic"]:
+            case_df = _run_case(
+                base_config=_apply_tpch_memory_preset(config, preset),
+                base_links_catalog=links_catalog,
             )
-            records.append(rec)
+            for _, row in case_df.iterrows():
+                rec = dict(row)
+                rec.update({"system_id": system_id, "sweep_family": "tpch_memory", "sweep_case": preset})
+                records.append(rec)
 
-    for preset in ["pessimistic", "baseline", "optimistic"]:
-        case_df = _run_case(base_config=_apply_tpch_memory_preset(config, preset))
-        for _, row in case_df.iterrows():
-            rec = dict(row)
-            rec.update({"system_id": system_id, "sweep_family": "tpch_memory", "sweep_case": preset})
-            records.append(rec)
+    if "energy" in enabled_families:
+        for scale in [float(v) for v in energy_cfg.get("power_scale_factors", [1.0])]:
+            patch = {
+                "transfer_power_W": {
+                    key: float(val) * scale
+                    for key, val in config["transfer_power_W"].items()
+                },
+                "stage_defaults": {
+                    "cpu_unit_power_W": float(config["stage_defaults"]["cpu_unit_power_W"]) * scale,
+                    "pim_unit_power_W": float(config["stage_defaults"]["pim_unit_power_W"]) * scale,
+                },
+            }
+            case_df = _run_case(base_config=config, base_links_catalog=links_catalog, patch=patch)
+            for _, row in case_df.iterrows():
+                rec = dict(row)
+                rec.update({"system_id": system_id, "sweep_family": "energy", "sweep_case": f"scale_{scale:.2f}"})
+                records.append(rec)
 
-    for scale in [float(v) for v in energy_cfg.get("power_scale_factors", [1.0])]:
-        patch = {
-            "transfer_power_W": {
-                key: float(val) * scale
-                for key, val in config["transfer_power_W"].items()
-            },
-            "stage_defaults": {
-                "cpu_unit_power_W": float(config["stage_defaults"]["cpu_unit_power_W"]) * scale,
-                "pim_unit_power_W": float(config["stage_defaults"]["pim_unit_power_W"]) * scale,
-            },
-        }
-        case_df = _run_case(base_config=config, patch=patch)
-        for _, row in case_df.iterrows():
-            rec = dict(row)
-            rec.update({"system_id": system_id, "sweep_family": "energy", "sweep_case": f"scale_{scale:.2f}"})
-            records.append(rec)
+    if "glue_fixed_cost" in enabled_families:
+        for fixed_s in [0.05e-6, 0.1e-6, 0.5e-6, 1e-6, 5e-6]:
+            case_df = _run_case(
+                base_config=_apply_glue_fixed_cost(config, fixed_s),
+                base_links_catalog=links_catalog,
+            )
+            for _, row in case_df.iterrows():
+                rec = dict(row)
+                rec.update(
+                    {
+                        "system_id": system_id,
+                        "sweep_family": "glue_fixed_cost",
+                        "sweep_case": f"fixed_s_{fixed_s:.2e}",
+                    }
+                )
+                records.append(rec)
+
+    if "glue_roofline_factor" in enabled_families:
+        for factor in [0.2, 0.5, 1.0, 1.5, 2.0]:
+            case_df = _run_case(
+                base_config=_apply_glue_roofline_factor(config, factor),
+                base_links_catalog=links_catalog,
+            )
+            for _, row in case_df.iterrows():
+                rec = dict(row)
+                rec.update(
+                    {
+                        "system_id": system_id,
+                        "sweep_family": "glue_roofline_factor",
+                        "sweep_case": f"factor_{factor:.2f}",
+                    }
+                )
+                records.append(rec)
+
+    if "pim_mode_effects_scale" in enabled_families:
+        for factor in [0.6, 0.8, 1.0, 1.2, 1.4]:
+            case_df = _run_case(
+                base_config=_apply_pim_mode_effects_scale(config, factor),
+                base_links_catalog=links_catalog,
+            )
+            for _, row in case_df.iterrows():
+                rec = dict(row)
+                rec.update(
+                    {
+                        "system_id": system_id,
+                        "sweep_family": "pim_mode_effects_scale",
+                        "sweep_case": f"factor_{factor:.2f}",
+                    }
+                )
+                records.append(rec)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     sensitivity_df = pd.DataFrame(records)
@@ -237,6 +370,7 @@ def run_sensitivity(
     ablations_path = out_dir / "ablations.csv"
     _run_ablations(
         base_config=config,
+        links_catalog=links_catalog,
         ablations_config_path=ablations_config_path,
         out_path=ablations_path,
         system_id=system_id,
@@ -253,6 +387,7 @@ def run_sensitivity(
 def _run_ablations(
     *,
     base_config: Dict[str, object],
+    links_catalog: Mapping[str, Mapping[str, object]] | None,
     ablations_config_path: Path,
     out_path: Path,
     system_id: str,
@@ -270,7 +405,7 @@ def _run_ablations(
         patch = entry.get("overrides", {})
         cfg = deep_merge(base_config, patch) if patch else copy.deepcopy(base_config)
         cfg["trace_max_tiles"] = 0
-        metrics, _ = generate_runs_from_config(cfg)
+        metrics, _ = generate_runs_from_config(cfg, links_catalog=links_catalog)
         ratio_df = _compute_ratios(metrics)
         one_x = ratio_df[ratio_df["multiplier"] == 1.0]
         for _, row in one_x.iterrows():
@@ -286,6 +421,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = load_yaml(Path(args.config))
     summary = run_sensitivity(
         config=config,
+        links_catalog=None,
         out_dir=Path(args.out),
         ablations_config_path=Path(args.ablations_config),
     )
