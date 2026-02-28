@@ -143,18 +143,40 @@ Boundary mappings:
 - `IDENTITY`: `producer(i) -> consumer(i)`
 - `GROUP_K_TO_1`: `consumer(j)` waits on producers `j*K ... j*K+K-1`
 - `SPLIT_1_TO_M`: producer `i` emits `M` split contributions
-- `REPARTITION_HASH`: each producer contributes to materialized partition consumers
+- `REPARTITION_HASH`: each producer contributes to a materialized shuffle barrier
 
-Materialized partition readiness (Level-1):
+Boundary mapping keys use stage transitions, not numeric indices:
+
+- `"<src_stage>-><dst_stage>"` (for example `join->groupby_agg`)
+
+`REPARTITION_HASH` v1 global materialized readiness:
 
 \[
-ready(partition\ p)\iff received_p = expected_p
+ready(boundary\ b)\iff received\_producers_b = total\_producers_b
 \]
 
-Barrier wait for a consumer tile:
+After boundary `b` is ready, consumer partition bytes are deterministically split:
 
 \[
-T_{barrier}=max(0,\;t_{latest\_contrib}-t_{first\_contrib})
+bytes_{b,\;consumer} = split\left(\sum_{producer} bytes_{producer}\cdot output\_amplification,\;N_{consumers}\right)
+\]
+
+Barrier wait decomposition for a consumer tile:
+
+\[
+T_{barrier,dep}=max(0,\;t_{latest\_contrib}-t_{first\_contrib})
+\]
+\[
+T_{glue,queue}=max(0,\;t_{glue,start}-t_{latest\_contrib})
+\]
+\[
+T_{barrier,total}=T_{barrier,dep}+T_{glue,queue}
+\]
+
+Compatibility alias:
+
+\[
+T_{barrier}=T_{barrier,total}
 \]
 
 Glue core cost:

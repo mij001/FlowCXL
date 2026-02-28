@@ -138,6 +138,9 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
         "total_bytes_pim_retained",
         "total_retain_fallback_bytes",
         "cxl_effective_striping_factor",
+        "total_barrier_dependency_wait_time_component_s",
+        "total_glue_queue_wait_time_component_s",
+        "total_barrier_wait_time_component_s",
     ]
     for col in numeric_cols:
         if col in out.columns:
@@ -419,9 +422,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "retile_enabled",
             "total_glue_time_component_s",
             "total_glue_transfer_time_component_s",
+            "total_barrier_dependency_wait_time_component_s",
+            "total_glue_queue_wait_time_component_s",
             "total_barrier_wait_time_component_s",
             "lb_glue_s",
             "total_pim_mode_command_overhead_s",
+            "mapping_ids_used",
         ]
     ].copy()
     appendix_diag["scenario"] = appendix_diag["scenario"].map(SCENARIO_LABELS)

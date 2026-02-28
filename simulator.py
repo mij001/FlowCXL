@@ -124,6 +124,8 @@ class TileDomain:
 
 @dataclass(frozen=True)
 class BoundaryMappingSpec:
+    transition_key: str
+    mapping_id: str
     mapping_type: str
     group_k: int
     split_m: int
@@ -141,9 +143,11 @@ class BoundaryMappingSpec:
 class TilingTemplateConfig:
     enabled: bool
     admission_refill_policy: str
+    glue_resource_mode: str
     stage_kernel_class: Dict[str, str]
     kernel_tiling_policy_by_class: Dict[str, Dict[str, float]]
-    boundary_mappings: Dict[int, BoundaryMappingSpec]
+    boundary_mappings: Dict[str, BoundaryMappingSpec]
+    boundary_index_to_transition_key: Dict[int, str]
 
 
 @dataclass
@@ -153,6 +157,15 @@ class BoundaryAggregationState:
     first_contrib_t: float = math.inf
     latest_contrib_t: float = 0.0
     bytes_in: float = 0.0
+
+
+@dataclass
+class RepartitionBarrierState:
+    producer_count: int
+    received_producer_count: int = 0
+    first_contrib_t: float = math.inf
+    latest_contrib_t: float = 0.0
+    total_bytes_in: float = 0.0
 
 @dataclass
 class ResourcePool:
@@ -851,8 +864,16 @@ def _default_kernel_class_for_stage(stage_name: str) -> str:
     return sources.KERNEL_CLASS_STREAM_SIMD
 
 
-def _identity_boundary_mapping() -> BoundaryMappingSpec:
+def _boundary_transition_key(stage_names: Sequence[str], boundary_idx: int) -> str:
+    if boundary_idx <= 0 or boundary_idx >= len(stage_names):
+        raise ValueError(f"invalid boundary index for transition key: {boundary_idx}")
+    return f"{stage_names[boundary_idx - 1]}->{stage_names[boundary_idx]}"
+
+
+def _identity_boundary_mapping(*, transition_key: str) -> BoundaryMappingSpec:
     return BoundaryMappingSpec(
+        transition_key=transition_key,
+        mapping_id=f"auto_identity_{transition_key}",
         mapping_type=sources.MAPPING_IDENTITY,
         group_k=1,
         split_m=1,
@@ -888,6 +909,17 @@ def _normalize_tiling_model_by_template(
             raise ValueError(
                 f"tiling_model_by_template[{template}].admission_refill_policy must be "
                 "stage0_output or pipeline_complete"
+            )
+        glue_resource_mode = str(
+            template_raw.get(
+                "glue_resource_mode",
+                sources.GLUE_RESOURCE_MODE_SHARED_CONSUMER_COMPUTE,
+            )
+        )
+        if glue_resource_mode not in sources.GLUE_RESOURCE_MODES:
+            raise ValueError(
+                f"tiling_model_by_template[{template}].glue_resource_mode must be one of "
+                f"{list(sources.GLUE_RESOURCE_MODES)}"
             )
 
         stage_kernel_raw = template_raw.get("stage_kernel_class", {})
@@ -926,21 +958,72 @@ def _normalize_tiling_model_by_template(
         boundary_raw = template_raw.get("boundary_mappings", {})
         if boundary_raw and not isinstance(boundary_raw, Mapping):
             raise ValueError(f"tiling_model_by_template[{template}].boundary_mappings must be a map")
-        boundary_mappings: Dict[int, BoundaryMappingSpec] = {}
+        boundary_mappings: Dict[str, BoundaryMappingSpec] = {}
+        boundary_index_to_transition_key: Dict[int, str] = {}
         num_stages = len(stage_names)
+        warned_explicit_mapping_authority = False
+        expected_transition_keys = {
+            _boundary_transition_key(stage_names=stage_names, boundary_idx=boundary_idx)
+            for boundary_idx in range(1, num_stages)
+        }
+        if boundary_raw:
+            numeric_like_keys = []
+            raw_key_strings = set()
+            for raw_key in boundary_raw.keys():
+                if isinstance(raw_key, int):
+                    numeric_like_keys.append(str(raw_key))
+                    continue
+                key_str = str(raw_key)
+                raw_key_strings.add(key_str)
+                if key_str.strip().isdigit():
+                    numeric_like_keys.append(key_str)
+            if numeric_like_keys:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings uses numeric keys "
+                    f"{numeric_like_keys}; use transition keys like 'join->groupby_agg'"
+                )
+            if raw_key_strings != expected_transition_keys:
+                missing = sorted(expected_transition_keys - raw_key_strings)
+                extra = sorted(raw_key_strings - expected_transition_keys)
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings keys must exactly match "
+                    f"stage transitions. Missing={missing}, extra={extra}"
+                )
         for boundary_idx in range(1, num_stages):
-            entry_raw = boundary_raw.get(str(boundary_idx), boundary_raw.get(boundary_idx, {}))
+            transition_key = _boundary_transition_key(stage_names=stage_names, boundary_idx=boundary_idx)
+            boundary_index_to_transition_key[boundary_idx] = transition_key
+            entry_raw = boundary_raw.get(transition_key, {})
             if entry_raw and not isinstance(entry_raw, Mapping):
                 raise ValueError(
-                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] must be a map"
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}] must be a map"
                 )
             if not entry_raw:
-                boundary_mappings[boundary_idx] = _identity_boundary_mapping()
+                boundary_mappings[transition_key] = _identity_boundary_mapping(
+                    transition_key=transition_key
+                )
                 continue
+            if (
+                not warned_explicit_mapping_authority
+                and enabled
+                and any(key in entry_raw for key in ("group_k", "split_m", "partitions"))
+            ):
+                warnings.warn(
+                    f"tiling_model_by_template[{template}] uses explicit mapping parameters; "
+                    "these override kernel_tiling_policy_by_class.target_tile_bytes for boundary cardinality.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                warned_explicit_mapping_authority = True
+            mapping_id = str(entry_raw.get("mapping_id", "")).strip()
+            if not mapping_id:
+                raise ValueError(
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}] "
+                    "requires non-empty mapping_id"
+                )
             mapping_type = str(entry_raw.get("mapping_type", sources.MAPPING_IDENTITY))
             if mapping_type not in sources.MAPPING_TYPES:
                 raise ValueError(
-                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] invalid mapping_type "
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}] invalid mapping_type "
                     f"{mapping_type}"
                 )
             group_k = int(entry_raw.get("group_k", 1))
@@ -950,35 +1033,37 @@ def _normalize_tiling_model_by_template(
                 partitions = partitions.strip()
                 if partitions != "pim_units":
                     raise ValueError(
-                        f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].partitions "
+                        f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}].partitions "
                         "must be integer or 'pim_units'"
                     )
             else:
                 partitions = int(partitions)
                 if partitions <= 0:
                     raise ValueError(
-                        f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].partitions "
+                        f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}].partitions "
                         "must be > 0"
                     )
             glue_type = str(entry_raw.get("glue_type", sources.GLUE_COPY))
             if glue_type not in sources.GLUE_TYPES:
                 raise ValueError(
-                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] invalid glue_type "
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}] invalid glue_type "
                     f"{glue_type}"
                 )
             glue_device = str(entry_raw.get("glue_device", sources.DEVICE_PIM)).lower()
             if glue_device not in {sources.DEVICE_CPU, sources.DEVICE_PIM}:
                 raise ValueError(
-                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] invalid glue_device "
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}] invalid glue_device "
                     f"{glue_device}"
                 )
             glue_transfer_path = str(entry_raw.get("glue_transfer_path", "none"))
             if glue_transfer_path not in {"none", "host_h2d_stage", "host_d2h", "cxl_direct"}:
                 raise ValueError(
-                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] invalid glue_transfer_path "
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}] invalid glue_transfer_path "
                     f"{glue_transfer_path}"
                 )
             spec = BoundaryMappingSpec(
+                transition_key=transition_key,
+                mapping_id=mapping_id,
                 mapping_type=mapping_type,
                 group_k=group_k,
                 split_m=split_m,
@@ -993,34 +1078,36 @@ def _normalize_tiling_model_by_template(
             )
             if spec.group_k <= 0:
                 raise ValueError(
-                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].group_k must be > 0"
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}].group_k must be > 0"
                 )
             if spec.split_m <= 0:
                 raise ValueError(
-                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].split_m must be > 0"
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}].split_m must be > 0"
                 )
             if spec.glue_fixed_s < 0:
                 raise ValueError(
-                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].glue_fixed_s "
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}].glue_fixed_s "
                     "must be >= 0"
                 )
             if spec.glue_compute_Bps <= 0 or spec.glue_mem_Bps <= 0:
                 raise ValueError(
-                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}] glue Bps must be > 0"
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}] glue Bps must be > 0"
                 )
             if spec.output_amplification <= 0:
                 raise ValueError(
-                    f"tiling_model_by_template[{template}].boundary_mappings[{boundary_idx}].output_amplification "
+                    f"tiling_model_by_template[{template}].boundary_mappings[{transition_key}].output_amplification "
                     "must be > 0"
                 )
-            boundary_mappings[boundary_idx] = spec
+            boundary_mappings[transition_key] = spec
 
         normalized[template] = TilingTemplateConfig(
             enabled=enabled,
             admission_refill_policy=refill,
+            glue_resource_mode=glue_resource_mode,
             stage_kernel_class=stage_kernel_class,
             kernel_tiling_policy_by_class=kernel_tiling_policy_by_class,
             boundary_mappings=boundary_mappings,
+            boundary_index_to_transition_key=boundary_index_to_transition_key,
         )
     return normalized
 
@@ -1052,7 +1139,7 @@ def _build_tile_domains_and_mappings(
     if len(scaled_boundaries) != num_stages + 1:
         raise ValueError("scaled_boundaries must have len(stage_names)+1")
     boundary_domains: List[TileDomain] = []
-    boundary_mappings: Dict[int, BoundaryMappingSpec] = {}
+    boundary_mappings_by_index: Dict[int, BoundaryMappingSpec] = {}
 
     stage0_class = tiling_cfg.stage_kernel_class[stage_names[0]]
     stage0_target_bytes = float(
@@ -1071,7 +1158,13 @@ def _build_tile_domains_and_mappings(
 
     for boundary_idx in range(1, num_stages):
         producer_count = boundary_domains[boundary_idx - 1].tile_count
-        mapping = tiling_cfg.boundary_mappings.get(boundary_idx, _identity_boundary_mapping())
+        transition_key = tiling_cfg.boundary_index_to_transition_key.get(boundary_idx)
+        if transition_key is None:
+            transition_key = _boundary_transition_key(stage_names=stage_names, boundary_idx=boundary_idx)
+        mapping = tiling_cfg.boundary_mappings.get(
+            transition_key,
+            _identity_boundary_mapping(transition_key=transition_key),
+        )
         if mapping.mapping_type == sources.MAPPING_IDENTITY:
             consumer_count = producer_count
         elif mapping.mapping_type == sources.MAPPING_GROUP_K_TO_1:
@@ -1096,7 +1189,7 @@ def _build_tile_domains_and_mappings(
                 logical_kind=f"boundary_{boundary_idx}",
             )
         )
-        boundary_mappings[boundary_idx] = mapping
+        boundary_mappings_by_index[boundary_idx] = mapping
 
     final_boundary_idx = num_stages
     final_producer_count = boundary_domains[-1].tile_count
@@ -1109,7 +1202,7 @@ def _build_tile_domains_and_mappings(
             logical_kind=f"boundary_{final_boundary_idx}",
         )
     )
-    return boundary_domains, boundary_mappings
+    return boundary_domains, boundary_mappings_by_index
 
 
 def _workload_family_from_template(pipeline_template: str) -> str:
@@ -2208,18 +2301,9 @@ def _mapping_contributions_for_producer(
         return out
 
     if spec.mapping_type == sources.MAPPING_REPARTITION_HASH:
-        partitions = _resolve_boundary_partition_count(
-            partitions=spec.partitions,
-            producer_count=producer_tile_count,
-            src_stage_cfg=src_stage_cfg,
-        )
         amplified = int(round(float(producer_bytes_out) * spec.output_amplification))
-        split_bytes = tile_boundary_bytes(amplified, partitions)
-        out = []
-        for part_id, value in enumerate(split_bytes):
-            consumer_id = min(part_id, consumer_tile_count - 1)
-            out.append((consumer_id, int(value)))
-        return out
+        # v1 materialized shuffle barrier: aggregate once per producer, then release all partitions together.
+        return [(0, int(amplified))]
 
     raise ValueError(f"unsupported mapping_type {spec.mapping_type}")
 
@@ -2233,11 +2317,12 @@ def _expected_contributions_per_consumer(
     if spec.mapping_type == sources.MAPPING_IDENTITY:
         return [1 for _ in range(consumer_tile_count)]
     if spec.mapping_type == sources.MAPPING_GROUP_K_TO_1:
-        out = [0 for _ in range(consumer_tile_count)]
-        for producer_id in range(producer_tile_count):
-            consumer_id = min(producer_id // max(1, spec.group_k), consumer_tile_count - 1)
-            out[consumer_id] += 1
-        return [max(1, value) for value in out]
+        out: List[int] = []
+        group_k = max(1, spec.group_k)
+        for consumer_id in range(consumer_tile_count):
+            remaining = max(0, producer_tile_count - (consumer_id * group_k))
+            out.append(max(1, min(group_k, remaining)))
+        return out
     if spec.mapping_type == sources.MAPPING_SPLIT_1_TO_M:
         return [1 for _ in range(consumer_tile_count)]
     if spec.mapping_type == sources.MAPPING_REPARTITION_HASH:
@@ -2621,8 +2706,12 @@ def _simulate_configuration_linear(
                         "domain_in_tile_id": int(direct_record.get("domain_in_tile_id", tile_id)),
                         "domain_out_tile_id": int(direct_record.get("domain_out_tile_id", tile_id)),
                         "mapping_type": str(direct_record.get("mapping_type", sources.MAPPING_IDENTITY)),
+                        "mapping_id": str(direct_record.get("mapping_id", "")),
                         "kernel_class": str(direct_record.get("kernel_class", "")),
                         "glue_type": str(direct_record.get("glue_type", "")),
+                        "barrier_dependency_wait_s": float(direct_record.get("barrier_dependency_wait_s", 0.0)),
+                        "glue_queue_wait_s": float(direct_record.get("glue_queue_wait_s", 0.0)),
+                        "barrier_total_wait_s": float(direct_record.get("barrier_total_wait_s", 0.0)),
                         "barrier_wait_s": float(direct_record.get("barrier_wait_s", 0.0)),
                         "aggregation_expected": int(direct_record.get("aggregation_expected", 0)),
                         "aggregation_received": int(direct_record.get("aggregation_received", 0)),
@@ -2971,8 +3060,12 @@ def _simulate_configuration_linear(
                         "domain_in_tile_id": domain_in_tile_id,
                         "domain_out_tile_id": domain_out_tile_id,
                         "mapping_type": mapping_type,
+                        "mapping_id": "",
                         "kernel_class": kernel_class,
                         "glue_type": glue_type,
+                        "barrier_dependency_wait_s": 0.0,
+                        "glue_queue_wait_s": 0.0,
+                        "barrier_total_wait_s": barrier_wait_s,
                         "barrier_wait_s": barrier_wait_s,
                         "aggregation_expected": aggregation_expected,
                         "aggregation_received": aggregation_received,
@@ -3207,8 +3300,12 @@ def _simulate_configuration_linear(
                         "domain_in_tile_id": domain_in_tile_id,
                         "domain_out_tile_id": domain_out_tile_id,
                         "mapping_type": mapping_type,
+                        "mapping_id": "",
                         "kernel_class": kernel_class,
                         "glue_type": glue_type,
+                        "barrier_dependency_wait_s": 0.0,
+                        "glue_queue_wait_s": 0.0,
+                        "barrier_total_wait_s": barrier_wait_s,
                         "barrier_wait_s": barrier_wait_s,
                         "aggregation_expected": aggregation_expected,
                         "aggregation_received": aggregation_received,
@@ -3326,9 +3423,12 @@ def _simulate_configuration_linear(
         "total_glue_shuffle_bytes": 0,
         "total_glue_time_component_s": 0.0,
         "total_glue_transfer_time_component_s": 0.0,
+        "total_barrier_dependency_wait_time_component_s": 0.0,
+        "total_glue_queue_wait_time_component_s": 0.0,
         "total_barrier_wait_time_component_s": 0.0,
         "lb_glue_s": 0.0,
         "total_pim_mode_command_overhead_s": total_pim_mode_command_overhead_s,
+        "mapping_ids_used": "",
     }
     return metrics_row, traces
 
@@ -3406,6 +3506,15 @@ def _simulate_configuration_retile(
         tiling_cfg=tiling_cfg,
         stage_configs=stage_configs,
     )
+    for boundary_idx, mapping in boundary_mappings.items():
+        if tiling_cfg.glue_resource_mode == sources.GLUE_RESOURCE_MODE_SHARED_CONSUMER_COMPUTE:
+            consumer_stage_id = boundary_idx + 1
+            consumer_device = stage_devices[consumer_stage_id - 1]
+            if mapping.glue_device != consumer_device:
+                raise ValueError(
+                    f"shared_consumer_compute requires glue_device={consumer_device} for "
+                    f"mapping {mapping.transition_key} (mapping_id={mapping.mapping_id})"
+                )
     stage_pim_modes = pim_mode_by_stage_by_template[pipeline_template]
     stage_kernel_class = tiling_cfg.stage_kernel_class
     bytes_touched_factors_by_stage = bytes_touched_factors_by_stage_by_template[pipeline_template]
@@ -3543,18 +3652,23 @@ def _simulate_configuration_retile(
         )
 
     boundary_states: Dict[int, List[BoundaryAggregationState]] = {}
+    repartition_states: Dict[int, RepartitionBarrierState] = {}
     for boundary_idx in range(1, num_stages):
         spec = boundary_mappings[boundary_idx]
         producer_count = boundary_domains[boundary_idx - 1].tile_count
         consumer_count = boundary_domains[boundary_idx].tile_count
-        expected = _expected_contributions_per_consumer(
-            spec=spec,
-            producer_tile_count=producer_count,
-            consumer_tile_count=consumer_count,
-        )
-        boundary_states[boundary_idx] = [
-            BoundaryAggregationState(expected_count=expected[idx]) for idx in range(consumer_count)
-        ]
+        if spec.mapping_type == sources.MAPPING_REPARTITION_HASH:
+            repartition_states[boundary_idx] = RepartitionBarrierState(producer_count=producer_count)
+            boundary_states[boundary_idx] = []
+        else:
+            expected = _expected_contributions_per_consumer(
+                spec=spec,
+                producer_tile_count=producer_count,
+                consumer_tile_count=consumer_count,
+            )
+            boundary_states[boundary_idx] = [
+                BoundaryAggregationState(expected_count=expected[idx]) for idx in range(consumer_count)
+            ]
 
     completed_terminal_items = 0
     makespan_s = 0.0
@@ -3589,7 +3703,10 @@ def _simulate_configuration_retile(
     total_glue_shuffle_bytes = 0
     total_glue_time_component_s = 0.0
     total_glue_transfer_time_component_s = 0.0
+    total_barrier_dependency_wait_time_component_s = 0.0
+    total_glue_queue_wait_time_component_s = 0.0
     total_barrier_wait_time_component_s = 0.0
+    mapping_ids_used = sorted({mapping.mapping_id for mapping in boundary_mappings.values()})
 
     def _trace_event(
         *,
@@ -3639,8 +3756,12 @@ def _simulate_configuration_retile(
         domain_in_tile_id: int = 0,
         domain_out_tile_id: int = 0,
         mapping_type: str = sources.MAPPING_IDENTITY,
+        mapping_id: str = "",
         kernel_class: str = "",
         glue_type: str = "",
+        barrier_dependency_wait_s: float = 0.0,
+        glue_queue_wait_s: float = 0.0,
+        barrier_total_wait_s: float = 0.0,
         barrier_wait_s: float = 0.0,
         aggregation_expected: int = 0,
         aggregation_received: int = 0,
@@ -3712,9 +3833,13 @@ def _simulate_configuration_retile(
                 "domain_in_tile_id": domain_in_tile_id,
                 "domain_out_tile_id": domain_out_tile_id,
                 "mapping_type": mapping_type,
+                "mapping_id": mapping_id,
                 "kernel_class": kernel_class,
                 "glue_type": glue_type,
-                "barrier_wait_s": barrier_wait_s,
+                "barrier_dependency_wait_s": barrier_dependency_wait_s,
+                "glue_queue_wait_s": glue_queue_wait_s,
+                "barrier_total_wait_s": barrier_total_wait_s,
+                "barrier_wait_s": barrier_wait_s if barrier_wait_s > 0.0 else barrier_total_wait_s,
                 "aggregation_expected": aggregation_expected,
                 "aggregation_received": aggregation_received,
                 "pim_mode": pim_mode,
@@ -3745,12 +3870,15 @@ def _simulate_configuration_retile(
         heap_counter += 1
         heapq.heappush(stage_work_heap, (release_t, heap_counter, stage_id, tile_id))
 
-    def _handle_boundary_arrival(
+    def _schedule_boundary_glue_and_release(
         *,
         boundary_idx: int,
         consumer_id: int,
         bytes_in_value: int,
-        t_arrival: float,
+        first_contrib_t: float,
+        latest_contrib_t: float,
+        aggregation_expected: int,
+        aggregation_received: int,
         producer_tile_id: int,
         stage_id: int,
         stage_name: str,
@@ -3767,51 +3895,54 @@ def _simulate_configuration_retile(
         nonlocal total_glue_time_component_s
         nonlocal total_glue_transfer_time_component_s
         nonlocal total_glue_copy_bytes, total_glue_reduce_bytes, total_glue_shuffle_bytes
+        nonlocal total_barrier_dependency_wait_time_component_s
+        nonlocal total_glue_queue_wait_time_component_s
         nonlocal total_barrier_wait_time_component_s
-        state = boundary_states[boundary_idx][consumer_id]
-        state.received_count += 1
-        state.bytes_in += float(bytes_in_value)
-        state.first_contrib_t = min(state.first_contrib_t, t_arrival)
-        state.latest_contrib_t = max(state.latest_contrib_t, t_arrival)
-        if state.received_count < state.expected_count:
-            return
 
-        barrier_wait = max(0.0, state.latest_contrib_t - state.first_contrib_t)
-        total_barrier_wait_time_component_s += barrier_wait
-        glue_start_t = state.latest_contrib_t
+        barrier_dependency_wait_s = max(0.0, latest_contrib_t - first_contrib_t)
+        total_barrier_dependency_wait_time_component_s += barrier_dependency_wait_s
+        glue_req_t = latest_contrib_t
         bytes_out = int(boundary_domains[boundary_idx].tile_bytes[consumer_id])
         need_glue = (
             mapping.mapping_type != sources.MAPPING_IDENTITY
             or mapping.glue_fixed_s > 0.0
             or mapping.glue_transfer_path != "none"
         )
-        glue_end_t = glue_start_t
+        glue_end_t = glue_req_t
+        glue_queue_wait_s = 0.0
+        barrier_total_wait_s = barrier_dependency_wait_s
         if need_glue:
-            glue_pool = glue_pim_pool if mapping.glue_device == sources.DEVICE_PIM else glue_cpu_pool
+            if tiling_cfg.glue_resource_mode == sources.GLUE_RESOURCE_MODE_SHARED_CONSUMER_COMPUTE:
+                glue_pool = compute_pools[boundary_idx]
+            else:
+                glue_pool = glue_pim_pool if mapping.glue_device == sources.DEVICE_PIM else glue_cpu_pool
             glue_core_duration = _glue_core_duration_s(
                 spec=mapping,
-                bytes_in=float(state.bytes_in),
+                bytes_in=float(bytes_in_value),
                 bytes_out=float(bytes_out),
             )
             t_glue_start, t_glue_end, glue_wait_s, glue_slot = _schedule_pool_event(
                 pool=glue_pool,
-                t_req=glue_start_t,
+                t_req=glue_req_t,
                 duration_s=glue_core_duration,
             )
             glue_end_t = t_glue_end
             total_glue_time_component_s += glue_core_duration
             if mapping.glue_type == sources.GLUE_COPY:
-                total_glue_copy_bytes += int(state.bytes_in)
+                total_glue_copy_bytes += int(bytes_in_value)
             elif mapping.glue_type == sources.GLUE_REDUCE:
-                total_glue_reduce_bytes += int(state.bytes_in)
+                total_glue_reduce_bytes += int(bytes_in_value)
             elif mapping.glue_type == sources.GLUE_SHUFFLE:
-                total_glue_shuffle_bytes += int(state.bytes_in)
+                total_glue_shuffle_bytes += int(bytes_in_value)
+            glue_queue_wait_s = max(0.0, t_glue_start - glue_req_t)
+            total_glue_queue_wait_time_component_s += glue_queue_wait_s
+            barrier_total_wait_s = barrier_dependency_wait_s + glue_queue_wait_s
             _trace_event(
                 tile_id=consumer_id,
                 stage_id=stage_id,
                 op_type=mapping.glue_type,
-                bytes_value=int(state.bytes_in),
-                t_req=glue_start_t,
+                bytes_value=int(bytes_in_value),
+                t_req=glue_req_t,
                 t_start=t_glue_start,
                 t_end=t_glue_end,
                 wait_s=glue_wait_s,
@@ -3826,11 +3957,15 @@ def _simulate_configuration_retile(
                 domain_in_tile_id=producer_tile_id,
                 domain_out_tile_id=consumer_id,
                 mapping_type=mapping.mapping_type,
+                mapping_id=mapping.mapping_id,
                 kernel_class=kernel_class,
                 glue_type=mapping.glue_type,
-                barrier_wait_s=barrier_wait,
-                aggregation_expected=state.expected_count,
-                aggregation_received=state.received_count,
+                barrier_dependency_wait_s=barrier_dependency_wait_s,
+                glue_queue_wait_s=glue_queue_wait_s,
+                barrier_total_wait_s=barrier_total_wait_s,
+                barrier_wait_s=barrier_total_wait_s,
+                aggregation_expected=aggregation_expected,
+                aggregation_received=aggregation_received,
                 pim_mode=pim_mode,
                 pim_mode_compute_multiplier=pim_mode_compute_multiplier,
                 pim_mode_mem_multiplier=pim_mode_mem_multiplier,
@@ -3882,18 +4017,110 @@ def _simulate_configuration_retile(
                     domain_in_tile_id=producer_tile_id,
                     domain_out_tile_id=consumer_id,
                     mapping_type=mapping.mapping_type,
+                    mapping_id=mapping.mapping_id,
                     kernel_class=kernel_class,
                     glue_type=mapping.glue_type,
+                    barrier_dependency_wait_s=0.0,
+                    glue_queue_wait_s=0.0,
+                    barrier_total_wait_s=0.0,
                     barrier_wait_s=0.0,
-                    aggregation_expected=state.expected_count,
-                    aggregation_received=state.received_count,
+                    aggregation_expected=aggregation_expected,
+                    aggregation_received=aggregation_received,
                     pim_mode=pim_mode,
                     pim_mode_compute_multiplier=pim_mode_compute_multiplier,
                     pim_mode_mem_multiplier=pim_mode_mem_multiplier,
                     pim_mode_command_overhead_s=pim_mode_command_overhead_s,
                 )
+        else:
+            barrier_total_wait_s = barrier_dependency_wait_s
 
+        total_barrier_wait_time_component_s += barrier_total_wait_s
         _release_stage_consumer(stage_id=boundary_idx + 1, tile_id=consumer_id, release_t=glue_end_t)
+
+    def _handle_boundary_arrival(
+        *,
+        boundary_idx: int,
+        consumer_id: int,
+        bytes_in_value: int,
+        t_arrival: float,
+        producer_tile_id: int,
+        stage_id: int,
+        stage_name: str,
+        stage_device: str,
+        mapping: BoundaryMappingSpec,
+        kernel_class: str,
+        pim_mode: str,
+        pim_mode_compute_multiplier: float,
+        pim_mode_mem_multiplier: float,
+        pim_mode_command_overhead_s: float,
+        domain_in_id: str,
+        domain_out_id: str,
+    ) -> None:
+        if mapping.mapping_type == sources.MAPPING_REPARTITION_HASH:
+            barrier_state = repartition_states[boundary_idx]
+            barrier_state.received_producer_count += 1
+            barrier_state.total_bytes_in += float(bytes_in_value)
+            barrier_state.first_contrib_t = min(barrier_state.first_contrib_t, t_arrival)
+            barrier_state.latest_contrib_t = max(barrier_state.latest_contrib_t, t_arrival)
+            if barrier_state.received_producer_count < barrier_state.producer_count:
+                return
+            consumer_count = boundary_domains[boundary_idx].tile_count
+            consumer_bytes = tile_boundary_bytes(
+                int(round(barrier_state.total_bytes_in)),
+                consumer_count,
+            )
+            for consumer_idx, consumer_bytes_in in enumerate(consumer_bytes):
+                _schedule_boundary_glue_and_release(
+                    boundary_idx=boundary_idx,
+                    consumer_id=consumer_idx,
+                    bytes_in_value=int(consumer_bytes_in),
+                    first_contrib_t=barrier_state.first_contrib_t,
+                    latest_contrib_t=barrier_state.latest_contrib_t,
+                    aggregation_expected=barrier_state.producer_count,
+                    aggregation_received=barrier_state.received_producer_count,
+                    producer_tile_id=-1,
+                    stage_id=stage_id,
+                    stage_name=stage_name,
+                    stage_device=stage_device,
+                    mapping=mapping,
+                    kernel_class=kernel_class,
+                    pim_mode=pim_mode,
+                    pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+                    pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+                    pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+                    domain_in_id=domain_in_id,
+                    domain_out_id=domain_out_id,
+                )
+            return
+
+        state = boundary_states[boundary_idx][consumer_id]
+        state.received_count += 1
+        state.bytes_in += float(bytes_in_value)
+        state.first_contrib_t = min(state.first_contrib_t, t_arrival)
+        state.latest_contrib_t = max(state.latest_contrib_t, t_arrival)
+        if state.received_count < state.expected_count:
+            return
+        _schedule_boundary_glue_and_release(
+            boundary_idx=boundary_idx,
+            consumer_id=consumer_id,
+            bytes_in_value=int(round(state.bytes_in)),
+            first_contrib_t=state.first_contrib_t,
+            latest_contrib_t=state.latest_contrib_t,
+            aggregation_expected=state.expected_count,
+            aggregation_received=state.received_count,
+            producer_tile_id=producer_tile_id,
+            stage_id=stage_id,
+            stage_name=stage_name,
+            stage_device=stage_device,
+            mapping=mapping,
+            kernel_class=kernel_class,
+            pim_mode=pim_mode,
+            pim_mode_compute_multiplier=pim_mode_compute_multiplier,
+            pim_mode_mem_multiplier=pim_mode_mem_multiplier,
+            pim_mode_command_overhead_s=pim_mode_command_overhead_s,
+            domain_in_id=domain_in_id,
+            domain_out_id=domain_out_id,
+        )
 
     while stage_work_heap or direct_request_heap or direct_completion_heap:
         next_stage_t = stage_work_heap[0][0] if stage_work_heap else math.inf
@@ -3945,8 +4172,12 @@ def _simulate_configuration_retile(
                 domain_in_tile_id=int(transfer_info["domain_in_tile_id"]),
                 domain_out_tile_id=int(transfer_info["domain_out_tile_id"]),
                 mapping_type=str(transfer_info["mapping_type"]),
+                mapping_id=str(transfer_info.get("mapping_id", "")),
                 kernel_class=str(transfer_info["kernel_class"]),
                 glue_type=str(transfer_info["glue_type"]),
+                barrier_dependency_wait_s=float(transfer_info.get("barrier_dependency_wait_s", 0.0)),
+                glue_queue_wait_s=float(transfer_info.get("glue_queue_wait_s", 0.0)),
+                barrier_total_wait_s=float(transfer_info.get("barrier_total_wait_s", 0.0)),
                 barrier_wait_s=float(transfer_info["barrier_wait_s"]),
                 aggregation_expected=int(transfer_info["aggregation_expected"]),
                 aggregation_received=int(transfer_info["aggregation_received"]),
@@ -4420,6 +4651,7 @@ def _simulate_configuration_retile(
                     domain_in_tile_id=tile_id,
                     domain_out_tile_id=consumer_id,
                     mapping_type=mapping.mapping_type,
+                    mapping_id=mapping.mapping_id,
                     kernel_class=kernel_class,
                     pim_mode=pim_mode,
                     pim_mode_compute_multiplier=pim_mode_compute_multiplier,
@@ -4482,6 +4714,7 @@ def _simulate_configuration_retile(
                     domain_in_tile_id=tile_id,
                     domain_out_tile_id=consumer_id,
                     mapping_type=mapping.mapping_type,
+                    mapping_id=mapping.mapping_id,
                     kernel_class=kernel_class,
                     pim_mode=pim_mode,
                     pim_mode_compute_multiplier=pim_mode_compute_multiplier,
@@ -4555,6 +4788,7 @@ def _simulate_configuration_retile(
                         domain_in_tile_id=tile_id,
                         domain_out_tile_id=consumer_id,
                         mapping_type=mapping.mapping_type,
+                        mapping_id=mapping.mapping_id,
                         kernel_class=kernel_class,
                         pim_mode=pim_mode,
                         pim_mode_compute_multiplier=pim_mode_compute_multiplier,
@@ -4643,6 +4877,7 @@ def _simulate_configuration_retile(
                     domain_in_tile_id=tile_id,
                     domain_out_tile_id=consumer_id,
                     mapping_type=mapping.mapping_type,
+                    mapping_id=mapping.mapping_id,
                     kernel_class=kernel_class,
                     pim_mode=pim_mode,
                     pim_mode_compute_multiplier=pim_mode_compute_multiplier,
@@ -4673,6 +4908,7 @@ def _simulate_configuration_retile(
                     domain_in_tile_id=tile_id,
                     domain_out_tile_id=consumer_id,
                     mapping_type=mapping.mapping_type,
+                    mapping_id=mapping.mapping_id,
                     kernel_class=kernel_class,
                     pim_mode=pim_mode,
                     pim_mode_compute_multiplier=pim_mode_compute_multiplier,
@@ -4704,6 +4940,7 @@ def _simulate_configuration_retile(
                     domain_in_tile_id=tile_id,
                     domain_out_tile_id=consumer_id,
                     mapping_type=mapping.mapping_type,
+                    mapping_id=mapping.mapping_id,
                     kernel_class=kernel_class,
                     pim_mode=pim_mode,
                     pim_mode_compute_multiplier=pim_mode_compute_multiplier,
@@ -4739,6 +4976,12 @@ def _simulate_configuration_retile(
                 total_cxl_dma_issue_time_component_s += issue_overhead_s
                 pending_id = next_pending_direct_id
                 next_pending_direct_id += 1
+                if mapping.mapping_type == sources.MAPPING_REPARTITION_HASH:
+                    aggregation_expected = repartition_states[boundary_idx].producer_count
+                    aggregation_received = repartition_states[boundary_idx].received_producer_count
+                else:
+                    aggregation_expected = boundary_states[boundary_idx][consumer_id].expected_count
+                    aggregation_received = boundary_states[boundary_idx][consumer_id].received_count
                 pending_direct_transfers[pending_id] = {
                     "ready_t": ready_t,
                     "t_req": t_contrib_req,
@@ -4759,11 +5002,15 @@ def _simulate_configuration_retile(
                     "domain_in_tile_id": tile_id,
                     "domain_out_tile_id": consumer_id,
                     "mapping_type": mapping.mapping_type,
+                    "mapping_id": mapping.mapping_id,
                     "kernel_class": kernel_class,
                     "glue_type": "",
+                    "barrier_dependency_wait_s": 0.0,
+                    "glue_queue_wait_s": 0.0,
+                    "barrier_total_wait_s": 0.0,
                     "barrier_wait_s": 0.0,
-                    "aggregation_expected": boundary_states[boundary_idx][consumer_id].expected_count,
-                    "aggregation_received": boundary_states[boundary_idx][consumer_id].received_count,
+                    "aggregation_expected": aggregation_expected,
+                    "aggregation_received": aggregation_received,
                     "pim_mode": pim_mode,
                     "pim_mode_compute_multiplier": pim_mode_compute_multiplier,
                     "pim_mode_mem_multiplier": pim_mode_mem_multiplier,
@@ -4780,8 +5027,9 @@ def _simulate_configuration_retile(
 
     compute_energy_J = sum(pool.busy_time_s * pool.power_W for pool in compute_pools)
     compute_energy_J += cpu_materialize_pool.busy_time_s * cpu_materialize_pool.power_W
-    compute_energy_J += glue_cpu_pool.busy_time_s * glue_cpu_pool.power_W
-    compute_energy_J += glue_pim_pool.busy_time_s * glue_pim_pool.power_W
+    if tiling_cfg.glue_resource_mode == sources.GLUE_RESOURCE_MODE_DEDICATED_POOL:
+        compute_energy_J += glue_cpu_pool.busy_time_s * glue_cpu_pool.power_W
+        compute_energy_J += glue_pim_pool.busy_time_s * glue_pim_pool.power_W
     cpu_materialize_energy_J = cpu_materialize_pool.busy_time_s * cpu_materialize_pool.power_W
     host_touch_energy_J = host_touch_pool.busy_time_s * host_touch_pool.power_W
     transfer_energy_J = (
@@ -4796,7 +5044,10 @@ def _simulate_configuration_retile(
     compute_lbs = [_pool_lower_bound_s(pool) for pool in compute_pools]
     compute_lbs.append(_pool_lower_bound_s(cpu_materialize_pool))
     lb_compute_stage_max_s = max(compute_lbs) if compute_lbs else 0.0
-    lb_glue_s = max(_pool_lower_bound_s(glue_cpu_pool), _pool_lower_bound_s(glue_pim_pool))
+    if tiling_cfg.glue_resource_mode == sources.GLUE_RESOURCE_MODE_DEDICATED_POOL:
+        lb_glue_s = max(_pool_lower_bound_s(glue_cpu_pool), _pool_lower_bound_s(glue_pim_pool))
+    else:
+        lb_glue_s = 0.0
     lb_host_h2d_ingress_s = _pool_lower_bound_s(host_h2d_ingress_pool)
     lb_host_h2d_stage_s = _pool_lower_bound_s(host_h2d_stage_pool)
     lb_host_d2h_s = _pool_lower_bound_s(host_d2h_pool)
@@ -4874,9 +5125,12 @@ def _simulate_configuration_retile(
         "total_glue_shuffle_bytes": total_glue_shuffle_bytes,
         "total_glue_time_component_s": total_glue_time_component_s,
         "total_glue_transfer_time_component_s": total_glue_transfer_time_component_s,
+        "total_barrier_dependency_wait_time_component_s": total_barrier_dependency_wait_time_component_s,
+        "total_glue_queue_wait_time_component_s": total_glue_queue_wait_time_component_s,
         "total_barrier_wait_time_component_s": total_barrier_wait_time_component_s,
         "lb_glue_s": lb_glue_s,
         "total_pim_mode_command_overhead_s": total_pim_mode_command_overhead_s,
+        "mapping_ids_used": "|".join(mapping_ids_used),
     }
     return metrics_row, traces
 

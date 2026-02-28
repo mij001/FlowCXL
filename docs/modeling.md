@@ -116,10 +116,25 @@ tile chain to boundary-domain aggregation:
 - each boundary has its own tile domain (`domain_id`, tile count, tile bytes)
 - producer contributions are mapped with `IDENTITY`, `GROUP_K_TO_1`, `SPLIT_1_TO_M`, or `REPARTITION_HASH`
 - downstream stage work is released only after mapping readiness and glue completion
+- mappings are keyed by transition names (`<src_stage>-><dst_stage>`) and carry stable `mapping_id`
 
-Glue ops (`GLUE_COPY`, `GLUE_REDUCE`, `GLUE_SHUFFLE`) run on configured CPU/PIM glue pools.
-Barrier wait is tracked explicitly as the gap between first and last required contribution arrivals
-for each consumer tile.
+`REPARTITION_HASH` uses a v1 global materialized barrier:
+
+- all producers must contribute before any consumer partition is released
+- consumer partition bytes are split deterministically from global accumulated bytes
+
+Glue resource contention defaults to `shared_consumer_compute`:
+
+- glue ops share the consumer-stage compute pool by default (no free extra parallelism)
+- optional `dedicated_pool` mode keeps explicit glue pools for experimentation
+
+Barrier wait is decomposed and reported explicitly:
+
+- `barrier_dependency_wait_s` = latest minus first contribution arrival
+- `glue_queue_wait_s` = glue start minus latest contribution arrival
+- `barrier_total_wait_s` = dependency + queue (and `barrier_wait_s` alias for compatibility)
+
+`GROUP_K_TO_1` tail rule is deterministic: the last consumer group may be smaller than `group_k`.
 
 Defaults keep this layer disabled for both templates to preserve backward comparability.
 

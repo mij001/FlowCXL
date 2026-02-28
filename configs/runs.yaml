@@ -276,6 +276,7 @@ tiling_model_by_template:
   deepvariant_3stage:
     enabled: false
     admission_refill_policy: stage0_output
+    glue_resource_mode: shared_consumer_compute
     stage_kernel_class:
       make_examples_frontend: STREAM_SIMD
       make_examples_tensorize: PACK_TENSORIZE
@@ -294,9 +295,11 @@ tiling_model_by_template:
       POSTPROC:
         target_tile_bytes: 134217728
     boundary_mappings:
-      "1":
+      "make_examples_frontend->make_examples_tensorize":
+        mapping_id: dv_frontend_to_tensorize_identity_v1
         mapping_type: IDENTITY
-      "2":
+      "make_examples_tensorize->call_variants_infer":
+        mapping_id: dv_tensorize_infer_batchify_v1
         mapping_type: GROUP_K_TO_1
         group_k: 4
         glue_type: GLUE_COPY
@@ -305,7 +308,8 @@ tiling_model_by_template:
         glue_compute_Bps: 80000000000.0
         glue_mem_Bps: 200000000000.0
         glue_transfer_path: none
-      "3":
+      "call_variants_infer->call_variants_post":
+        mapping_id: dv_infer_post_batchify_v1
         mapping_type: GROUP_K_TO_1
         group_k: 2
         glue_type: GLUE_COPY
@@ -314,11 +318,13 @@ tiling_model_by_template:
         glue_compute_Bps: 80000000000.0
         glue_mem_Bps: 200000000000.0
         glue_transfer_path: none
-      "4":
+      "call_variants_post->postprocess_variants":
+        mapping_id: dv_post_to_postprocess_identity_v1
         mapping_type: IDENTITY
   tpch_3op:
     enabled: false
     admission_refill_policy: stage0_output
+    glue_resource_mode: shared_consumer_compute
     stage_kernel_class:
       scan_filter_project: STREAM_SIMD
       join: HASH_JOIN_PROBE
@@ -335,7 +341,8 @@ tiling_model_by_template:
       REDUCE_FINAL:
         target_tile_bytes: 67108864
     boundary_mappings:
-      "1":
+      "scan_filter_project->join":
+        mapping_id: tpch_join_shuffle_v1
         mapping_type: REPARTITION_HASH
         partitions: pim_units
         glue_type: GLUE_SHUFFLE
@@ -345,7 +352,8 @@ tiling_model_by_template:
         glue_mem_Bps: 180000000000.0
         glue_transfer_path: none
         output_amplification: 1.0
-      "2":
+      "join->groupby_agg":
+        mapping_id: tpch_groupby_reduce_v1
         mapping_type: GROUP_K_TO_1
         group_k: 4
         glue_type: GLUE_REDUCE

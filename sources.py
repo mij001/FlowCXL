@@ -42,6 +42,13 @@ GLUE_TYPES = (
     GLUE_SHUFFLE,
 )
 
+GLUE_RESOURCE_MODE_SHARED_CONSUMER_COMPUTE = "shared_consumer_compute"
+GLUE_RESOURCE_MODE_DEDICATED_POOL = "dedicated_pool"
+GLUE_RESOURCE_MODES = (
+    GLUE_RESOURCE_MODE_SHARED_CONSUMER_COMPUTE,
+    GLUE_RESOURCE_MODE_DEDICATED_POOL,
+)
+
 KERNEL_CLASS_STREAM_SIMD = "STREAM_SIMD"
 KERNEL_CLASS_HASH_SHUFFLE = "HASH_SHUFFLE"
 KERNEL_CLASS_HASH_JOIN_BUILD = "HASH_JOIN_BUILD"
@@ -712,7 +719,10 @@ PARAMETER_PROVENANCE = {
     "pim_mode_effects": {
         "class": "assumed_sweepable",
         "source": "configs/runs.yaml",
-        "note": "PIM mode multipliers and command-overhead assumptions.",
+        "note": (
+            "PIM mode multipliers and command-overhead assumptions; recommended sweeps: "
+            "compute/mem multipliers +/-20% to +/-40%, command_overhead_s x0.5 to x2.0."
+        ),
         "config_key": "pim_mode_effects",
     },
 }
