@@ -743,6 +743,83 @@ class ValidationPipelineChecks(unittest.TestCase):
             self.assertTrue(Path(summary["fit_yaml"]).exists())
             self.assertIn("One-way sanity check", report_text)
 
+    def test_readme_includes_validation_full_reference_sections(self) -> None:
+        text = Path("README.md").read_text(encoding="utf-8")
+        required_sections = [
+            "## Validation Suite (Microbench + Cross-check + Sensitivity)",
+            "### 1) What This Suite Validates",
+            "### 2) End-to-End Workflow",
+            "### 3) CLI Commands",
+            "### 4) Validation Config Schema (validation.*)",
+            "### 5) Measured CSV Contracts",
+            "### 6) Calibration Semantics",
+            "### 7) Direct Path Provenance States",
+            "### 8) Coverage and Data-Quality Policy",
+            "### 9) Output Artifacts and How to Read Them",
+            "### 10) Applying Calibration Overlay to Simulation",
+            "### 11) Report Integration (Validation Appendix)",
+            "### 12) Troubleshooting and Common Failures",
+            "### 13) Reproducibility Checklist",
+        ]
+        for section in required_sections:
+            self.assertIn(section, text)
+
+    def test_readme_includes_validation_statuses_contracts_and_commands(self) -> None:
+        text = Path("README.md").read_text(encoding="utf-8")
+        required_snippets = [
+            "`measured`",
+            "`crosscheck_only`",
+            "`cited_sweep_only`",
+            "`microbench_agg.csv`",
+            "Required host paths must be pinned",
+            "host_touch_source",
+            "python tools/validation/calibrate_microbench.py --config configs/runs.yaml --out artifacts/validation",
+            "python tools/validation/crosscheck_ps.py --config configs/runs.yaml --out artifacts/validation",
+            "python tools/validation/sensitivity.py --config configs/runs.yaml --out artifacts/validation --ablations-config paper/configs/ablations.yaml",
+            "python tools/validation/run_validation.py --config configs/runs.yaml --artifacts-dir artifacts --ablations-config paper/configs/ablations.yaml",
+            "python run.py --config configs/runs.yaml --artifacts-dir artifacts --validation-overlay artifacts/validation/microbench_overlay.yaml",
+            "python report.py --config configs/runs.yaml --artifacts-dir artifacts --metrics-file artifacts/metrics.csv",
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
+
+    def test_run_validation_cli_emits_summary_and_overlay(self) -> None:
+        import tools.validation.run_validation as run_validation_module
+
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg_path = tmp_path / "cfg.yaml"
+            with cfg_path.open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(cfg, handle, sort_keys=False)
+
+            ablations_cfg = tmp_path / "ablations.yaml"
+            ablations_cfg.write_text(
+                yaml.safe_dump(
+                    {
+                        "ablations": [
+                            {"name": "full_model", "overrides": {}},
+                        ]
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
+            run_validation_module.main(
+                [
+                    "--config",
+                    str(cfg_path),
+                    "--artifacts-dir",
+                    str(tmp_path),
+                    "--ablations-config",
+                    str(ablations_cfg),
+                ]
+            )
+
+            self.assertTrue((tmp_path / "validation" / "validation_summary.yaml").exists())
+            self.assertTrue((tmp_path / "validation" / "microbench_overlay.yaml").exists())
+
     def test_paper_config_discovery_and_run_matrix_determinism(self) -> None:
         self.assertTrue(Path("paper/configs/fig_main.yaml").exists())
         self.assertTrue(Path("paper/configs/fig_validation.yaml").exists())
