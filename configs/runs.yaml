@@ -413,8 +413,31 @@ validation:
       host_d2h: tools/validation/sample_inputs/system_x_2026q1/host_d2h.csv
       bounce: tools/validation/sample_inputs/system_x_2026q1/bounce.csv
       direct: tools/validation/sample_inputs/system_x_2026q1/direct.csv
+      host_touch: tools/validation/sample_inputs/system_x_2026q1/host_touch.csv
     required_paths: [host_h2d, host_d2h, bounce]
     optional_paths: [direct]
+    required_points_min_samples: 5
+    coverage_policy:
+      warn_on_low_samples: true
+      fail_on_missing_required_point: true
+    memory_mode_policy:
+      required_paths_must_be_pinned: true
+      allow_mixed_memory_mode: false
+      pinned_column: pinned
+    host_touch_sanity:
+      enabled: true
+      expected_bandwidth_Bps: null
+      ratio_min: 0.2
+      ratio_max: 2.0
+      warn_only_if_missing_reference: true
+    negative_residual_policy:
+      mode: clamp_to_zero
+      epsilon_s: 1.0e-9
+    direct_provenance_policy:
+      allow_crosscheck_only: true
+      allow_cited_sweep_only: true
+      cited_latency_ns_range: [214, 394]
+      cited_bandwidth_GBps_range: [18, 52]
     payload_bytes: [4194304, 33554432, 268435456]
     concurrency_levels: [1, 2, 4, 8]
     repetitions: 10

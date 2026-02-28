@@ -8,7 +8,8 @@ from typing import Dict, Mapping, MutableMapping
 
 import yaml
 
-VALID_CALIBRATION_PATHS = ("host_h2d", "host_d2h", "bounce", "direct")
+VALID_CALIBRATION_PATHS = ("host_h2d", "host_d2h", "bounce", "direct", "host_touch")
+TRANSFER_CALIBRATION_PATHS = ("host_h2d", "host_d2h", "bounce", "direct")
 DEFAULT_REQUIRED_CALIBRATION_PATHS = ("host_h2d", "host_d2h", "bounce")
 DEFAULT_OPTIONAL_CALIBRATION_PATHS = ("direct",)
 
@@ -138,6 +139,111 @@ def ensure_calibration_config(validation: Mapping[str, object]) -> Dict[str, obj
 
     cal["required_paths"] = required_paths
     cal["optional_paths"] = optional_paths
+
+    required_points_min_samples = int(cal.get("required_points_min_samples", 5))
+    if required_points_min_samples < 1:
+        raise ValueError("validation.calibration.required_points_min_samples must be >= 1")
+    cal["required_points_min_samples"] = required_points_min_samples
+
+    coverage_policy_raw = cal.get("coverage_policy", {})
+    if not isinstance(coverage_policy_raw, Mapping):
+        raise ValueError("validation.calibration.coverage_policy must be a mapping")
+    cal["coverage_policy"] = {
+        "warn_on_low_samples": bool(coverage_policy_raw.get("warn_on_low_samples", True)),
+        "fail_on_missing_required_point": bool(
+            coverage_policy_raw.get("fail_on_missing_required_point", True)
+        ),
+    }
+
+    memory_mode_policy_raw = cal.get("memory_mode_policy", {})
+    if not isinstance(memory_mode_policy_raw, Mapping):
+        raise ValueError("validation.calibration.memory_mode_policy must be a mapping")
+    pinned_column = str(memory_mode_policy_raw.get("pinned_column", "pinned")).strip()
+    if not pinned_column:
+        raise ValueError("validation.calibration.memory_mode_policy.pinned_column must be non-empty")
+    cal["memory_mode_policy"] = {
+        "required_paths_must_be_pinned": bool(
+            memory_mode_policy_raw.get("required_paths_must_be_pinned", True)
+        ),
+        "allow_mixed_memory_mode": bool(memory_mode_policy_raw.get("allow_mixed_memory_mode", False)),
+        "pinned_column": pinned_column,
+    }
+
+    host_touch_sanity_raw = cal.get("host_touch_sanity", {})
+    if not isinstance(host_touch_sanity_raw, Mapping):
+        raise ValueError("validation.calibration.host_touch_sanity must be a mapping")
+    expected_bandwidth_raw = host_touch_sanity_raw.get("expected_bandwidth_Bps")
+    expected_bandwidth = None
+    if expected_bandwidth_raw is not None:
+        expected_bandwidth = float(expected_bandwidth_raw)
+        if expected_bandwidth <= 0.0:
+            raise ValueError(
+                "validation.calibration.host_touch_sanity.expected_bandwidth_Bps must be > 0 when provided"
+            )
+    ratio_min = float(host_touch_sanity_raw.get("ratio_min", 0.2))
+    ratio_max = float(host_touch_sanity_raw.get("ratio_max", 2.0))
+    if ratio_min <= 0.0 or ratio_max <= 0.0:
+        raise ValueError("validation.calibration.host_touch_sanity ratio bounds must be > 0")
+    if ratio_min > ratio_max:
+        raise ValueError("validation.calibration.host_touch_sanity.ratio_min must be <= ratio_max")
+    cal["host_touch_sanity"] = {
+        "enabled": bool(host_touch_sanity_raw.get("enabled", True)),
+        "expected_bandwidth_Bps": expected_bandwidth,
+        "ratio_min": ratio_min,
+        "ratio_max": ratio_max,
+        "warn_only_if_missing_reference": bool(
+            host_touch_sanity_raw.get("warn_only_if_missing_reference", True)
+        ),
+    }
+
+    negative_policy_raw = cal.get("negative_residual_policy", {})
+    if not isinstance(negative_policy_raw, Mapping):
+        raise ValueError("validation.calibration.negative_residual_policy must be a mapping")
+    negative_mode = str(negative_policy_raw.get("mode", "clamp_to_zero"))
+    if negative_mode not in {"drop", "clamp_to_zero", "clamp_to_epsilon"}:
+        raise ValueError(
+            "validation.calibration.negative_residual_policy.mode must be one of "
+            "{drop, clamp_to_zero, clamp_to_epsilon}"
+        )
+    epsilon_s = float(negative_policy_raw.get("epsilon_s", 1e-9))
+    if epsilon_s <= 0.0:
+        raise ValueError("validation.calibration.negative_residual_policy.epsilon_s must be > 0")
+    cal["negative_residual_policy"] = {
+        "mode": negative_mode,
+        "epsilon_s": epsilon_s,
+    }
+
+    direct_policy_raw = cal.get("direct_provenance_policy", {})
+    if not isinstance(direct_policy_raw, Mapping):
+        raise ValueError("validation.calibration.direct_provenance_policy must be a mapping")
+    latency_range = direct_policy_raw.get("cited_latency_ns_range", [214, 394])
+    bandwidth_range = direct_policy_raw.get("cited_bandwidth_GBps_range", [18, 52])
+    if not isinstance(latency_range, list) or len(latency_range) != 2:
+        raise ValueError(
+            "validation.calibration.direct_provenance_policy.cited_latency_ns_range must be [min,max]"
+        )
+    if not isinstance(bandwidth_range, list) or len(bandwidth_range) != 2:
+        raise ValueError(
+            "validation.calibration.direct_provenance_policy.cited_bandwidth_GBps_range must be [min,max]"
+        )
+    latency_range_f = [float(latency_range[0]), float(latency_range[1])]
+    bandwidth_range_f = [float(bandwidth_range[0]), float(bandwidth_range[1])]
+    if latency_range_f[0] <= 0 or latency_range_f[1] <= 0 or latency_range_f[0] > latency_range_f[1]:
+        raise ValueError("validation.calibration.direct_provenance_policy.cited_latency_ns_range invalid")
+    if (
+        bandwidth_range_f[0] <= 0
+        or bandwidth_range_f[1] <= 0
+        or bandwidth_range_f[0] > bandwidth_range_f[1]
+    ):
+        raise ValueError(
+            "validation.calibration.direct_provenance_policy.cited_bandwidth_GBps_range invalid"
+        )
+    cal["direct_provenance_policy"] = {
+        "allow_crosscheck_only": bool(direct_policy_raw.get("allow_crosscheck_only", True)),
+        "allow_cited_sweep_only": bool(direct_policy_raw.get("allow_cited_sweep_only", True)),
+        "cited_latency_ns_range": latency_range_f,
+        "cited_bandwidth_GBps_range": bandwidth_range_f,
+    }
 
     ceiling_raw = cal.get("ceiling_check", {})
     if not isinstance(ceiling_raw, Mapping):

@@ -438,28 +438,55 @@ def main(argv: Sequence[str] | None = None) -> None:
     validation_plots: List[str] = []
     if validation_dir.exists():
         raw_path = validation_dir / "microbench_raw.csv"
+        agg_path = validation_dir / "microbench_agg.csv"
         fit_path = validation_dir / "microbench_fit.yaml"
         cross_path = validation_dir / "cxl_ps_crosscheck.csv"
         sensitivity_path = validation_dir / "sensitivity_results.csv"
         tornado_path = validation_dir / "tornado_top8.csv"
         ablations_path = validation_dir / "ablations.csv"
+        fit_payload: Dict[str, object] = {}
+
+        if agg_path.exists():
+            agg_df = pd.read_csv(agg_path)
+            validation_plots.extend(_plot_validation_measured_vs_sim(agg_df, report_dir))
+            validation_sections.append(
+                "### Microbenchmark Calibration (Aggregated)\n\n"
+                f"- Source: `{agg_path}`\n\n"
+                + "\n".join(f"- {p}" for p in validation_plots if "measured_vs_sim" in p)
+            )
+        elif raw_path.exists():
+            raw_df = pd.read_csv(raw_path)
+            validation_plots.extend(_plot_validation_measured_vs_sim(raw_df, report_dir))
+            validation_sections.append(
+                "### Microbenchmark Calibration (Raw Fallback)\n\n"
+                f"- Source: `{raw_path}`\n\n"
+                + "\n".join(f"- {p}" for p in validation_plots if "measured_vs_sim" in p)
+            )
 
         if raw_path.exists():
             raw_df = pd.read_csv(raw_path)
-            validation_plots.extend(_plot_validation_measured_vs_sim(raw_df, report_dir))
             tool_values = sorted({str(v) for v in raw_df.get("tool", pd.Series(dtype=str)).dropna().tolist()})
             pinned_values = sorted({str(v) for v in raw_df.get("pinned", pd.Series(dtype=str)).dropna().tolist()})
+            numa_values = sorted(
+                {str(v) for v in raw_df.get("numa_policy", pd.Series(dtype=str)).dropna().tolist()}
+            )
+            dma_values = sorted(
+                {str(v) for v in raw_df.get("dma_engine", pd.Series(dtype=str)).dropna().tolist()}
+            )
             notes: List[str] = []
             if tool_values:
                 notes.append(f"- Tools observed: `{', '.join(tool_values)}`")
             if pinned_values:
                 notes.append(f"- Pinned flags observed: `{', '.join(pinned_values)}`")
-            validation_sections.append(
-                "### Microbenchmark Calibration\n\n"
-                f"- Source: `{raw_path}`\n"
-                + ("\n".join(notes) + "\n" if notes else "")
-                + "\n".join(f"- {p}" for p in validation_plots if "measured_vs_sim" in p)
-            )
+            if numa_values:
+                notes.append(f"- NUMA policies observed: `{', '.join(numa_values)}`")
+            if dma_values:
+                notes.append(f"- DMA engines observed: `{', '.join(dma_values)}`")
+            if notes:
+                validation_sections.append(
+                    "### Measurement Notes\n\n"
+                    + "\n".join(notes)
+                )
         if fit_path.exists():
             with fit_path.open("r", encoding="utf-8") as handle:
                 fit_payload = yaml.safe_load(handle) or {}
@@ -479,15 +506,62 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             fit_df = pd.DataFrame(fit_rows)
             host_touch_fit = fit_payload.get("host_touch_fit", {}) or {}
+            host_touch_source = str(fit_payload.get("host_touch_source", ""))
+            host_touch_sanity = fit_payload.get("host_touch_sanity", {}) or {}
+            negative_summary = fit_payload.get("negative_residual_summary", {}) or {}
+            coverage_summary = fit_payload.get("coverage_summary", {}) or {}
+            semantics_summary = fit_payload.get("measurement_semantics_summary", {}) or {}
+            direct_status = str(fit_payload.get("direct_status", ""))
             host_touch_df = pd.DataFrame(
                 [
                     {
+                        "host_touch_source": host_touch_source,
                         "status": host_touch_fit.get("status", ""),
                         "host_touch_Bps": host_touch_fit.get("host_touch_Bps", ""),
                         "host_touch_fixed_s": host_touch_fit.get("host_touch_fixed_s", ""),
                         "mape_percent": host_touch_fit.get("mape_percent", ""),
                         "r2": host_touch_fit.get("r2", ""),
                         "n_points": host_touch_fit.get("n_points", ""),
+                        "sanity_status": host_touch_sanity.get("status", ""),
+                        "sanity_ratio": host_touch_sanity.get("ratio", ""),
+                        "sanity_note": host_touch_sanity.get("note", ""),
+                    }
+                ]
+            )
+            coverage_df = pd.DataFrame(
+                [
+                    {
+                        "required_points_total": coverage_summary.get("required_points_total", ""),
+                        "required_points_observed": coverage_summary.get("required_points_observed", ""),
+                        "required_points_missing_count": coverage_summary.get("required_points_missing_count", ""),
+                        "optional_points_missing_count": coverage_summary.get("optional_points_missing_count", ""),
+                        "low_sample_points_count": coverage_summary.get("low_sample_points_count", ""),
+                        "required_points_min_samples": coverage_summary.get(
+                            "required_points_min_samples", ""
+                        ),
+                    }
+                ]
+            )
+            semantics_rows: List[Dict[str, object]] = []
+            for path_name, values in (semantics_summary.get("per_path", {}) or {}).items():
+                semantics_rows.append(
+                    {
+                        "path": path_name,
+                        "pinned": "|".join(values.get("pinned", []) or []),
+                        "tool": "|".join(values.get("tool", []) or []),
+                        "numa_policy": "|".join(values.get("numa_policy", []) or []),
+                        "dma_engine": "|".join(values.get("dma_engine", []) or []),
+                    }
+                )
+            semantics_df = pd.DataFrame(semantics_rows)
+            negative_df = pd.DataFrame(
+                [
+                    {
+                        "policy_mode": negative_summary.get("policy_mode", ""),
+                        "epsilon_s": negative_summary.get("epsilon_s", ""),
+                        "negative_points_count": negative_summary.get("negative_points_count", ""),
+                        "affected_paths": "|".join(negative_summary.get("affected_paths", []) or []),
+                        "action_applied": negative_summary.get("action_applied", ""),
                     }
                 ]
             )
@@ -498,26 +572,50 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "ceiling_check_pass": ceiling.get("ceiling_check_pass", ""),
                     "pcie_gen": ceiling.get("pcie_gen", ""),
                     "lane_width": ceiling.get("lane_width", ""),
+                    "one_way_theoretical_Bps": ceiling.get("one_way_theoretical_Bps", ""),
                     "one_way_threshold_Bps": ceiling.get("one_way_threshold_Bps", ""),
                     "ceiling_violation_paths": "|".join(ceiling.get("ceiling_violation_paths", []) or []),
                     "note": ceiling.get("ceiling_violation_notes", ""),
                 }
             ]
-            status_map = fit_payload.get("calibration_status", {}) or {}
-            fallback_paths = sorted([k for k, v in status_map.items() if str(v) == "fallback_crosscheck"])
-            fallback_text = (
-                f"- Cross-check fallback paths: `{', '.join(fallback_paths)}`"
-                if fallback_paths
-                else "- Cross-check fallback paths: none"
+            coverage_warnings = coverage_summary.get("coverage_warnings", []) or []
+            coverage_warning_text = (
+                "- Coverage warnings: " + " | ".join(str(v) for v in coverage_warnings)
+                if coverage_warnings
+                else "- Coverage warnings: none"
             )
+            if direct_status == "measured":
+                direct_status_text = (
+                    "- Direct status: `measured` (calibrated from measured direct CSV input)."
+                )
+            elif direct_status == "crosscheck_only":
+                direct_status_text = (
+                    "- Direct status: `crosscheck_only` (validated via processor-share cross-check; "
+                    "not measured calibrated)."
+                )
+            elif direct_status == "cited_sweep_only":
+                direct_status_text = (
+                    "- Direct status: `cited_sweep_only` (not measured calibrated; uses cited+sweep envelope)."
+                )
+            else:
+                direct_status_text = f"- Direct status: `{direct_status or 'unknown'}`"
             validation_sections.append(
                 "### Calibration Fit Summary\n\n"
                 f"{_build_markdown_table(_format_metric_fields(fit_df))}\n\n"
+                "Measurement semantics:\n\n"
+                f"{_build_markdown_table(_format_metric_fields(semantics_df))}\n\n"
+                "Coverage quality:\n\n"
+                f"{_build_markdown_table(_format_metric_fields(coverage_df))}\n\n"
+                f"{coverage_warning_text}\n\n"
                 "Host-touch decomposition fit:\n\n"
                 f"{_build_markdown_table(_format_metric_fields(host_touch_df))}\n\n"
+                "Residual policy audit:\n\n"
+                f"{_build_markdown_table(_format_metric_fields(negative_df))}\n\n"
                 "PCIe ceiling check:\n\n"
                 f"{_build_markdown_table(_format_metric_fields(pd.DataFrame(ceiling_rows)))}\n\n"
-                f"{fallback_text}"
+                "- One-way sanity check uses x16 bidirectional vendor-table approximation / 2 with "
+                "configured utilization cap.\n\n"
+                f"{direct_status_text}"
             )
         if cross_path.exists():
             cross_df = pd.read_csv(cross_path)
@@ -531,16 +629,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             ]
             cross_show = cross_df[show_cols] if not cross_df.empty else cross_df
             cross_note = ""
-            if fit_path.exists():
-                with fit_path.open("r", encoding="utf-8") as handle:
-                    fit_payload = yaml.safe_load(handle) or {}
-                status_map = fit_payload.get("calibration_status", {}) or {}
-                fallback_paths = sorted([k for k, v in status_map.items() if str(v) == "fallback_crosscheck"])
-                if fallback_paths:
-                    cross_note = (
-                        "\n- Direct-path calibration is fallback cross-check validated for: "
-                        f"`{', '.join(fallback_paths)}`"
-                    )
+            if str(fit_payload.get("direct_status", "")) == "crosscheck_only":
+                cross_note = (
+                    "\n- Direct path is `crosscheck_only`: validated by this PS cross-check artifact, "
+                    "not measured calibrated."
+                )
             validation_sections.append(
                 "### Processor-Share Cross-Check\n\n"
                 f"- Source: `{cross_path}`\n\n"

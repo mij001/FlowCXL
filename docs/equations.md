@@ -355,16 +355,22 @@ E_{total}=E_{compute}+E_{transfer}
 
 ## 8) Calibration Fit And Residual Metrics
 
-Measured calibration rows come from CSV inputs (`time_s`) and are compared against simulator predictions:
+Measured rows are first aggregated by group:
 
 \[
-error_i = T^{measured}_i - T^{sim}_i
+g=(path,\ payload,\ concurrency)
 \]
 \[
-MAE = \frac{1}{N}\sum_i |error_i|
+T^{measured}_{g}=Agg\left(\{time\_s\}_{g}\right),\quad Agg\in\{median,mean\}
 \]
 \[
-MAPE = \frac{100}{N}\sum_i \left|\frac{T^{measured}_i - T^{sim}_i}{max(T^{measured}_i,\epsilon)}\right|
+error_g = T^{measured}_g - T^{sim}_g
+\]
+\[
+MAE = \frac{1}{|G|}\sum_g |error_g|
+\]
+\[
+MAPE = \frac{100}{|G|}\sum_g \left|\frac{T^{measured}_g - T^{sim}_g}{max(T^{measured}_g,\epsilon)}\right|
 \]
 
 Per-path fit model (reference concurrency):
@@ -375,7 +381,13 @@ T_{path}(bytes)=latency_{path}+\frac{bytes}{BW_{path}}
 
 with `latency_path` and `BW_path` fitted from measured points using linear regression over payload size.
 
-Host-touch decomposition from bounce measurements:
+Host-touch provenance:
+
+\[
+host\_touch\_source \in \{measured\_stream,\ derived\_from\_bounce\}
+\]
+
+If `host_touch_source=derived_from_bounce`:
 
 \[
 T_{touch,est}(bytes)=T_{bounce,measured}(bytes)-T_{d2h,fit}(bytes)-T_{h2d,fit}(bytes)
@@ -384,7 +396,22 @@ T_{touch,est}(bytes)=T_{bounce,measured}(bytes)-T_{d2h,fit}(bytes)-T_{h2d,fit}(b
 T_{touch,fit}(bytes)=host\_touch\_fixed\_s+\frac{bytes}{host\_touch\_Bps}
 \]
 
-Negative `T_touch,est` values are clamped to zero and reported as fit warnings.
+Negative `T_touch,est` policy:
+
+\[
+T^{\prime}_{touch,est}=
+\begin{cases}
+\text{drop point}, & mode=drop \\
+0, & mode=clamp\_to\_zero \\
+\epsilon, & mode=clamp\_to\_epsilon
+\end{cases}
+\]
+
+Direct-path provenance status:
+
+\[
+direct\_status \in \{measured,\ crosscheck\_only,\ cited\_sweep\_only\}
+\]
 
 Cross-check acceptance compares direct scheduler MAPE against configured tolerance.
 
@@ -405,4 +432,4 @@ Host-path fit is flagged if:
 BW_{fit,path} > BW_{threshold}
 \]
 
-This is a sanity guard for suspect measurements (e.g., wrong NUMA placement, pageable staging effects).
+This is a one-way sanity guard derived from a bidirectional table approximation (per-lane rate x lane width, then utilization cap), not a full throughput model.

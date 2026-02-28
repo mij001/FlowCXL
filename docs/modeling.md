@@ -113,9 +113,14 @@ Metrics include:
 Calibration inputs are measured CSV files configured under `validation.calibration.measured_inputs`.
 
 - required measured paths: `host_h2d`, `host_d2h`, `bounce`
-- optional measured path: `direct`
+- optional measured paths: `direct`, `host_touch`
+- required host paths default to pinned-only rows (`memory_mode_policy.required_paths_must_be_pinned=true`)
 
-When `direct` is missing, calibration status is `fallback_crosscheck` and direct-path validation is taken from the PS cross-check artifact (`cxl_ps_crosscheck.csv`).
+Direct-path provenance is explicit:
+
+- `measured`: calibrated from measured direct CSV input
+- `crosscheck_only`: validated via PS cross-check artifact (`cxl_ps_crosscheck.csv`), not measured calibrated
+- `cited_sweep_only`: no measured direct input; use cited+sweep envelope
 
 ## Optional Retiling/Glue Layer
 

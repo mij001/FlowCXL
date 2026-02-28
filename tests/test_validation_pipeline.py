@@ -38,15 +38,24 @@ class ValidationPipelineChecks(unittest.TestCase):
         ]
         return cfg
 
-    def _write_measured_inputs(self, root_dir: Path, cfg: dict, *, include_direct: bool = True) -> dict:
+    def _write_measured_inputs(
+        self,
+        root_dir: Path,
+        cfg: dict,
+        *,
+        include_direct: bool = True,
+        include_host_touch: bool = False,
+        samples_per_point: int | None = None,
+    ) -> dict:
         payloads = [int(v) for v in cfg["validation"]["calibration"]["payload_bytes"]]
         concs = [int(v) for v in cfg["validation"]["calibration"]["concurrency_levels"]]
         system_id = str(cfg["validation"]["system_id"])
+        reps = int(samples_per_point or cfg["validation"]["calibration"]["repetitions"])
 
         spec = {
             "host_h2d": (8.9e-6, 6.65e9, 0.035, "true"),
             "host_d2h": (9.4e-6, 4.72e9, 0.040, "true"),
-            "bounce": (21.0e-6, 2.52e9, 0.055, "na"),
+            "bounce": (21.0e-6, 2.52e9, 0.055, "true"),
             "direct": (0.62e-6, 46.8e9, 0.025, "na"),
         }
         paths = ["host_h2d", "host_d2h", "bounce"] + (["direct"] if include_direct else [])
@@ -67,26 +76,70 @@ class ValidationPipelineChecks(unittest.TestCase):
                         "time_s",
                         "tool",
                         "pinned",
+                        "numa_policy",
+                        "dma_engine",
                         "notes",
                     ]
                 )
                 for payload in payloads:
                     for conc in concs:
-                        time_s = base + (float(payload) / bw) * (1.0 + scale * (conc - 1))
+                        for rep in range(reps):
+                            jitter = 1.0 + (0.0005 * rep)
+                            time_s = (base + (float(payload) / bw) * (1.0 + scale * (conc - 1))) * jitter
+                            writer.writerow(
+                                [
+                                    system_id,
+                                    path_name,
+                                    payload,
+                                    conc,
+                                    rep,
+                                    f"{time_s:.12f}",
+                                    "custom",
+                                    pinned,
+                                    "socket0_pinned",
+                                    "gpu_dma",
+                                    "test_input",
+                                ]
+                            )
+            out_map[path_name] = str(out_path)
+
+        if include_host_touch:
+            host_touch_path = root_dir / "host_touch.csv"
+            with host_touch_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(
+                    [
+                        "system_id",
+                        "path",
+                        "payload_bytes",
+                        "repetition",
+                        "time_s",
+                        "tool",
+                        "numa_policy",
+                        "dma_engine",
+                        "notes",
+                    ]
+                )
+                host_touch_bw = 2.2e10
+                host_touch_fixed = 2.0e-6
+                for payload in payloads:
+                    for rep in range(reps):
+                        jitter = 1.0 + (0.0005 * rep)
+                        time_s = (host_touch_fixed + (float(payload) / host_touch_bw)) * jitter
                         writer.writerow(
                             [
                                 system_id,
-                                path_name,
+                                "host_touch",
                                 payload,
-                                conc,
-                                0,
+                                rep,
                                 f"{time_s:.12f}",
-                                "custom",
-                                pinned,
+                                "stream_like",
+                                "socket0_pinned",
+                                "host_memcpy",
                                 "test_input",
                             ]
                         )
-            out_map[path_name] = str(out_path)
+            out_map["host_touch"] = str(host_touch_path)
 
         return out_map
 
@@ -97,9 +150,11 @@ class ValidationPipelineChecks(unittest.TestCase):
             cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(tmp_path, cfg)
             summary = run_calibration(config=cfg, out_dir=tmp_path)
             raw_path = Path(summary["raw_csv"])
+            agg_path = Path(summary["agg_csv"])
             fit_path = Path(summary["fit_yaml"])
             overlay_path = Path(summary["overlay_yaml"])
             self.assertTrue(raw_path.exists())
+            self.assertTrue(agg_path.exists())
             self.assertTrue(fit_path.exists())
             self.assertTrue(overlay_path.exists())
 
@@ -108,6 +163,11 @@ class ValidationPipelineChecks(unittest.TestCase):
                 cols = reader.fieldnames or []
             for col in ["system_id", "path", "payload_bytes", "concurrency", "measured_s", "simulated_s"]:
                 self.assertIn(col, cols)
+
+            with agg_path.open("r", encoding="utf-8", newline="") as handle:
+                agg_cols = csv.DictReader(handle).fieldnames or []
+            for col in ["path", "payload_bytes", "concurrency", "sample_count", "measured_s", "simulated_s"]:
+                self.assertIn(col, agg_cols)
 
     def test_calibration_requires_measured_inputs_for_required_paths(self) -> None:
         cfg = self._small_config()
@@ -118,7 +178,7 @@ class ValidationPipelineChecks(unittest.TestCase):
             with self.assertRaises((FileNotFoundError, ValueError, KeyError)):
                 run_calibration(config=cfg, out_dir=Path(tmpdir))
 
-    def test_calibration_accepts_missing_direct_with_fallback_status(self) -> None:
+    def test_calibration_accepts_missing_direct_with_crosscheck_only_status(self) -> None:
         cfg = self._small_config()
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -130,7 +190,8 @@ class ValidationPipelineChecks(unittest.TestCase):
             with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
                 fit_payload = yaml.safe_load(handle) or {}
             status = fit_payload.get("calibration_status", {})
-            self.assertEqual(status.get("direct"), "fallback_crosscheck")
+            self.assertEqual(status.get("direct"), "crosscheck_only")
+            self.assertEqual(fit_payload.get("direct_status"), "crosscheck_only")
 
     def test_measured_csv_schema_validation(self) -> None:
         cfg = self._small_config()
@@ -191,6 +252,205 @@ class ValidationPipelineChecks(unittest.TestCase):
             strict_cfg["validation"]["calibration"]["ceiling_check"]["fail_on_violation"] = True
             with self.assertRaises(ValueError):
                 run_calibration(config=strict_cfg, out_dir=tmp_path)
+
+    def test_required_host_paths_reject_non_pinned_rows(self) -> None:
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            measured_inputs = self._write_measured_inputs(tmp_path, cfg)
+            host_h2d = Path(measured_inputs["host_h2d"])
+            with host_h2d.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            rows[0]["pinned"] = "false"
+            with host_h2d.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+            cfg["validation"]["calibration"]["measured_inputs"] = measured_inputs
+            with self.assertRaises(ValueError):
+                run_calibration(config=cfg, out_dir=tmp_path)
+
+    def test_required_host_paths_reject_mixed_pinned_pageable_when_disallowed(self) -> None:
+        cfg = self._small_config()
+        cfg["validation"]["calibration"]["memory_mode_policy"]["required_paths_must_be_pinned"] = False
+        cfg["validation"]["calibration"]["memory_mode_policy"]["allow_mixed_memory_mode"] = False
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            measured_inputs = self._write_measured_inputs(tmp_path, cfg)
+            host_d2h = Path(measured_inputs["host_d2h"])
+            with host_d2h.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            rows[0]["pinned"] = "false"
+            with host_d2h.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+            cfg["validation"]["calibration"]["measured_inputs"] = measured_inputs
+            with self.assertRaises(ValueError):
+                run_calibration(config=cfg, out_dir=tmp_path)
+
+    def test_allow_mixed_memory_mode_true_allows_mixed_rows(self) -> None:
+        cfg = self._small_config()
+        cfg["validation"]["calibration"]["memory_mode_policy"]["required_paths_must_be_pinned"] = False
+        cfg["validation"]["calibration"]["memory_mode_policy"]["allow_mixed_memory_mode"] = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            measured_inputs = self._write_measured_inputs(tmp_path, cfg)
+            host_d2h = Path(measured_inputs["host_d2h"])
+            with host_d2h.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            rows[0]["pinned"] = "false"
+            with host_d2h.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+            cfg["validation"]["calibration"]["measured_inputs"] = measured_inputs
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            self.assertTrue(Path(summary["fit_yaml"]).exists())
+
+    def test_coverage_requires_min_samples_per_required_point(self) -> None:
+        cfg = self._small_config()
+        cfg["validation"]["calibration"]["required_points_min_samples"] = 5
+        cfg["validation"]["calibration"]["coverage_policy"]["fail_on_missing_required_point"] = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            measured_inputs = self._write_measured_inputs(tmp_path, cfg, samples_per_point=1)
+            host_h2d = Path(measured_inputs["host_h2d"])
+            with host_h2d.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            rows = [r for r in rows if not (int(r["payload_bytes"]) == 4194304 and int(r["concurrency"]) == 1)]
+            with host_h2d.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+            cfg["validation"]["calibration"]["measured_inputs"] = measured_inputs
+            with self.assertRaises(ValueError):
+                run_calibration(config=cfg, out_dir=tmp_path)
+
+    def test_coverage_warns_on_low_samples_without_missing_point(self) -> None:
+        cfg = self._small_config()
+        cfg["validation"]["calibration"]["required_points_min_samples"] = 5
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(
+                tmp_path, cfg, samples_per_point=2
+            )
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            coverage_summary = fit_payload.get("coverage_summary", {})
+            self.assertEqual(coverage_summary.get("required_points_missing_count"), 0)
+            self.assertGreater(int(coverage_summary.get("low_sample_points_count", 0)), 0)
+
+    def test_aggregate_level_fit_ignores_repetition_pairing(self) -> None:
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(tmp_path, cfg)
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["agg_csv"]).open("r", encoding="utf-8", newline="") as handle:
+                agg_rows = list(csv.DictReader(handle))
+            self.assertTrue(agg_rows)
+            first = agg_rows[0]
+            self.assertIn("sample_count", first)
+            self.assertGreaterEqual(int(float(first["sample_count"])), 1)
+
+    def test_host_touch_source_measured_stream_when_host_touch_input_present(self) -> None:
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(
+                tmp_path, cfg, include_host_touch=True
+            )
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            self.assertEqual(fit_payload.get("host_touch_source"), "measured_stream")
+
+    def test_host_touch_source_derived_from_bounce_when_host_touch_absent(self) -> None:
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(
+                tmp_path, cfg, include_host_touch=False
+            )
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            self.assertEqual(fit_payload.get("host_touch_source"), "derived_from_bounce")
+
+    def test_host_touch_sanity_block_present_and_auditable(self) -> None:
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(
+                tmp_path, cfg, include_host_touch=True
+            )
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            sanity = fit_payload.get("host_touch_sanity", {})
+            self.assertIn("status", sanity)
+            self.assertIn("source", sanity)
+            self.assertIn("ratio_min", sanity)
+            self.assertIn("ratio_max", sanity)
+
+    def test_negative_residual_policy_audit_fields_present(self) -> None:
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(tmp_path, cfg)
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            negative = fit_payload.get("negative_residual_summary", {})
+            for key in ["policy_mode", "negative_points_count", "affected_paths", "action_applied"]:
+                self.assertIn(key, negative)
+
+    def test_direct_status_measured(self) -> None:
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(tmp_path, cfg)
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            self.assertEqual(fit_payload.get("direct_status"), "measured")
+
+    def test_direct_status_cited_sweep_only(self) -> None:
+        cfg = self._small_config()
+        cfg["validation"]["calibration"]["direct_provenance_policy"]["allow_crosscheck_only"] = False
+        cfg["validation"]["calibration"]["direct_provenance_policy"]["allow_cited_sweep_only"] = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            measured_inputs = self._write_measured_inputs(tmp_path, cfg, include_direct=False)
+            measured_inputs["direct"] = str(tmp_path / "direct_missing.csv")
+            cfg["validation"]["calibration"]["measured_inputs"] = measured_inputs
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            self.assertEqual(fit_payload.get("direct_status"), "cited_sweep_only")
+
+    def test_direct_override_written_only_when_status_measured(self) -> None:
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(tmp_path, cfg)
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["overlay_yaml"]).open("r", encoding="utf-8") as handle:
+                overlay_measured = yaml.safe_load(handle) or {}
+            direct_link = str(cfg["link_profile"]["cxl_direct_link"])
+            self.assertIn(direct_link, (overlay_measured.get("link_constant_overrides") or {}))
+
+            cfg2 = self._small_config()
+            cfg2["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(
+                tmp_path, cfg2, include_direct=False
+            )
+            cfg2["validation"]["calibration"]["measured_inputs"]["direct"] = str(tmp_path / "direct_missing.csv")
+            summary2 = run_calibration(config=cfg2, out_dir=tmp_path / "run2")
+            with Path(summary2["overlay_yaml"]).open("r", encoding="utf-8") as handle:
+                overlay_unmeasured = yaml.safe_load(handle) or {}
+            self.assertNotIn(direct_link, (overlay_unmeasured.get("link_constant_overrides") or {}))
 
     def test_overlay_merge_determinism(self) -> None:
         import run as run_module
@@ -339,8 +599,9 @@ class ValidationPipelineChecks(unittest.TestCase):
                             "host_h2d": "measured",
                             "host_d2h": "measured",
                             "bounce": "measured",
-                            "direct": "fallback_crosscheck",
+                            "direct": "crosscheck_only",
                         },
+                        "direct_status": "crosscheck_only",
                         "paths": {
                             "host_h2d": {
                                 "calibration_status": "measured",
@@ -352,6 +613,39 @@ class ValidationPipelineChecks(unittest.TestCase):
                                 "fit_concurrency": 1,
                             }
                         },
+                        "coverage_summary": {
+                            "required_points_total": 12,
+                            "required_points_observed": 12,
+                            "required_points_missing_count": 0,
+                            "optional_points_missing_count": 0,
+                            "low_sample_points_count": 0,
+                            "required_points_min_samples": 5,
+                            "coverage_warnings": [],
+                        },
+                        "measurement_semantics_summary": {
+                            "per_path": {
+                                "host_h2d": {
+                                    "pinned": ["True"],
+                                    "tool": ["custom"],
+                                    "numa_policy": ["socket0_pinned"],
+                                    "dma_engine": ["gpu_dma"],
+                                }
+                            }
+                        },
+                        "host_touch_source": "derived_from_bounce",
+                        "host_touch_sanity": {
+                            "status": "warn_no_reference",
+                            "source": "derived_from_bounce",
+                            "ratio_min": 0.2,
+                            "ratio_max": 2.0,
+                            "note": "No measured host_touch input or expected_bandwidth_Bps reference provided.",
+                        },
+                        "negative_residual_summary": {
+                            "policy_mode": "clamp_to_zero",
+                            "negative_points_count": 0,
+                            "affected_paths": [],
+                            "action_applied": "clamp_to_zero",
+                        },
                         "host_touch_fit": {
                             "status": "measured_decomposition",
                             "host_touch_Bps": 2.5e10,
@@ -362,6 +656,7 @@ class ValidationPipelineChecks(unittest.TestCase):
                             "ceiling_check_pass": True,
                             "pcie_gen": 4,
                             "lane_width": 16,
+                            "one_way_theoretical_Bps": 3.1504e10,
                             "one_way_threshold_Bps": 3.0e10,
                             "ceiling_violation_paths": [],
                             "ceiling_violation_notes": "",
@@ -411,7 +706,42 @@ class ValidationPipelineChecks(unittest.TestCase):
                 ]
             )
             report_text = (artifacts_dir / "report" / "report.md").read_text(encoding="utf-8")
-            self.assertIn("fallback cross-check", report_text)
+            self.assertIn("crosscheck_only", report_text)
+            self.assertIn("not measured calibrated", report_text)
+
+    def test_report_mentions_pcie_one_way_sanity_language(self) -> None:
+        import report as report_module
+
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(tmp_path, cfg)
+            summary = run_calibration(config=cfg, out_dir=tmp_path / "validation")
+
+            metrics, _ = generate_runs_from_config(cfg)
+            metrics_path = tmp_path / "metrics.csv"
+            with metrics_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(metrics[0].keys()))
+                writer.writeheader()
+                writer.writerows(metrics)
+
+            cfg_path = tmp_path / "cfg.yaml"
+            with cfg_path.open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(cfg, handle, sort_keys=False)
+
+            report_module.main(
+                [
+                    "--config",
+                    str(cfg_path),
+                    "--artifacts-dir",
+                    str(tmp_path),
+                    "--metrics-file",
+                    str(metrics_path),
+                ]
+            )
+            report_text = (tmp_path / "report" / "report.md").read_text(encoding="utf-8")
+            self.assertTrue(Path(summary["fit_yaml"]).exists())
+            self.assertIn("One-way sanity check", report_text)
 
     def test_paper_config_discovery_and_run_matrix_determinism(self) -> None:
         self.assertTrue(Path("paper/configs/fig_main.yaml").exists())

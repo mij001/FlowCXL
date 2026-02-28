@@ -16,13 +16,20 @@ Validation calibration contract:
 - `validation.calibration.input_mode` must be `measured_csv`.
 - `validation.calibration.measured_inputs` maps each path to a CSV file.
 - required measured paths: `host_h2d`, `host_d2h`, `bounce`.
-- optional measured path: `direct`.
-- when optional `direct` is missing, calibration status is `fallback_crosscheck` and direct-path validity is taken from PS cross-check outputs.
+- optional measured paths: `direct`, `host_touch`.
+- default pinned contract requires required host paths to be pinned (`memory_mode_policy.required_paths_must_be_pinned=true`).
+- mixed pinned/pageable required-path rows are rejected by default (`allow_mixed_memory_mode=false`).
+- optional `direct` status is explicit:
+  - `measured`
+  - `crosscheck_only` (validated via PS cross-check; not measured calibrated)
+  - `cited_sweep_only` (no measured/crosscheck direct calibration path)
 
 Canonical measured CSV schema per path:
 
-- required columns: `system_id`, `path`, `payload_bytes`, `concurrency`, `repetition`, `time_s`
-- optional columns: `tool`, `pinned`, `percentile_source`, `timestamp`, `notes`
+- transfer-path required columns: `system_id`, `path`, `payload_bytes`, `concurrency`, `repetition`, `time_s`, `pinned`
+- `host_touch` required columns: `system_id`, `path=host_touch`, `payload_bytes`, `repetition`, `time_s` (`concurrency` defaults to 1 if omitted)
+- optional measurement semantics columns: `tool`, `numa_policy`, `dma_engine`, `percentile_source`, `timestamp`, `notes`
+- `repetition` is sample-id only; fit/residuals use aggregate groups `(path,payload_bytes,concurrency)`
 
 ## Outputs
 
@@ -36,6 +43,7 @@ Primary outputs:
 Validation outputs:
 
 - `artifacts/validation/microbench_raw.csv`
+- `artifacts/validation/microbench_agg.csv`
 - `artifacts/validation/microbench_fit.yaml`
 - `artifacts/validation/microbench_overlay.yaml`
 - `artifacts/validation/cxl_ps_crosscheck.csv`
@@ -97,8 +105,11 @@ Bounce decomposition derives host-touch fit:
 
 - `T_touch_est = T_bounce_measured - T_h2d_fit - T_d2h_fit`
 - `T_touch_est = host_touch_fixed_s + bytes / host_touch_Bps`
+- `host_touch_source` is always explicit: `derived_from_bounce` or `measured_stream`
+- negative residual handling is policy-driven and audited (`drop`, `clamp_to_zero`, `clamp_to_epsilon`)
 
 PCIe sanity guard can flag suspicious one-way throughput using configured generation/lane width and utilization cap.
+It is a sanity approximation derived from a bidirectional table / 2, not a full throughput model.
 
 ## Non-goals
 

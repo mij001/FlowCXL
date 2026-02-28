@@ -83,7 +83,10 @@ This file maps each headline claim to reproducible artifacts, configs, provenanc
 - Sensitivity statement:
   - Calibration/cross-check residuals are tracked and surfaced in validation appendix sections.
 - Residual caveats:
-  - Optional `direct` path may use cross-check-only fallback when no measured direct CSV is supplied.
+  - Optional `direct` path status is explicit:
+    - `measured` when direct CSV is provided and fitted
+    - `crosscheck_only` when direct is unmeasured but validated by PS cross-check
+    - `cited_sweep_only` when direct is unmeasured and validated via cited envelope + sweep
 
 ## Claim 5: Direct scheduler behavior matches independent PS reference within configured tolerance
 - Claim statement:

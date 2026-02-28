@@ -159,14 +159,21 @@ Required measured paths:
 - `host_d2h`
 - `bounce`
 
-Optional measured path:
+Optional measured paths:
 
-- `direct` (falls back to cross-check-only validation when omitted)
+- `direct`
+- `host_touch` (STREAM-like host memory touch path)
+
+Pinned contract defaults:
+
+- required host paths must be pinned (`memory_mode_policy.required_paths_must_be_pinned=true`)
+- mixed pinned/pageable required-path rows are rejected (`allow_mixed_memory_mode=false`)
 
 Canonical CSV columns:
 
-- required: `system_id,path,payload_bytes,concurrency,repetition,time_s`
-- optional: `tool,pinned,percentile_source,timestamp,notes`
+- transfer-path required: `system_id,path,payload_bytes,concurrency,repetition,time_s,pinned`
+- host-touch required: `system_id,path=host_touch,payload_bytes,repetition,time_s` (`concurrency` defaults to `1` if omitted)
+- optional: `tool,numa_policy,dma_engine,percentile_source,timestamp,notes`
 
 Default sample inputs for local exercisability:
 
@@ -174,6 +181,19 @@ Default sample inputs for local exercisability:
 - `tools/validation/sample_inputs/system_x_2026q1/host_d2h.csv`
 - `tools/validation/sample_inputs/system_x_2026q1/bounce.csv`
 - `tools/validation/sample_inputs/system_x_2026q1/direct.csv`
+- `tools/validation/sample_inputs/system_x_2026q1/host_touch.csv`
+
+Coverage and fitting policy:
+
+- fit/residuals are computed on aggregated groups `(path,payload_bytes,concurrency)` using `aggregate_stat`
+- `repetition` is sample-id only in raw measurements
+- required points use minimum sample policy (`required_points_min_samples`, default `5`) with low-sample warnings
+
+Direct provenance status:
+
+- `measured`: calibrated from measured direct CSV
+- `crosscheck_only`: validated via PS cross-check (not measured calibrated)
+- `cited_sweep_only`: unmeasured direct path, validated by cited envelope + sweep
 
 For a real calibration run, replace those CSVs with measurements from your declared `validation.system_id`.
 
