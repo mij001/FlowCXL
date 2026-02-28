@@ -15,7 +15,7 @@ This file maps each headline claim to reproducible artifacts, configs, provenanc
   - `python run.py --config configs/runs.yaml --artifacts-dir artifacts`
   - `python report.py --config configs/runs.yaml --artifacts-dir artifacts`
 - Parameter provenance:
-  - measured_cited: `LINK_UPMEM_HOST_H2D_MEASURED.bandwidth_Bps`, `LINK_UPMEM_HOST_D2H_MEASURED.bandwidth_Bps`
+  - spec_or_literature_backed: `LINK_UPMEM_HOST_H2D_MEASURED.bandwidth_Bps`, `LINK_UPMEM_HOST_D2H_MEASURED.bandwidth_Bps`
   - derived_workload: `tpch_3op.boundaries_bytes`, `deepvariant_3stage.boundaries_bytes`
   - assumed_sweepable: `cxl_direct_concurrency`, `cxl_topology`, `memory_system_by_template`, `pim_retention`
 - Sensitivity statement:
@@ -34,7 +34,7 @@ This file maps each headline claim to reproducible artifacts, configs, provenanc
 - Reproduce:
   - `FLOWCXL_ENABLE_STORY_GATES=1 python -m unittest tests/test_story_gates.py -v`
 - Parameter provenance:
-  - measured_cited: directional host-link points
+  - spec_or_literature_backed: directional host-link points
   - derived_workload: TPCH boundary derivation
   - assumed_sweepable: host touch, queueing, retention/topology knobs
 - Sensitivity statement:
@@ -63,12 +63,13 @@ This file maps each headline claim to reproducible artifacts, configs, provenanc
 
 ## Claim 4: Calibration overlays are system-scoped and reproducible
 - Claim statement:
-  - Calibration outputs are tied to `validation.system_id`, and overlay application is run-scoped without global link mutation.
+  - Calibration outputs are tied to `validation.system_id`, fit from measured host-path CSVs, and overlay application is run-scoped without global link mutation.
 - Supporting artifacts:
   - `artifacts/validation/microbench_raw.csv`
   - `artifacts/validation/microbench_fit.yaml`
   - `artifacts/validation/microbench_overlay.yaml`
   - `artifacts/config_validation_overlay.yaml`
+  - `tools/validation/sample_inputs/system_x_2026q1/*.csv` (schema reference inputs)
   - `tests/test_validation_pipeline.py::test_validation_overlay_does_not_mutate_sources_links`
 - Canonical config:
   - `paper/configs/fig_validation.yaml`
@@ -76,12 +77,13 @@ This file maps each headline claim to reproducible artifacts, configs, provenanc
   - `python tools/validation/run_validation.py --config configs/runs.yaml --artifacts-dir artifacts`
   - `python run.py --config configs/runs.yaml --artifacts-dir artifacts --validation-overlay artifacts/validation/microbench_overlay.yaml`
 - Parameter provenance:
-  - measured_cited: directional host-link anchors
+  - measured: `validation.calibration.measured_inputs` host-path datasets
+  - spec_or_literature_backed: directional host-link anchors
   - assumed_sweepable: CXL switch/issue/topology knobs
 - Sensitivity statement:
   - Calibration/cross-check residuals are tracked and surfaced in validation appendix sections.
 - Residual caveats:
-  - Synthetic calibration suite is deterministic and system-tagged; unavailable physical paths use model cross-check evidence.
+  - Optional `direct` path may use cross-check-only fallback when no measured direct CSV is supplied.
 
 ## Claim 5: Direct scheduler behavior matches independent PS reference within configured tolerance
 - Claim statement:

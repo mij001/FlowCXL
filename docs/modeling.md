@@ -108,6 +108,15 @@ Metrics include:
 - memory service and queue-delay components
 - lower-bound families and `dominant_lb_component`
 
+## Validation Calibration
+
+Calibration inputs are measured CSV files configured under `validation.calibration.measured_inputs`.
+
+- required measured paths: `host_h2d`, `host_d2h`, `bounce`
+- optional measured path: `direct`
+
+When `direct` is missing, calibration status is `fallback_crosscheck` and direct-path validation is taken from the PS cross-check artifact (`cxl_ps_crosscheck.csv`).
+
 ## Optional Retiling/Glue Layer
 
 When `tiling_model_by_template.<template>.enabled` is true, scheduling switches from a single global

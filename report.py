@@ -447,9 +447,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         if raw_path.exists():
             raw_df = pd.read_csv(raw_path)
             validation_plots.extend(_plot_validation_measured_vs_sim(raw_df, report_dir))
+            tool_values = sorted({str(v) for v in raw_df.get("tool", pd.Series(dtype=str)).dropna().tolist()})
+            pinned_values = sorted({str(v) for v in raw_df.get("pinned", pd.Series(dtype=str)).dropna().tolist()})
+            notes: List[str] = []
+            if tool_values:
+                notes.append(f"- Tools observed: `{', '.join(tool_values)}`")
+            if pinned_values:
+                notes.append(f"- Pinned flags observed: `{', '.join(pinned_values)}`")
             validation_sections.append(
                 "### Microbenchmark Calibration\n\n"
                 f"- Source: `{raw_path}`\n"
+                + ("\n".join(notes) + "\n" if notes else "")
                 + "\n".join(f"- {p}" for p in validation_plots if "measured_vs_sim" in p)
             )
         if fit_path.exists():
@@ -460,16 +468,56 @@ def main(argv: Sequence[str] | None = None) -> None:
                 fit_rows.append(
                     {
                         "path": path_name,
+                        "calibration_status": values.get("calibration_status", ""),
                         "bandwidth_Bps": values.get("bandwidth_Bps", ""),
                         "latency_s": values.get("latency_s", ""),
                         "mape_percent": values.get("mape_percent", ""),
                         "r2": values.get("r2", ""),
+                        "n_points": values.get("n_points", ""),
+                        "fit_concurrency": values.get("fit_concurrency", ""),
                     }
                 )
             fit_df = pd.DataFrame(fit_rows)
+            host_touch_fit = fit_payload.get("host_touch_fit", {}) or {}
+            host_touch_df = pd.DataFrame(
+                [
+                    {
+                        "status": host_touch_fit.get("status", ""),
+                        "host_touch_Bps": host_touch_fit.get("host_touch_Bps", ""),
+                        "host_touch_fixed_s": host_touch_fit.get("host_touch_fixed_s", ""),
+                        "mape_percent": host_touch_fit.get("mape_percent", ""),
+                        "r2": host_touch_fit.get("r2", ""),
+                        "n_points": host_touch_fit.get("n_points", ""),
+                    }
+                ]
+            )
+            ceiling = fit_payload.get("ceiling_check", {}) or {}
+            ceiling_rows = [
+                {
+                    "enabled": ceiling.get("enabled", ""),
+                    "ceiling_check_pass": ceiling.get("ceiling_check_pass", ""),
+                    "pcie_gen": ceiling.get("pcie_gen", ""),
+                    "lane_width": ceiling.get("lane_width", ""),
+                    "one_way_threshold_Bps": ceiling.get("one_way_threshold_Bps", ""),
+                    "ceiling_violation_paths": "|".join(ceiling.get("ceiling_violation_paths", []) or []),
+                    "note": ceiling.get("ceiling_violation_notes", ""),
+                }
+            ]
+            status_map = fit_payload.get("calibration_status", {}) or {}
+            fallback_paths = sorted([k for k, v in status_map.items() if str(v) == "fallback_crosscheck"])
+            fallback_text = (
+                f"- Cross-check fallback paths: `{', '.join(fallback_paths)}`"
+                if fallback_paths
+                else "- Cross-check fallback paths: none"
+            )
             validation_sections.append(
                 "### Calibration Fit Summary\n\n"
-                f"{_build_markdown_table(_format_metric_fields(fit_df))}"
+                f"{_build_markdown_table(_format_metric_fields(fit_df))}\n\n"
+                "Host-touch decomposition fit:\n\n"
+                f"{_build_markdown_table(_format_metric_fields(host_touch_df))}\n\n"
+                "PCIe ceiling check:\n\n"
+                f"{_build_markdown_table(_format_metric_fields(pd.DataFrame(ceiling_rows)))}\n\n"
+                f"{fallback_text}"
             )
         if cross_path.exists():
             cross_df = pd.read_csv(cross_path)
@@ -482,10 +530,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "passes_tolerance",
             ]
             cross_show = cross_df[show_cols] if not cross_df.empty else cross_df
+            cross_note = ""
+            if fit_path.exists():
+                with fit_path.open("r", encoding="utf-8") as handle:
+                    fit_payload = yaml.safe_load(handle) or {}
+                status_map = fit_payload.get("calibration_status", {}) or {}
+                fallback_paths = sorted([k for k, v in status_map.items() if str(v) == "fallback_crosscheck"])
+                if fallback_paths:
+                    cross_note = (
+                        "\n- Direct-path calibration is fallback cross-check validated for: "
+                        f"`{', '.join(fallback_paths)}`"
+                    )
             validation_sections.append(
                 "### Processor-Share Cross-Check\n\n"
                 f"- Source: `{cross_path}`\n\n"
                 f"{_build_markdown_table(_format_metric_fields(cross_show.head(16)))}"
+                f"{cross_note}"
             )
         if sensitivity_path.exists():
             sensitivity_df = pd.read_csv(sensitivity_path)

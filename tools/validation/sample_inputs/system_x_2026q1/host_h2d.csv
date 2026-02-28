@@ -1,0 +1,13 @@
+system_id,path,payload_bytes,concurrency,repetition,time_s,tool,pinned,notes
+system_x_2026q1,host_h2d,4194304,1,0,0.000639622406,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,4194304,2,0,0.000661697690,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,4194304,4,0,0.000705848259,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,4194304,8,0,0.000794149395,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,33554432,1,0,0.005054679248,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,33554432,2,0,0.005231281522,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,33554432,4,0,0.005584486069,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,33554432,8,0,0.006290895164,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,268435456,1,0,0.040375133985,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,268435456,2,0,0.041787952174,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,268435456,4,0,0.044613588553,custom,true,sample_measured_input
+system_x_2026q1,host_h2d,268435456,8,0,0.050264861311,custom,true,sample_measured_input

@@ -151,6 +151,32 @@ Validation pipeline:
 python tools/validation/run_validation.py --config configs/runs.yaml --artifacts-dir artifacts
 ```
 
+Calibration now ingests measured CSV files (configured in `validation.calibration.measured_inputs`).
+
+Required measured paths:
+
+- `host_h2d`
+- `host_d2h`
+- `bounce`
+
+Optional measured path:
+
+- `direct` (falls back to cross-check-only validation when omitted)
+
+Canonical CSV columns:
+
+- required: `system_id,path,payload_bytes,concurrency,repetition,time_s`
+- optional: `tool,pinned,percentile_source,timestamp,notes`
+
+Default sample inputs for local exercisability:
+
+- `tools/validation/sample_inputs/system_x_2026q1/host_h2d.csv`
+- `tools/validation/sample_inputs/system_x_2026q1/host_d2h.csv`
+- `tools/validation/sample_inputs/system_x_2026q1/bounce.csv`
+- `tools/validation/sample_inputs/system_x_2026q1/direct.csv`
+
+For a real calibration run, replace those CSVs with measurements from your declared `validation.system_id`.
+
 Claim-to-evidence mapping for paper artifacts:
 
 - `paper/CLAIMS.md`

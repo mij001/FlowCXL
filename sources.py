@@ -633,28 +633,40 @@ CITATIONS = {key: {"url": value["url"], "quote": value["quote"]} for key, value 
 
 PARAMETER_PROVENANCE = {
     "link_profile.host_h2d_link": {
-        "class": "assumed_sweepable",
+        "class": "spec_or_literature_backed",
         "source": "configs/runs.yaml",
         "note": "Directional host H2D link selection for the experiment matrix.",
         "config_key": "link_profile.host_h2d_link",
     },
     "link_profile.host_d2h_link": {
-        "class": "assumed_sweepable",
+        "class": "spec_or_literature_backed",
         "source": "configs/runs.yaml",
         "note": "Directional host D2H link selection for the experiment matrix.",
         "config_key": "link_profile.host_d2h_link",
     },
     "LINK_UPMEM_HOST_H2D_MEASURED.bandwidth_Bps": {
-        "class": "measured_cited",
+        "class": "spec_or_literature_backed",
         "source": "CITED_VALUES.UPMEM_HOST_H2D_MEASURED_BW_Bps",
-        "note": "Chosen H2D point in the cited single-digit GB/s range.",
+        "note": "Literature-backed anchor point for host H2D directional bandwidth.",
         "config_key": "sources.LINKS[UPMEM_HOST_H2D_MEASURED].bandwidth_Bps",
     },
     "LINK_UPMEM_HOST_D2H_MEASURED.bandwidth_Bps": {
-        "class": "measured_cited",
+        "class": "spec_or_literature_backed",
         "source": "CITED_VALUES.UPMEM_HOST_D2H_MEASURED_BW_Bps",
-        "note": "Chosen D2H point in the cited single-digit GB/s range.",
+        "note": "Literature-backed anchor point for host D2H directional bandwidth.",
         "config_key": "sources.LINKS[UPMEM_HOST_D2H_MEASURED].bandwidth_Bps",
+    },
+    "validation.calibration.measured_inputs": {
+        "class": "measured",
+        "source": "validation.calibration.measured_inputs CSV files",
+        "note": "System-scoped measured microbenchmark inputs used for calibration fitting.",
+        "config_key": "validation.calibration.measured_inputs",
+    },
+    "validation.calibration.ceiling_check": {
+        "class": "spec_or_literature_backed",
+        "source": "validation.calibration.ceiling_check",
+        "note": "PCIe generation/lane-width sanity envelope used to flag suspect measurements.",
+        "config_key": "validation.calibration.ceiling_check",
     },
     "LINK_CXL_SWITCH.bandwidth_Bps": {
         "class": "assumed_sweepable",

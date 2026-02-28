@@ -16,7 +16,7 @@ if __package__ in {None, ""}:
 
 import sources
 from simulator import CXLProcessorShareScheduler
-from tools.validation.common import ensure_validation_config, load_yaml
+from tools.validation.common import ensure_calibration_config, ensure_validation_config, load_yaml
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -146,7 +146,9 @@ def run_crosscheck(config: Dict[str, object], out_dir: Path) -> Dict[str, object
     if str(cross_cfg.get("reference_model")) != "processor_share":
         raise ValueError("validation.crosscheck.reference_model must be processor_share")
 
-    cal_cfg = validation["calibration"]
+    cal_cfg = ensure_calibration_config(validation)
+    if not bool(cal_cfg.get("enabled", False)):
+        raise ValueError("validation.calibration.enabled must be true when validation.crosscheck.enabled is true")
     payloads = [int(v) for v in cal_cfg["payload_bytes"]]
     conc_levels = [int(v) for v in cal_cfg["concurrency_levels"]]
     system_id = str(validation["system_id"])

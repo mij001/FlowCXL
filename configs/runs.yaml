@@ -407,10 +407,27 @@ validation:
   system_id: system_x_2026q1
   calibration:
     enabled: true
+    input_mode: measured_csv
+    measured_inputs:
+      host_h2d: tools/validation/sample_inputs/system_x_2026q1/host_h2d.csv
+      host_d2h: tools/validation/sample_inputs/system_x_2026q1/host_d2h.csv
+      bounce: tools/validation/sample_inputs/system_x_2026q1/bounce.csv
+      direct: tools/validation/sample_inputs/system_x_2026q1/direct.csv
+    required_paths: [host_h2d, host_d2h, bounce]
+    optional_paths: [direct]
     payload_bytes: [4194304, 33554432, 268435456]
     concurrency_levels: [1, 2, 4, 8]
     repetitions: 10
     paths: [host_h2d, host_d2h, bounce, direct]
+    fit_model: latency_plus_bytes_over_bw
+    fit_reference_concurrency: 1
+    aggregate_stat: median
+    ceiling_check:
+      enabled: true
+      pcie_gen: 4
+      lane_width: 16
+      max_one_way_utilization_fraction: 0.95
+      fail_on_violation: false
   crosscheck:
     enabled: true
     reference_model: processor_share

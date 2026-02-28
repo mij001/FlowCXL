@@ -1,0 +1,13 @@
+system_id,path,payload_bytes,concurrency,repetition,time_s,tool,pinned,notes
+system_x_2026q1,direct,4194304,1,0,0.000090241880,custom,na,sample_measured_input
+system_x_2026q1,direct,4194304,2,0,0.000092482427,custom,na,sample_measured_input
+system_x_2026q1,direct,4194304,4,0,0.000096963521,custom,na,sample_measured_input
+system_x_2026q1,direct,4194304,8,0,0.000105925709,custom,na,sample_measured_input
+system_x_2026q1,direct,33554432,1,0,0.000717595043,custom,na,sample_measured_input
+system_x_2026q1,direct,33554432,2,0,0.000735519419,custom,na,sample_measured_input
+system_x_2026q1,direct,33554432,4,0,0.000771368171,custom,na,sample_measured_input
+system_x_2026q1,direct,33554432,8,0,0.000843065675,custom,na,sample_measured_input
+system_x_2026q1,direct,268435456,1,0,0.005736420342,custom,na,sample_measured_input
+system_x_2026q1,direct,268435456,2,0,0.005879815350,custom,na,sample_measured_input
+system_x_2026q1,direct,268435456,4,0,0.006166605368,custom,na,sample_measured_input
+system_x_2026q1,direct,268435456,8,0,0.006740185402,custom,na,sample_measured_input

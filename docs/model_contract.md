@@ -2,7 +2,7 @@
 
 ## Inputs
 
-Required high-level config keys are validated in `simulator._validate_config`.
+Required high-level config keys are validated in `simulator._validate_config` and validation tooling.
 
 Key requirements:
 
@@ -10,6 +10,19 @@ Key requirements:
 - legacy memory keys are hard-invalid.
 - profile definitions must provide template + stage/boundary consistency.
 - variant overrides are merged recursively and validated post-merge.
+
+Validation calibration contract:
+
+- `validation.calibration.input_mode` must be `measured_csv`.
+- `validation.calibration.measured_inputs` maps each path to a CSV file.
+- required measured paths: `host_h2d`, `host_d2h`, `bounce`.
+- optional measured path: `direct`.
+- when optional `direct` is missing, calibration status is `fallback_crosscheck` and direct-path validity is taken from PS cross-check outputs.
+
+Canonical measured CSV schema per path:
+
+- required columns: `system_id`, `path`, `payload_bytes`, `concurrency`, `repetition`, `time_s`
+- optional columns: `tool`, `pinned`, `percentile_source`, `timestamp`, `notes`
 
 ## Outputs
 
@@ -19,6 +32,13 @@ Primary outputs:
 - `artifacts/traces.csv`
 - `artifacts/traces.yaml`
 - grouped absolute plot artifacts and `artifacts/report/report.md`
+
+Validation outputs:
+
+- `artifacts/validation/microbench_raw.csv`
+- `artifacts/validation/microbench_fit.yaml`
+- `artifacts/validation/microbench_overlay.yaml`
+- `artifacts/validation/cxl_ps_crosscheck.csv`
 
 Metric semantics:
 
@@ -50,7 +70,7 @@ This is not packet-level simulation and does not model burstiness/HOL details.
 
 ## Processor-Sharing Performance Note
 
-The current scheduler reissues completion candidates for all active direct transfers at each admit/complete event (using stale-token invalidation for superseded events).
+The scheduler reissues completion candidates for all active direct transfers at each admit/complete event (using stale-token invalidation for superseded events).
 
 - Practical cost scales with active direct streams.
 - Keep direct concurrency in a moderate range for fast simulation turnaround.
@@ -64,6 +84,21 @@ The current scheduler reissues completion candidates for all active direct trans
 - DeepVariant (CPU frontend then PIM): skips first `host_h2d_stage`.
 
 Physical interpretation is resident/pinned stage-1 input placement, not free additional link bandwidth.
+
+## Calibration Fitting Model
+
+Per path fit uses:
+
+- `T = latency_s + bytes / bandwidth_Bps`
+- aggregate statistic (`median` or `mean`) over measured rows
+- fitting at configured reference concurrency (`fit_reference_concurrency`)
+
+Bounce decomposition derives host-touch fit:
+
+- `T_touch_est = T_bounce_measured - T_h2d_fit - T_d2h_fit`
+- `T_touch_est = host_touch_fixed_s + bytes / host_touch_Bps`
+
+PCIe sanity guard can flag suspicious one-way throughput using configured generation/lane width and utilization cap.
 
 ## Non-goals
 

@@ -353,9 +353,9 @@ E_{transfer}=E_{h2d\_ingress}+E_{h2d\_stage}+E_{d2h}+E_{cxl\_direct}+E_{host\_to
 E_{total}=E_{compute}+E_{transfer}
 \]
 
-## 8) Validation Residual Metrics
+## 8) Calibration Fit And Residual Metrics
 
-For measured vs simulated timings:
+Measured calibration rows come from CSV inputs (`time_s`) and are compared against simulator predictions:
 
 \[
 error_i = T^{measured}_i - T^{sim}_i
@@ -367,4 +367,42 @@ MAE = \frac{1}{N}\sum_i |error_i|
 MAPE = \frac{100}{N}\sum_i \left|\frac{T^{measured}_i - T^{sim}_i}{max(T^{measured}_i,\epsilon)}\right|
 \]
 
-Cross-check acceptance compares scheduler MAPE against configured tolerance.
+Per-path fit model (reference concurrency):
+
+\[
+T_{path}(bytes)=latency_{path}+\frac{bytes}{BW_{path}}
+\]
+
+with `latency_path` and `BW_path` fitted from measured points using linear regression over payload size.
+
+Host-touch decomposition from bounce measurements:
+
+\[
+T_{touch,est}(bytes)=T_{bounce,measured}(bytes)-T_{d2h,fit}(bytes)-T_{h2d,fit}(bytes)
+\]
+\[
+T_{touch,fit}(bytes)=host\_touch\_fixed\_s+\frac{bytes}{host\_touch\_Bps}
+\]
+
+Negative `T_touch,est` values are clamped to zero and reported as fit warnings.
+
+Cross-check acceptance compares direct scheduler MAPE against configured tolerance.
+
+## 9) PCIe Ceiling Sanity Check
+
+One-way theoretical PCIe ceiling under configured generation/lane width:
+
+\[
+BW_{theoretical,oneway}=BW_{per\_lane}(gen)\cdot lanes
+\]
+\[
+BW_{threshold}=BW_{theoretical,oneway}\cdot utilization\_cap
+\]
+
+Host-path fit is flagged if:
+
+\[
+BW_{fit,path} > BW_{threshold}
+\]
+
+This is a sanity guard for suspect measurements (e.g., wrong NUMA placement, pageable staging effects).

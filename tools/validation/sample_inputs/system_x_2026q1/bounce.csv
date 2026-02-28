@@ -1,0 +1,13 @@
+system_id,path,payload_bytes,concurrency,repetition,time_s,tool,pinned,notes
+system_x_2026q1,bounce,4194304,1,0,0.001685406349,custom,na,sample_measured_input
+system_x_2026q1,bounce,4194304,2,0,0.001776948698,custom,na,sample_measured_input
+system_x_2026q1,bounce,4194304,4,0,0.001960033397,custom,na,sample_measured_input
+system_x_2026q1,bounce,4194304,8,0,0.002326202794,custom,na,sample_measured_input
+system_x_2026q1,bounce,33554432,1,0,0.013336250794,custom,na,sample_measured_input
+system_x_2026q1,bounce,33554432,2,0,0.014068589587,custom,na,sample_measured_input
+system_x_2026q1,bounce,33554432,4,0,0.015533267175,custom,na,sample_measured_input
+system_x_2026q1,bounce,33554432,8,0,0.018462622349,custom,na,sample_measured_input
+system_x_2026q1,bounce,268435456,1,0,0.106543006349,custom,na,sample_measured_input
+system_x_2026q1,bounce,268435456,2,0,0.112401716698,custom,na,sample_measured_input
+system_x_2026q1,bounce,268435456,4,0,0.124119137397,custom,na,sample_measured_input
+system_x_2026q1,bounce,268435456,8,0,0.147553978794,custom,na,sample_measured_input
