@@ -38,8 +38,6 @@ All default profiles run across:
 - multipliers: `0.5x, 1x, 2x, 4x`
 - scenarios: `cpu_only`, `pim_host_bounce`, `pim_flowcxl_direct`
 
-The high-intermediate TPCH profile is configured to expose host-bounce penalties and target `bounce/direct >= 2.0` at `1x`.
-
 ## What is modeled
 
 - Stage-limited compute pools (CPU/PIM)
@@ -157,12 +155,14 @@ optional per-kernel command overhead.
 ### 2) End-to-End Workflow
 
 Canonical path A: full measured
+
 1. Provide measured CSVs for `host_h2d`, `host_d2h`, `bounce`, and `direct`.
 2. Run validation pipeline.
 3. `microbench_fit.yaml` reports `direct_status=measured`.
 4. `microbench_overlay.yaml` includes host links + direct link overrides.
 
 Canonical path B: missing direct, cross-check enabled
+
 1. Provide measured CSVs for required host paths; omit `direct`.
 2. Keep `direct_provenance_policy.allow_crosscheck_only=true`.
 3. Run validation pipeline.
@@ -170,6 +170,7 @@ Canonical path B: missing direct, cross-check enabled
 5. Direct override is not emitted; PS cross-check artifact is the validation evidence.
 
 Canonical path C: missing direct, cited+sweep posture
+
 1. Provide measured CSVs for required host paths; omit `direct`.
 2. Set `direct_provenance_policy.allow_crosscheck_only=false` and `allow_cited_sweep_only=true`.
 3. Run validation pipeline.
@@ -209,7 +210,7 @@ python run.py --config configs/runs.yaml --artifacts-dir artifacts --validation-
 python report.py --config configs/runs.yaml --artifacts-dir artifacts --metrics-file artifacts/metrics.csv
 ```
 
-### 4) Validation Config Schema (validation.*)
+### 4) Validation Config Schema (validation.\*)
 
 ```yaml
 validation:
@@ -275,33 +276,33 @@ validation:
 
 Transfer-path CSVs (`host_h2d`, `host_d2h`, `bounce`, optional `direct`):
 
-| Column | Required | Type | Notes |
-| --- | --- | --- | --- |
-| `system_id` | yes | string | Must match `validation.system_id` |
-| `path` | yes | enum string | one of transfer paths |
-| `payload_bytes` | yes | int > 0 | per transaction payload |
-| `concurrency` | yes | int > 0 | stream count for this sample |
-| `repetition` | yes | int >= 0 | sample id only |
-| `time_s` | yes | float > 0 | measured duration |
-| `pinned` | yes | bool-like token | required by default policy for required host paths |
-| `tool` | optional | string | e.g. `pcie_bench`, `bandwidthTest`, `custom` |
-| `numa_policy` | optional | string | measurement context |
-| `dma_engine` | optional | string | measurement context |
-| `percentile_source` | optional | string | provenance |
-| `timestamp` | optional | string | provenance |
-| `notes` | optional | string | provenance |
+| Column              | Required | Type            | Notes                                              |
+| ------------------- | -------- | --------------- | -------------------------------------------------- |
+| `system_id`         | yes      | string          | Must match `validation.system_id`                  |
+| `path`              | yes      | enum string     | one of transfer paths                              |
+| `payload_bytes`     | yes      | int > 0         | per transaction payload                            |
+| `concurrency`       | yes      | int > 0         | stream count for this sample                       |
+| `repetition`        | yes      | int >= 0        | sample id only                                     |
+| `time_s`            | yes      | float > 0       | measured duration                                  |
+| `pinned`            | yes      | bool-like token | required by default policy for required host paths |
+| `tool`              | optional | string          | e.g. `pcie_bench`, `bandwidthTest`, `custom`       |
+| `numa_policy`       | optional | string          | measurement context                                |
+| `dma_engine`        | optional | string          | measurement context                                |
+| `percentile_source` | optional | string          | provenance                                         |
+| `timestamp`         | optional | string          | provenance                                         |
+| `notes`             | optional | string          | provenance                                         |
 
 Optional host-touch CSV (`host_touch`):
 
-| Column | Required | Type | Notes |
-| --- | --- | --- | --- |
-| `system_id` | yes | string | Must match `validation.system_id` |
-| `path` | yes | string | must be `host_touch` |
-| `payload_bytes` | yes | int > 0 | payload size |
-| `repetition` | yes | int >= 0 | sample id only |
-| `time_s` | yes | float > 0 | measured host-touch time |
-| `concurrency` | optional | int > 0 | defaults to `1` if omitted |
-| `tool`, `numa_policy`, `dma_engine`, `percentile_source`, `timestamp`, `notes` | optional | string | context fields |
+| Column                                                                         | Required | Type      | Notes                             |
+| ------------------------------------------------------------------------------ | -------- | --------- | --------------------------------- |
+| `system_id`                                                                    | yes      | string    | Must match `validation.system_id` |
+| `path`                                                                         | yes      | string    | must be `host_touch`              |
+| `payload_bytes`                                                                | yes      | int > 0   | payload size                      |
+| `repetition`                                                                   | yes      | int >= 0  | sample id only                    |
+| `time_s`                                                                       | yes      | float > 0 | measured host-touch time          |
+| `concurrency`                                                                  | optional | int > 0   | defaults to `1` if omitted        |
+| `tool`, `numa_policy`, `dma_engine`, `percentile_source`, `timestamp`, `notes` | optional | string    | context fields                    |
 
 Default sample inputs (for local exercisability):
 
@@ -347,17 +348,17 @@ Only `direct_status=measured` can write direct link overrides into `microbench_o
 
 ### 9) Output Artifacts and How to Read Them
 
-| Artifact | Producer | Purpose | Key fields | Downstream usage |
-| --- | --- | --- | --- | --- |
-| `artifacts/validation/microbench_raw.csv` | `calibrate_microbench.py` | normalized measured rows + per-row predictions | `measured_s`, `simulated_s`, `error_s`, context columns | audit raw ingestion |
-| `artifacts/validation/microbench_agg.csv` | `calibrate_microbench.py` | aggregate-level measured vs simulated comparison | `path,payload_bytes,concurrency,sample_count,measured_s,simulated_s` | report measured-vs-sim plots |
-| `artifacts/validation/microbench_fit.yaml` | `calibrate_microbench.py` | fit parameters, statuses, coverage/semantics/sanity audits | `paths`, `direct_status`, `host_touch_source`, `coverage_summary`, `negative_residual_summary` | report tables + audit record |
-| `artifacts/validation/microbench_overlay.yaml` | `calibrate_microbench.py` | run-time overlay derived from measured host calibration | `link_constant_overrides`, `stage_defaults` | input to `run.py --validation-overlay` |
-| `artifacts/validation/cxl_ps_crosscheck.csv` | `crosscheck_ps.py` | direct scheduler cross-check evidence | `mape_percent`, `passes_tolerance` | validates `crosscheck_only` posture |
-| `artifacts/validation/sensitivity_results.csv` | `sensitivity.py` | sweep outcomes | ratio columns + `sweep_family/sweep_case` | validation appendix |
-| `artifacts/validation/tornado_top8.csv` | `sensitivity.py` | top contributors near target point | `effect_score`, deltas | robustness summary |
-| `artifacts/validation/ablations.csv` | `sensitivity.py` | ablation outcomes at `1x` | `ablation`, ratio columns | ablation appendix |
-| `artifacts/validation/validation_summary.yaml` | `run_validation.py` | orchestration summary pointer file | calibration/crosscheck/sensitivity outputs | quick run integrity check |
+| Artifact                                       | Producer                  | Purpose                                                    | Key fields                                                                                     | Downstream usage                       |
+| ---------------------------------------------- | ------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `artifacts/validation/microbench_raw.csv`      | `calibrate_microbench.py` | normalized measured rows + per-row predictions             | `measured_s`, `simulated_s`, `error_s`, context columns                                        | audit raw ingestion                    |
+| `artifacts/validation/microbench_agg.csv`      | `calibrate_microbench.py` | aggregate-level measured vs simulated comparison           | `path,payload_bytes,concurrency,sample_count,measured_s,simulated_s`                           | report measured-vs-sim plots           |
+| `artifacts/validation/microbench_fit.yaml`     | `calibrate_microbench.py` | fit parameters, statuses, coverage/semantics/sanity audits | `paths`, `direct_status`, `host_touch_source`, `coverage_summary`, `negative_residual_summary` | report tables + audit record           |
+| `artifacts/validation/microbench_overlay.yaml` | `calibrate_microbench.py` | run-time overlay derived from measured host calibration    | `link_constant_overrides`, `stage_defaults`                                                    | input to `run.py --validation-overlay` |
+| `artifacts/validation/cxl_ps_crosscheck.csv`   | `crosscheck_ps.py`        | direct scheduler cross-check evidence                      | `mape_percent`, `passes_tolerance`                                                             | validates `crosscheck_only` posture    |
+| `artifacts/validation/sensitivity_results.csv` | `sensitivity.py`          | sweep outcomes                                             | ratio columns + `sweep_family/sweep_case`                                                      | validation appendix                    |
+| `artifacts/validation/tornado_top8.csv`        | `sensitivity.py`          | top contributors near target point                         | `effect_score`, deltas                                                                         | robustness summary                     |
+| `artifacts/validation/ablations.csv`           | `sensitivity.py`          | ablation outcomes at `1x`                                  | `ablation`, ratio columns                                                                      | ablation appendix                      |
+| `artifacts/validation/validation_summary.yaml` | `run_validation.py`       | orchestration summary pointer file                         | calibration/crosscheck/sensitivity outputs                                                     | quick run integrity check              |
 
 ### 10) Applying Calibration Overlay to Simulation
 
@@ -390,16 +391,16 @@ Reproducibility note: overlay link overrides are applied via an injected link ca
 
 ### 12) Troubleshooting and Common Failures
 
-| Symptom / Error | Likely cause | Fix |
-| --- | --- | --- |
-| `required measured CSV not found` | path missing in `measured_inputs` | fix path or file placement |
-| `missing required columns` | CSV schema mismatch | add required columns for that path type |
-| `contains non-pinned rows` | required host path has pageable/unknown rows | use pinned rows or relax `required_paths_must_be_pinned` |
-| `mixes pinned/pageable states` | mixed memory mode in required path | harmonize rows or set `allow_mixed_memory_mode=true` |
-| `missing required payload/concurrency points` | coverage gaps | add missing `(payload,concurrency)` samples |
-| `points below required_points_min_samples` warning | too few reps per point | increase sample count or lower threshold |
-| unsupported enum / invalid policy config | typo or invalid config value | align with allowed values in schema |
-| strict PCIe ceiling failure | measured/fitted one-way throughput above threshold | verify measurement setup or lower strictness (`fail_on_violation=false`) |
+| Symptom / Error                                    | Likely cause                                       | Fix                                                                      |
+| -------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------ |
+| `required measured CSV not found`                  | path missing in `measured_inputs`                  | fix path or file placement                                               |
+| `missing required columns`                         | CSV schema mismatch                                | add required columns for that path type                                  |
+| `contains non-pinned rows`                         | required host path has pageable/unknown rows       | use pinned rows or relax `required_paths_must_be_pinned`                 |
+| `mixes pinned/pageable states`                     | mixed memory mode in required path                 | harmonize rows or set `allow_mixed_memory_mode=true`                     |
+| `missing required payload/concurrency points`      | coverage gaps                                      | add missing `(payload,concurrency)` samples                              |
+| `points below required_points_min_samples` warning | too few reps per point                             | increase sample count or lower threshold                                 |
+| unsupported enum / invalid policy config           | typo or invalid config value                       | align with allowed values in schema                                      |
+| strict PCIe ceiling failure                        | measured/fitted one-way throughput above threshold | verify measurement setup or lower strictness (`fail_on_violation=false`) |
 
 ### 13) Reproducibility Checklist
 
