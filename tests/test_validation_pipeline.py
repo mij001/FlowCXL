@@ -14,6 +14,11 @@ import sources
 from simulator import generate_runs_from_config
 from tools.validation.calibrate_microbench import run_calibration
 from tools.validation.crosscheck_ps import run_crosscheck
+from tools.validation.common import (
+    DIRECT_STATUS_CALIBRATED_MEASURED,
+    DIRECT_STATUS_SWEPT_FROM_LITERATURE,
+    DIRECT_STATUS_VALIDATED_CROSSCHECK,
+)
 
 
 class ValidationPipelineChecks(unittest.TestCase):
@@ -170,12 +175,12 @@ class ValidationPipelineChecks(unittest.TestCase):
                 "path",
                 "payload_bytes",
                 "concurrency",
-                "sample_count",
+                "n_samples",
                 "measured_s",
                 "simulated_s",
+                "p05_s",
                 "p50_s",
                 "p95_s",
-                "p99_s",
             ]:
                 self.assertIn(col, agg_cols)
 
@@ -188,7 +193,7 @@ class ValidationPipelineChecks(unittest.TestCase):
             with self.assertRaises((FileNotFoundError, ValueError, KeyError)):
                 run_calibration(config=cfg, out_dir=Path(tmpdir))
 
-    def test_calibration_accepts_missing_direct_with_crosscheck_only_status(self) -> None:
+    def test_calibration_accepts_missing_direct_with_validated_crosscheck_status(self) -> None:
         cfg = self._small_config()
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -196,12 +201,13 @@ class ValidationPipelineChecks(unittest.TestCase):
             measured_inputs["direct"] = str(tmp_path / "direct_missing.csv")
             cfg["validation"]["calibration"]["measured_inputs"] = measured_inputs
             cfg["validation"]["calibration"]["optional_paths"] = ["direct"]
-            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            cross_summary = run_crosscheck(config=cfg, out_dir=tmp_path)
+            summary = run_calibration(config=cfg, out_dir=tmp_path, crosscheck_summary=cross_summary)
             with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
                 fit_payload = yaml.safe_load(handle) or {}
             status = fit_payload.get("calibration_status", {})
-            self.assertEqual(status.get("direct"), "crosscheck_only")
-            self.assertEqual(fit_payload.get("direct_status"), "crosscheck_only")
+            self.assertEqual(status.get("direct"), DIRECT_STATUS_VALIDATED_CROSSCHECK)
+            self.assertEqual(fit_payload.get("direct_status"), DIRECT_STATUS_VALIDATED_CROSSCHECK)
 
     def test_measured_csv_schema_validation(self) -> None:
         cfg = self._small_config()
@@ -362,8 +368,9 @@ class ValidationPipelineChecks(unittest.TestCase):
                 agg_rows = list(csv.DictReader(handle))
             self.assertTrue(agg_rows)
             first = agg_rows[0]
-            self.assertIn("sample_count", first)
-            self.assertGreaterEqual(int(float(first["sample_count"])), 1)
+            self.assertIn("n_samples", first)
+            self.assertIn("p05_s", first)
+            self.assertGreaterEqual(int(float(first["n_samples"])), 1)
 
     def test_host_touch_source_measured_stream_when_host_touch_input_present(self) -> None:
         cfg = self._small_config()
@@ -442,9 +449,9 @@ class ValidationPipelineChecks(unittest.TestCase):
             summary = run_calibration(config=cfg, out_dir=tmp_path)
             with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
                 fit_payload = yaml.safe_load(handle) or {}
-            self.assertEqual(fit_payload.get("direct_status"), "measured")
+            self.assertEqual(fit_payload.get("direct_status"), DIRECT_STATUS_CALIBRATED_MEASURED)
 
-    def test_direct_status_cited_sweep_only(self) -> None:
+    def test_direct_status_swept_from_literature(self) -> None:
         cfg = self._small_config()
         cfg["validation"]["calibration"]["direct_provenance_policy"]["allow_crosscheck_only"] = False
         cfg["validation"]["calibration"]["direct_provenance_policy"]["allow_cited_sweep_only"] = True
@@ -456,7 +463,74 @@ class ValidationPipelineChecks(unittest.TestCase):
             summary = run_calibration(config=cfg, out_dir=tmp_path)
             with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
                 fit_payload = yaml.safe_load(handle) or {}
-            self.assertEqual(fit_payload.get("direct_status"), "cited_sweep_only")
+            self.assertEqual(fit_payload.get("direct_status"), DIRECT_STATUS_SWEPT_FROM_LITERATURE)
+
+    def test_crosscheck_policy_threshold_controls_validated_status(self) -> None:
+        cfg = self._small_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            measured_inputs = self._write_measured_inputs(tmp_path, cfg, include_direct=False)
+            measured_inputs["direct"] = str(tmp_path / "direct_missing.csv")
+            cfg["validation"]["calibration"]["measured_inputs"] = measured_inputs
+
+            cross_summary = run_crosscheck(config=cfg, out_dir=tmp_path)
+            summary = run_calibration(config=cfg, out_dir=tmp_path, crosscheck_summary=cross_summary)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            self.assertEqual(fit_payload.get("direct_status"), DIRECT_STATUS_VALIDATED_CROSSCHECK)
+
+            strict_cfg = copy.deepcopy(cfg)
+            strict_cfg["validation"]["calibration"]["crosscheck_policy"]["pass_points_min"] = 9999
+            strict_summary = run_calibration(
+                config=strict_cfg,
+                out_dir=tmp_path / "strict",
+                crosscheck_summary=cross_summary,
+            )
+            with Path(strict_summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                strict_fit_payload = yaml.safe_load(handle) or {}
+            self.assertEqual(
+                strict_fit_payload.get("direct_status"),
+                DIRECT_STATUS_SWEPT_FROM_LITERATURE,
+            )
+
+    def test_fit_window_controls_n_points(self) -> None:
+        cfg = self._small_config()
+        cfg["validation"]["calibration"]["fit_payload_min_bytes"] = 33554432
+        cfg["validation"]["calibration"]["fit_payload_max_bytes"] = 268435456
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(tmp_path, cfg)
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            host_h2d_points = int(fit_payload["paths"]["host_h2d"]["n_points"])
+            self.assertEqual(host_h2d_points, 2)
+
+    def test_tiny_fit_window_warning_emitted(self) -> None:
+        cfg = self._small_config()
+        cfg["validation"]["calibration"]["fit_payload_min_bytes"] = 1024
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(tmp_path, cfg)
+            summary = run_calibration(config=cfg, out_dir=tmp_path)
+            with Path(summary["fit_yaml"]).open("r", encoding="utf-8") as handle:
+                fit_payload = yaml.safe_load(handle) or {}
+            warnings = [str(v) for v in (fit_payload.get("fit_warnings", []) or [])]
+            self.assertTrue(
+                any("Small-payload regime may deviate from latency+bytes/BW model" in msg for msg in warnings)
+            )
+
+    def test_host_touch_on_missing_reference_error_policy(self) -> None:
+        cfg = self._small_config()
+        cfg["validation"]["calibration"]["host_touch_sanity"]["on_missing_reference"] = "error"
+        cfg["validation"]["calibration"]["host_touch_sanity"]["expected_bandwidth_Bps"] = None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg["validation"]["calibration"]["measured_inputs"] = self._write_measured_inputs(
+                tmp_path, cfg, include_host_touch=False
+            )
+            with self.assertRaises(ValueError):
+                run_calibration(config=cfg, out_dir=tmp_path)
 
     def test_direct_override_written_only_when_status_measured(self) -> None:
         cfg = self._small_config()
@@ -548,12 +622,17 @@ class ValidationPipelineChecks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             summary = run_crosscheck(config=cfg, out_dir=Path(tmpdir))
             cross_path = Path(summary["crosscheck_csv"])
+            cross_summary_path = Path(summary["crosscheck_summary_yaml"])
             self.assertTrue(cross_path.exists())
+            self.assertTrue(cross_summary_path.exists())
             with cross_path.open("r", encoding="utf-8", newline="") as handle:
                 reader = csv.DictReader(handle)
                 cols = reader.fieldnames or []
             for col in ["pattern", "payload_bytes", "concurrency", "mape_percent", "passes_tolerance"]:
                 self.assertIn(col, cols)
+            cross_summary = yaml.safe_load(cross_summary_path.read_text(encoding="utf-8")) or {}
+            for key in ["crosscheck_pass", "crosscheck_mape_percent_mean", "n_points"]:
+                self.assertIn(key, cross_summary)
 
     def test_provenance_table_rendered_in_report(self) -> None:
         import report as report_module
@@ -733,7 +812,7 @@ class ValidationPipelineChecks(unittest.TestCase):
                 ]
             )
             report_text = (artifacts_dir / "report" / "report.md").read_text(encoding="utf-8")
-            self.assertIn("crosscheck_only", report_text)
+            self.assertIn("validated_crosscheck", report_text)
             self.assertIn("not measured calibrated", report_text)
 
     def test_report_mentions_pcie_one_way_sanity_language(self) -> None:
@@ -794,9 +873,9 @@ class ValidationPipelineChecks(unittest.TestCase):
     def test_readme_includes_validation_statuses_contracts_and_commands(self) -> None:
         text = Path("README.md").read_text(encoding="utf-8")
         required_snippets = [
-            "`measured`",
-            "`crosscheck_only`",
-            "`cited_sweep_only`",
+            "`calibrated_measured`",
+            "`validated_crosscheck`",
+            "`swept_from_literature`",
             "`microbench_agg.csv`",
             "Required host paths must be pinned",
             "host_touch_source",
