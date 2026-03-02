@@ -14,6 +14,12 @@ import pandas as pd
 import yaml
 
 import sources
+from tools.validation.common import (
+    DIRECT_STATUS_CALIBRATED_MEASURED,
+    DIRECT_STATUS_SWEPT_FROM_LITERATURE,
+    DIRECT_STATUS_VALIDATED_CROSSCHECK,
+    normalize_direct_status,
+)
 
 SCENARIO_ORDER = [
     sources.SCENARIO_CPU_ONLY,
@@ -144,9 +150,11 @@ def _format_metric_fields(table_df: pd.DataFrame) -> pd.DataFrame:
         "barrier_wait_mass_s",
         "barrier_wait_critical_path_s",
         "barrier_wait_mean_s",
+        "p05_s",
         "p50_s",
         "p95_s",
         "p99_s",
+        "n_samples",
         "sample_count",
     ]
     for col in numeric_cols:
@@ -479,12 +487,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "path",
                     "payload_bytes",
                     "concurrency",
-                    "sample_count",
+                    "n_samples",
                     "measured_s",
                     "simulated_s",
+                    "p05_s",
                     "p50_s",
                     "p95_s",
-                    "p99_s",
                     "error_pct",
                 ]
                 if col in agg_df.columns
@@ -534,10 +542,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 fit_payload = yaml.safe_load(handle) or {}
             fit_rows: List[Dict[str, object]] = []
             for path_name, values in (fit_payload.get("paths", {}) or {}).items():
+                path_status = normalize_direct_status(
+                    values.get("calibration_status", ""),
+                    strict=False,
+                )
                 fit_rows.append(
                     {
                         "path": path_name,
-                        "calibration_status": values.get("calibration_status", ""),
+                        "calibration_status": path_status,
                         "bandwidth_Bps": values.get("bandwidth_Bps", ""),
                         "latency_s": values.get("latency_s", ""),
                         "mape_percent": values.get("mape_percent", ""),
@@ -553,8 +565,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             negative_summary = fit_payload.get("negative_residual_summary", {}) or {}
             coverage_summary = fit_payload.get("coverage_summary", {}) or {}
             semantics_summary = fit_payload.get("measurement_semantics_summary", {}) or {}
-            direct_status = str(fit_payload.get("direct_status", ""))
+            direct_status = normalize_direct_status(fit_payload.get("direct_status", ""), strict=False)
             direct_note = str(fit_payload.get("direct_status_note", ""))
+            fit_warnings = [str(v) for v in (fit_payload.get("fit_warnings", []) or [])]
             host_touch_df = pd.DataFrame(
                 [
                     {
@@ -627,24 +640,29 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if coverage_warnings
                 else "- Coverage warnings: none"
             )
-            if direct_status == "measured":
+            fit_warning_text = (
+                "- Fit warnings: " + " | ".join(fit_warnings)
+                if fit_warnings
+                else "- Fit warnings: none"
+            )
+            if direct_status == DIRECT_STATUS_CALIBRATED_MEASURED:
                 direct_status_text = (
-                    "- Direct status: `measured` (calibrated from measured direct CSV input)."
+                    "- Direct status: `calibrated_measured` (calibrated from measured direct CSV input)."
                 )
-            elif direct_status == "crosscheck_only":
+            elif direct_status == DIRECT_STATUS_VALIDATED_CROSSCHECK:
                 direct_status_text = (
-                    "- Direct status: `crosscheck_only` (validated via processor-share cross-check; "
+                    "- Direct status: `validated_crosscheck` (validated via processor-share cross-check; "
                     "not measured calibrated)."
                 )
-            elif direct_status == "cited_sweep_only":
+            elif direct_status == DIRECT_STATUS_SWEPT_FROM_LITERATURE:
                 direct_status_text = (
-                    "- Direct status: `cited_sweep_only` (not measured calibrated; uses cited+sweep envelope)."
+                    "- Direct status: `swept_from_literature` (not measured calibrated; uses literature sweep envelope)."
                 )
             else:
                 direct_status_text = f"- Direct status: `{direct_status or 'unknown'}`"
             cited_env = fit_payload.get("direct_cited_envelope", {}) or {}
             cited_env_text = ""
-            if direct_status == "cited_sweep_only" and cited_env:
+            if direct_status == DIRECT_STATUS_SWEPT_FROM_LITERATURE and cited_env:
                 cited_env_text = (
                     "\n- Cited direct envelope: "
                     f"latency_ns={cited_env.get('latency_ns_range', [])}, "
@@ -661,6 +679,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "Coverage quality:\n\n"
                 f"{_build_markdown_table(_format_metric_fields(coverage_df))}\n\n"
                 f"{coverage_warning_text}\n\n"
+                f"{fit_warning_text}\n\n"
                 "Host-touch decomposition fit:\n\n"
                 f"{_build_markdown_table(_format_metric_fields(host_touch_df))}\n\n"
                 "Residual policy audit:\n\n"
@@ -685,9 +704,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             ]
             cross_show = cross_df[show_cols] if not cross_df.empty else cross_df
             cross_note = ""
-            if str(fit_payload.get("direct_status", "")) == "crosscheck_only":
+            if normalize_direct_status(fit_payload.get("direct_status", ""), strict=False) == DIRECT_STATUS_VALIDATED_CROSSCHECK:
                 cross_note = (
-                    "\n- Direct path is `crosscheck_only`: validated by this PS cross-check artifact, "
+                    "\n- Direct path is `validated_crosscheck`: validated by this PS cross-check artifact, "
                     "not measured calibrated."
                 )
             validation_sections.append(

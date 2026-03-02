@@ -20,7 +20,7 @@ Use these classes consistently:
 - Validation calibration is system-specific and keyed by `validation.system_id`.
 - `validation.calibration.measured_inputs` is the authoritative source for host-path calibration.
 - `host_h2d`, `host_d2h`, and `bounce` are required measured paths.
-- `direct` uses explicit provenance status: `measured`, `crosscheck_only`, or `cited_sweep_only`.
+- `direct` uses explicit provenance status: `calibrated_measured`, `validated_crosscheck`, or `swept_from_literature`.
 - `direct_cited_envelope` carries the cited sweep contract for unmeasured direct paths (Melody latency/BW range + switch sweeps).
 - `CXL_SWITCH_LAT_s` and `CXL_SWITCH_BW_Bps` are **assumed_sweepable** topology points, not directly measured constants from the cited CXL homepage.
 - `UPMEM_HOST_H2D_MEASURED_BW_Bps` and `UPMEM_HOST_D2H_MEASURED_BW_Bps` are literature-backed anchors and remain sweepable in sensitivity analyses.

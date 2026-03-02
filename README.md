@@ -158,7 +158,7 @@ Canonical path A: full measured
 
 1. Provide measured CSVs for `host_h2d`, `host_d2h`, `bounce`, and `direct`.
 2. Run validation pipeline.
-3. `microbench_fit.yaml` reports `direct_status=measured`.
+3. `microbench_fit.yaml` reports `direct_status=calibrated_measured`.
 4. `microbench_overlay.yaml` includes host links + direct link overrides.
 
 Canonical path B: missing direct, cross-check enabled
@@ -166,7 +166,7 @@ Canonical path B: missing direct, cross-check enabled
 1. Provide measured CSVs for required host paths; omit `direct`.
 2. Keep `direct_provenance_policy.allow_crosscheck_only=true`.
 3. Run validation pipeline.
-4. `microbench_fit.yaml` reports `direct_status=crosscheck_only` (validated, not calibrated).
+4. `microbench_fit.yaml` reports `direct_status=validated_crosscheck` (validated, not calibrated).
 5. Direct override is not emitted; PS cross-check artifact is the validation evidence.
 
 Canonical path C: missing direct, cited+sweep posture
@@ -174,7 +174,7 @@ Canonical path C: missing direct, cited+sweep posture
 1. Provide measured CSVs for required host paths; omit `direct`.
 2. Set `direct_provenance_policy.allow_crosscheck_only=false` and `allow_cited_sweep_only=true`.
 3. Run validation pipeline.
-4. `microbench_fit.yaml` reports `direct_status=cited_sweep_only`.
+4. `microbench_fit.yaml` reports `direct_status=swept_from_literature`.
 5. Direct override is not emitted; direct path is treated as cited+sweep envelope only.
 
 ### 3) CLI Commands
@@ -239,10 +239,14 @@ validation:
       expected_bandwidth_Bps: null
       ratio_min: 0.2
       ratio_max: 2.0
-      warn_only_if_missing_reference: true
+      on_fail: warn
+      on_missing_reference: warn
     negative_residual_policy:
       mode: clamp_to_zero
       epsilon_s: 1.0e-9
+    crosscheck_policy:
+      pass_mape_max: 0.20
+      pass_points_min: 5
     direct_provenance_policy:
       allow_crosscheck_only: true
       allow_cited_sweep_only: true
@@ -257,6 +261,8 @@ validation:
     fit_model: latency_plus_bytes_over_bw
     fit_reference_concurrency: 1
     aggregate_stat: median
+    fit_payload_min_bytes: 4194304
+    fit_payload_max_bytes: 268435456
     ceiling_check:
       enabled: true
       pcie_gen: 4
@@ -318,11 +324,11 @@ Default sample inputs (for local exercisability):
 ### 6) Calibration Semantics
 
 - Aggregate-first comparison: measured rows are aggregated by `(path,payload_bytes,concurrency)` with `aggregate_stat`.
-- Aggregate output also reports robust percentiles per group: `p50_s`, `p95_s`, `p99_s`.
+- Aggregate output also reports robust percentiles per group: `n_samples`, `p05_s`, `p50_s`, `p95_s`.
 - `repetition` is sample-id only and is not used as a join key for prediction.
 - Fit model per path:
   - `T = latency_s + bytes / bandwidth_Bps`
-  - fitted at `fit_reference_concurrency`.
+  - fitted at `fit_reference_concurrency` and payload window `[fit_payload_min_bytes, fit_payload_max_bytes]`.
 - Host-touch provenance:
   - `measured_stream`: fitted directly from `host_touch` measured CSV.
   - `derived_from_bounce`: estimated via `bounce - d2h_fit - h2d_fit`.
@@ -330,17 +336,19 @@ Default sample inputs (for local exercisability):
   - `drop`
   - `clamp_to_zero`
   - `clamp_to_epsilon`
+- Tiny fit-window warning is emitted when `fit_payload_min_bytes < 4096`:
+  - `Small-payload regime may deviate from latency+bytes/BW model; consider raising fit window.`
 - PCIe one-way ceiling is a sanity check only (not a full throughput oracle).
 
 ### 7) Direct Path Provenance States
 
-- `measured`: direct path has measured CSV and fitted parameters.
-- `crosscheck_only`: direct path not measured; validated against PS cross-check results. This is validated, not calibrated.
-- `cited_sweep_only`: direct path not measured and treated as cited+sweep envelope only.
+- `calibrated_measured`: direct path has measured CSV and fitted parameters.
+- `validated_crosscheck`: direct path not measured; validated against PS cross-check results. This is validated, not calibrated.
+- `swept_from_literature`: direct path not measured and treated as cited+sweep envelope only.
   - Melody envelope defaults: latency `214-394 ns`, bandwidth `18-52 GB/s`.
   - Switch posture is modeled as additional-latency/bottleneck sweep (default switch latency `~600 ns`).
 
-Only `direct_status=measured` can write direct link overrides into `microbench_overlay.yaml`.
+Only `direct_status=calibrated_measured` can write direct link overrides into `microbench_overlay.yaml`.
 
 ### 8) Coverage and Data-Quality Policy
 
@@ -357,10 +365,11 @@ Only `direct_status=measured` can write direct link overrides into `microbench_o
 | Artifact                                       | Producer                  | Purpose                                                    | Key fields                                                                                     | Downstream usage                       |
 | ---------------------------------------------- | ------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------- |
 | `artifacts/validation/microbench_raw.csv`      | `calibrate_microbench.py` | normalized measured rows + per-row predictions             | `measured_s`, `simulated_s`, `error_s`, context columns                                        | audit raw ingestion                    |
-| `artifacts/validation/microbench_agg.csv`      | `calibrate_microbench.py` | aggregate-level measured vs simulated comparison           | `path,payload_bytes,concurrency,sample_count,measured_s,simulated_s,p50_s,p95_s,p99_s`         | report measured-vs-sim plots           |
+| `artifacts/validation/microbench_agg.csv`      | `calibrate_microbench.py` | aggregate-level measured vs simulated comparison           | `path,payload_bytes,concurrency,n_samples,measured_s,simulated_s,p05_s,p50_s,p95_s`            | report measured-vs-sim plots           |
 | `artifacts/validation/microbench_fit.yaml`     | `calibrate_microbench.py` | fit parameters, statuses, coverage/semantics/sanity audits | `paths`, `direct_status`, `host_touch_source`, `coverage_summary`, `negative_residual_summary` | report tables + audit record           |
 | `artifacts/validation/microbench_overlay.yaml` | `calibrate_microbench.py` | run-time overlay derived from measured host calibration    | `link_constant_overrides`, `stage_defaults`                                                    | input to `run.py --validation-overlay` |
-| `artifacts/validation/cxl_ps_crosscheck.csv`   | `crosscheck_ps.py`        | direct scheduler cross-check evidence                      | `mape_percent`, `passes_tolerance`                                                             | validates `crosscheck_only` posture    |
+| `artifacts/validation/cxl_ps_crosscheck.csv`   | `crosscheck_ps.py`        | direct scheduler cross-check evidence                      | `mape_percent`, `passes_tolerance`                                                             | validates `validated_crosscheck` posture |
+| `artifacts/validation/cxl_ps_crosscheck_summary.yaml` | `crosscheck_ps.py`   | cross-check quality summary                                | `crosscheck_pass`, `crosscheck_mape_percent_mean`, `n_points`                                 | calibration status gating              |
 | `artifacts/validation/sensitivity_results.csv` | `sensitivity.py`          | sweep outcomes                                             | ratio columns + `sweep_family/sweep_case`                                                      | validation appendix                    |
 | `artifacts/validation/tornado_top8.csv`        | `sensitivity.py`          | top contributors near target point                         | `effect_score`, deltas                                                                         | robustness summary                     |
 | `artifacts/validation/ablations.csv`           | `sensitivity.py`          | ablation outcomes at `1x`                                  | `ablation`, ratio columns                                                                      | ablation appendix                      |
@@ -393,7 +402,7 @@ Reproducibility note: overlay link overrides are applied via an injected link ca
 - host-touch provenance/sanity section
 - residual policy audit section
 - one-way PCIe sanity summary
-- direct-status narrative (`measured`, `crosscheck_only`, `cited_sweep_only`)
+- direct-status narrative (`calibrated_measured`, `validated_crosscheck`, `swept_from_literature`)
 
 ### 12) Troubleshooting and Common Failures
 

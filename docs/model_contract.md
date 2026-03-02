@@ -19,10 +19,13 @@ Validation calibration contract:
 - optional measured paths: `direct`, `host_touch`.
 - default pinned contract requires required host paths to be pinned (`memory_mode_policy.required_paths_must_be_pinned=true`).
 - mixed pinned/pageable required-path rows are rejected by default (`allow_mixed_memory_mode=false`).
+- host-touch sanity policies are explicit:
+  - `host_touch_sanity.on_fail = warn|error`
+  - `host_touch_sanity.on_missing_reference = warn|error`
 - optional `direct` status is explicit:
-  - `measured`
-  - `crosscheck_only` (validated via PS cross-check; not measured calibrated)
-  - `cited_sweep_only` (no measured/crosscheck direct calibration path)
+  - `calibrated_measured`
+  - `validated_crosscheck` (validated via PS cross-check; not measured calibrated)
+  - `swept_from_literature` (no measured/crosscheck direct calibration path)
   - cited+sweep envelope metadata is carried in `direct_cited_envelope` (Melody latency/BW ranges plus switch latency/bottleneck sweeps)
 
 Canonical measured CSV schema per path:
@@ -31,7 +34,7 @@ Canonical measured CSV schema per path:
 - `host_touch` required columns: `system_id`, `path=host_touch`, `payload_bytes`, `repetition`, `time_s` (`concurrency` defaults to 1 if omitted)
 - optional measurement semantics columns: `tool`, `numa_policy`, `dma_engine`, `percentile_source`, `timestamp`, `notes`
 - `repetition` is sample-id only; fit/residuals use aggregate groups `(path,payload_bytes,concurrency)`
-- aggregate rows include `sample_count`, `p50_s`, `p95_s`, `p99_s`
+- aggregate rows include `n_samples`, `p05_s`, `p50_s`, `p95_s`
 
 ## Outputs
 
@@ -102,6 +105,8 @@ Per path fit uses:
 - `T = latency_s + bytes / bandwidth_Bps`
 - aggregate statistic (`median` or `mean`) over measured rows
 - fitting at configured reference concurrency (`fit_reference_concurrency`)
+- fitting payload window `[fit_payload_min_bytes, fit_payload_max_bytes]`
+- warning emitted when `fit_payload_min_bytes < 4096`
 
 Bounce decomposition derives host-touch fit:
 
@@ -109,6 +114,7 @@ Bounce decomposition derives host-touch fit:
 - `T_touch_est = host_touch_fixed_s + bytes / host_touch_Bps`
 - `host_touch_source` is always explicit: `derived_from_bounce` or `measured_stream`
 - negative residual handling is policy-driven and audited (`drop`, `clamp_to_zero`, `clamp_to_epsilon`)
+- direct cross-check gating uses `crosscheck_policy.pass_mape_max` and `crosscheck_policy.pass_points_min`
 - host-touch sanity output includes a STREAM methodology note (`arrays >= 4x LLC sum or >=1M elements`)
 
 PCIe sanity guard can flag suspicious one-way throughput using configured generation/lane width and utilization cap.

@@ -118,9 +118,9 @@ Calibration inputs are measured CSV files configured under `validation.calibrati
 
 Direct-path provenance is explicit:
 
-- `measured`: calibrated from measured direct CSV input
-- `crosscheck_only`: validated via PS cross-check artifact (`cxl_ps_crosscheck.csv`), not measured calibrated
-- `cited_sweep_only`: no measured direct input; use cited+sweep envelope
+- `calibrated_measured`: calibrated from measured direct CSV input
+- `validated_crosscheck`: validated via PS cross-check artifact (`cxl_ps_crosscheck.csv`), not measured calibrated
+- `swept_from_literature`: no measured direct input; use cited+sweep envelope
 
 ## Optional Retiling/Glue Layer
 

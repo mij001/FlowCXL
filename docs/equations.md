@@ -358,13 +358,13 @@ E_{total}=E_{compute}+E_{transfer}
 Measured rows are first aggregated by group:
 
 \[
-g=(path,\ payload,\ concurrency)
+g=(system\_id,\ path,\ payload,\ concurrency)
 \]
 \[
 T^{measured}_{g}=Agg\left(\{time\_s\}_{g}\right),\quad Agg\in\{median,mean\}
 \]
 \[
-p50_g=Q_{0.50}(\{time_s\}_g),\quad p95_g=Q_{0.95}(\{time_s\}_g),\quad p99_g=Q_{0.99}(\{time_s\}_g)
+n_g=|\{time_s\}_g|,\quad p05_g=Q_{0.05}(\{time_s\}_g),\quad p50_g=Q_{0.50}(\{time_s\}_g),\quad p95_g=Q_{0.95}(\{time_s\}_g)
 \]
 \[
 error_g = T^{measured}_g - T^{sim}_g
@@ -383,6 +383,10 @@ T_{path}(bytes)=latency_{path}+\frac{bytes}{BW_{path}}
 \]
 
 with `latency_path` and `BW_path` fitted from measured points using linear regression over payload size.
+Fit subset is constrained to:
+\[
+payload \in [fit\_payload\_min\_bytes,\ fit\_payload\_max\_bytes]
+\]
 
 Host-touch provenance:
 
@@ -413,7 +417,7 @@ T^{\prime}_{touch,est}=
 Direct-path provenance status:
 
 \[
-direct\_status \in \{measured,\ crosscheck\_only,\ cited\_sweep\_only\}
+direct\_status \in \{calibrated\_measured,\ validated\_crosscheck,\ swept\_from\_literature\}
 \]
 
 For cited+sweep posture, the envelope is recorded as:
@@ -424,7 +428,10 @@ latency_{ns}\in[214,394],\quad bandwidth_{GB/s}\in[18,52]
 switch\_latency_{ns}\approx 600,\quad hop\_latency\_sweep,\ bottleneck\_factor\_sweep \text{ configured}
 \]
 
-Cross-check acceptance compares direct scheduler MAPE against configured tolerance.
+Cross-check acceptance for `validated_crosscheck` uses:
+\[
+MAPE_{mean} \le 100\cdot pass\_mape\_max,\quad n\_points \ge pass\_points\_min
+\]
 
 ## 9) PCIe Ceiling Sanity Check
 
