@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
+import yaml
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -200,10 +201,30 @@ def run_crosscheck(config: Dict[str, object], out_dir: Path) -> Dict[str, object
     cross_df = pd.DataFrame(rows)
     out_path = out_dir / "cxl_ps_crosscheck.csv"
     cross_df.to_csv(out_path, index=False)
+    max_mape = float(cross_df["mape_percent"].max()) if not cross_df.empty else float("nan")
+    mean_mape = float(cross_df["mape_percent"].mean()) if not cross_df.empty else float("nan")
+    n_points = int(len(cross_df))
+    crosscheck_pass = bool(cross_df["passes_tolerance"].all()) if not cross_df.empty else False
+    summary_payload = {
+        "system_id": system_id,
+        "reference_model": "processor_share",
+        "crosscheck_pass": crosscheck_pass,
+        "crosscheck_mape_percent_mean": mean_mape,
+        "crosscheck_mape_percent_max": max_mape,
+        "n_points": n_points,
+        "tolerance_mape_percent": float(cross_cfg["tolerance_mape_percent"]),
+    }
+    summary_path = out_dir / "cxl_ps_crosscheck_summary.yaml"
+    with summary_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(summary_payload, handle, sort_keys=False)
     return {
         "system_id": system_id,
         "crosscheck_csv": str(out_path),
-        "max_mape_percent": float(cross_df["mape_percent"].max()),
+        "crosscheck_summary_yaml": str(summary_path),
+        "crosscheck_pass": crosscheck_pass,
+        "crosscheck_mape_percent_mean": mean_mape,
+        "crosscheck_mape_percent_max": max_mape,
+        "n_points": n_points,
     }
 
 

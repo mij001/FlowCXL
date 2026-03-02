@@ -12,6 +12,32 @@ VALID_CALIBRATION_PATHS = ("host_h2d", "host_d2h", "bounce", "direct", "host_tou
 TRANSFER_CALIBRATION_PATHS = ("host_h2d", "host_d2h", "bounce", "direct")
 DEFAULT_REQUIRED_CALIBRATION_PATHS = ("host_h2d", "host_d2h", "bounce")
 DEFAULT_OPTIONAL_CALIBRATION_PATHS = ("direct",)
+DIRECT_STATUS_CALIBRATED_MEASURED = "calibrated_measured"
+DIRECT_STATUS_VALIDATED_CROSSCHECK = "validated_crosscheck"
+DIRECT_STATUS_SWEPT_FROM_LITERATURE = "swept_from_literature"
+DIRECT_STATUS_LEGACY_ALIASES = {
+    "measured": DIRECT_STATUS_CALIBRATED_MEASURED,
+    "crosscheck_only": DIRECT_STATUS_VALIDATED_CROSSCHECK,
+    "cited_sweep_only": DIRECT_STATUS_SWEPT_FROM_LITERATURE,
+}
+VALID_DIRECT_STATUSES = {
+    DIRECT_STATUS_CALIBRATED_MEASURED,
+    DIRECT_STATUS_VALIDATED_CROSSCHECK,
+    DIRECT_STATUS_SWEPT_FROM_LITERATURE,
+}
+
+
+def normalize_direct_status(status: object, *, strict: bool = False) -> str:
+    token = str(status or "").strip()
+    if token == "":
+        return token
+    normalized = DIRECT_STATUS_LEGACY_ALIASES.get(token, token)
+    if strict and normalized not in VALID_DIRECT_STATUSES:
+        raise ValueError(
+            "direct status must be one of "
+            f"{sorted(VALID_DIRECT_STATUSES)} (got {token})"
+        )
+    return normalized
 
 
 def load_yaml(path: Path) -> Dict[str, object]:
@@ -91,18 +117,29 @@ def ensure_calibration_config(validation: Mapping[str, object]) -> Dict[str, obj
         raise ValueError("validation.calibration.fit_reference_concurrency must be > 0")
     cal["fit_reference_concurrency"] = fit_reference_concurrency
 
+    compare_level = str(cal.get("compare_level", "aggregated_by_path_payload_concurrency"))
+    if compare_level != "aggregated_by_path_payload_concurrency":
+        raise ValueError(
+            "validation.calibration.compare_level must be aggregated_by_path_payload_concurrency"
+        )
+    cal["compare_level"] = compare_level
+
     aggregate_stat = str(cal.get("aggregate_stat", "median"))
     if aggregate_stat not in {"median", "mean"}:
         raise ValueError("validation.calibration.aggregate_stat must be median or mean")
     cal["aggregate_stat"] = aggregate_stat
 
     measured_inputs_raw = cal.get("measured_inputs")
+    schema_warnings = []
     if measured_inputs_raw is None:
         paths_raw = cal.get("paths")
         if not isinstance(paths_raw, list) or not paths_raw:
             raise KeyError(
                 "validation.calibration requires measured_inputs map (or legacy paths list)"
             )
+        schema_warnings.append(
+            "validation.calibration.paths is legacy; use measured_inputs map instead"
+        )
         input_dir = str(cal.get("input_dir", "artifacts/validation_inputs"))
         measured_inputs_raw = {str(path): str(Path(input_dir) / f"{path}.csv") for path in paths_raw}
 
@@ -118,6 +155,8 @@ def ensure_calibration_config(validation: Mapping[str, object]) -> Dict[str, obj
             raise ValueError(f"empty CSV path for calibration path {name}")
         measured_inputs[name] = csv_path
     cal["measured_inputs"] = measured_inputs
+    if schema_warnings:
+        cal["schema_warnings"] = schema_warnings
 
     required_paths_raw = cal.get("required_paths", list(DEFAULT_REQUIRED_CALIBRATION_PATHS))
     optional_paths_raw = cal.get("optional_paths", list(DEFAULT_OPTIONAL_CALIBRATION_PATHS))
@@ -139,6 +178,15 @@ def ensure_calibration_config(validation: Mapping[str, object]) -> Dict[str, obj
 
     cal["required_paths"] = required_paths
     cal["optional_paths"] = optional_paths
+
+    fit_payload_min_bytes = int(cal.get("fit_payload_min_bytes", min(cal["payload_bytes"])))
+    fit_payload_max_bytes = int(cal.get("fit_payload_max_bytes", max(cal["payload_bytes"])))
+    if fit_payload_min_bytes <= 0 or fit_payload_max_bytes <= 0:
+        raise ValueError("validation.calibration.fit_payload_min_bytes/max_bytes must be > 0")
+    if fit_payload_min_bytes > fit_payload_max_bytes:
+        raise ValueError("validation.calibration.fit_payload_min_bytes must be <= fit_payload_max_bytes")
+    cal["fit_payload_min_bytes"] = fit_payload_min_bytes
+    cal["fit_payload_max_bytes"] = fit_payload_max_bytes
 
     required_points_min_samples = int(cal.get("required_points_min_samples", 5))
     if required_points_min_samples < 1:
@@ -191,10 +239,24 @@ def ensure_calibration_config(validation: Mapping[str, object]) -> Dict[str, obj
         "expected_bandwidth_Bps": expected_bandwidth,
         "ratio_min": ratio_min,
         "ratio_max": ratio_max,
-        "warn_only_if_missing_reference": bool(
-            host_touch_sanity_raw.get("warn_only_if_missing_reference", True)
-        ),
+        "on_fail": str(host_touch_sanity_raw.get("on_fail", "warn")).strip().lower(),
+        "on_missing_reference": str(
+            host_touch_sanity_raw.get(
+                "on_missing_reference",
+                "warn"
+                if bool(host_touch_sanity_raw.get("warn_only_if_missing_reference", True))
+                else "error",
+            )
+        )
+        .strip()
+        .lower(),
     }
+    if cal["host_touch_sanity"]["on_fail"] not in {"warn", "error"}:
+        raise ValueError("validation.calibration.host_touch_sanity.on_fail must be warn or error")
+    if cal["host_touch_sanity"]["on_missing_reference"] not in {"warn", "error"}:
+        raise ValueError(
+            "validation.calibration.host_touch_sanity.on_missing_reference must be warn or error"
+        )
 
     negative_policy_raw = cal.get("negative_residual_policy", {})
     if not isinstance(negative_policy_raw, Mapping):
@@ -277,6 +339,20 @@ def ensure_calibration_config(validation: Mapping[str, object]) -> Dict[str, obj
         "cited_switch_latency_ns": cited_switch_latency_ns,
         "cited_switch_hop_latency_ns_sweep": hop_latency_sweep,
         "cited_switch_bottleneck_factor_sweep": bottleneck_sweep,
+    }
+
+    crosscheck_policy_raw = cal.get("crosscheck_policy", {})
+    if not isinstance(crosscheck_policy_raw, Mapping):
+        raise ValueError("validation.calibration.crosscheck_policy must be a mapping")
+    pass_mape_max = float(crosscheck_policy_raw.get("pass_mape_max", 0.20))
+    pass_points_min = int(crosscheck_policy_raw.get("pass_points_min", 5))
+    if pass_mape_max <= 0.0 or pass_mape_max > 1.0:
+        raise ValueError("validation.calibration.crosscheck_policy.pass_mape_max must be in (0,1]")
+    if pass_points_min < 1:
+        raise ValueError("validation.calibration.crosscheck_policy.pass_points_min must be >= 1")
+    cal["crosscheck_policy"] = {
+        "pass_mape_max": pass_mape_max,
+        "pass_points_min": pass_points_min,
     }
 
     ceiling_raw = cal.get("ceiling_check", {})

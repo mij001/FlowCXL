@@ -429,10 +429,14 @@ validation:
       expected_bandwidth_Bps: null
       ratio_min: 0.2
       ratio_max: 2.0
-      warn_only_if_missing_reference: true
+      on_fail: warn
+      on_missing_reference: warn
     negative_residual_policy:
       mode: clamp_to_zero
       epsilon_s: 1.0e-9
+    crosscheck_policy:
+      pass_mape_max: 0.20
+      pass_points_min: 5
     direct_provenance_policy:
       allow_crosscheck_only: true
       allow_cited_sweep_only: true
@@ -448,6 +452,8 @@ validation:
     fit_model: latency_plus_bytes_over_bw
     fit_reference_concurrency: 1
     aggregate_stat: median
+    fit_payload_min_bytes: 4194304
+    fit_payload_max_bytes: 268435456
     ceiling_check:
       enabled: true
       pcie_gen: 4

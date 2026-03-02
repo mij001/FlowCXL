@@ -15,10 +15,14 @@ if __package__ in {None, ""}:
 
 import sources
 from tools.validation.common import (
+    DIRECT_STATUS_CALIBRATED_MEASURED,
+    DIRECT_STATUS_SWEPT_FROM_LITERATURE,
+    DIRECT_STATUS_VALIDATED_CROSSCHECK,
     TRANSFER_CALIBRATION_PATHS,
     ensure_calibration_config,
     ensure_validation_config,
     load_yaml,
+    normalize_direct_status,
     save_yaml,
 )
 
@@ -442,10 +446,11 @@ def _build_aggregated_rows(
     config: Dict[str, object],
 ) -> pd.DataFrame:
     grouped = (
-        measured_df.groupby(["path", "payload_bytes", "concurrency"])["measured_s"]
+        measured_df.groupby(["system_id", "path", "payload_bytes", "concurrency"])["measured_s"]
         .agg(
-            sample_count="size",
+            n_samples="size",
             mean_s="mean",
+            p05_s=lambda s: float(s.quantile(0.05)),
             p50_s=lambda s: float(s.quantile(0.50)),
             p95_s=lambda s: float(s.quantile(0.95)),
             p99_s=lambda s: float(s.quantile(0.99)),
@@ -457,6 +462,7 @@ def _build_aggregated_rows(
         axis=1,
     )
     grouped = grouped.sort_values(["path", "payload_bytes", "concurrency"]).reset_index(drop=True)
+    grouped["sample_count"] = grouped["n_samples"]
     grouped["simulated_s"] = grouped.apply(
         lambda row: _sim_time_for_path(
             path=str(row["path"]),
@@ -481,13 +487,20 @@ def _fit_path(
     path_name: str,
     agg_df: pd.DataFrame,
     fit_reference_concurrency: int,
+    fit_payload_min_bytes: int,
+    fit_payload_max_bytes: int,
 ) -> Dict[str, float | int | str]:
     fit_subset = agg_df[
-        (agg_df["path"] == path_name) & (agg_df["concurrency"] == fit_reference_concurrency)
+        (agg_df["path"] == path_name)
+        & (agg_df["concurrency"] == fit_reference_concurrency)
+        & (agg_df["payload_bytes"] >= fit_payload_min_bytes)
+        & (agg_df["payload_bytes"] <= fit_payload_max_bytes)
     ].copy()
     if fit_subset.empty:
         raise ValueError(
-            f"no measured aggregate rows for {path_name} at fit_reference_concurrency={fit_reference_concurrency}"
+            "no measured aggregate rows for "
+            f"{path_name} at fit_reference_concurrency={fit_reference_concurrency} "
+            f"within fit payload window [{fit_payload_min_bytes}, {fit_payload_max_bytes}]"
         )
 
     fit_subset = fit_subset.sort_values("payload_bytes")
@@ -510,7 +523,9 @@ def _fit_path(
         "mape_percent": float(mape),
         "n_points": len(x_vals),
         "fit_concurrency": int(fit_reference_concurrency),
-        "calibration_status": "measured",
+        "fit_payload_min_bytes": int(fit_payload_min_bytes),
+        "fit_payload_max_bytes": int(fit_payload_max_bytes),
+        "calibration_status": DIRECT_STATUS_CALIBRATED_MEASURED,
     }
 
 
@@ -518,11 +533,16 @@ def _fit_host_touch_from_measured(
     *,
     agg_df: pd.DataFrame,
     fit_reference_concurrency: int,
+    fit_payload_min_bytes: int,
+    fit_payload_max_bytes: int,
     fallback_stage_defaults: Mapping[str, object],
 ) -> Tuple[Dict[str, float | int | str], List[str]]:
     warnings: List[str] = []
     fit_subset = agg_df[
-        (agg_df["path"] == "host_touch") & (agg_df["concurrency"] == fit_reference_concurrency)
+        (agg_df["path"] == "host_touch")
+        & (agg_df["concurrency"] == fit_reference_concurrency)
+        & (agg_df["payload_bytes"] >= fit_payload_min_bytes)
+        & (agg_df["payload_bytes"] <= fit_payload_max_bytes)
     ].copy()
     fit_subset = fit_subset.sort_values("payload_bytes")
 
@@ -536,6 +556,8 @@ def _fit_host_touch_from_measured(
                 "mape_percent": 0.0,
                 "n_points": int(len(fit_subset)),
                 "fit_concurrency": int(fit_reference_concurrency),
+                "fit_payload_min_bytes": int(fit_payload_min_bytes),
+                "fit_payload_max_bytes": int(fit_payload_max_bytes),
                 "status": "fallback_defaults",
             },
             warnings,
@@ -561,6 +583,8 @@ def _fit_host_touch_from_measured(
             "mape_percent": float(mape),
             "n_points": len(x_vals),
             "fit_concurrency": int(fit_reference_concurrency),
+            "fit_payload_min_bytes": int(fit_payload_min_bytes),
+            "fit_payload_max_bytes": int(fit_payload_max_bytes),
             "status": "measured_stream",
         },
         warnings,
@@ -571,6 +595,8 @@ def _fit_host_touch_from_bounce(
     *,
     payloads: Sequence[int],
     fit_reference_concurrency: int,
+    fit_payload_min_bytes: int,
+    fit_payload_max_bytes: int,
     agg_df: pd.DataFrame,
     path_fits: Mapping[str, Mapping[str, float | int | str]],
     fallback_stage_defaults: Mapping[str, object],
@@ -599,6 +625,8 @@ def _fit_host_touch_from_bounce(
 
     for payload in payloads:
         payload_i = int(payload)
+        if payload_i < fit_payload_min_bytes or payload_i > fit_payload_max_bytes:
+            continue
         if payload_i not in bounce_map:
             continue
         payload_f = float(payload_i)
@@ -636,6 +664,8 @@ def _fit_host_touch_from_bounce(
                 "mape_percent": 0.0,
                 "n_points": len(x_vals),
                 "fit_concurrency": int(fit_reference_concurrency),
+                "fit_payload_min_bytes": int(fit_payload_min_bytes),
+                "fit_payload_max_bytes": int(fit_payload_max_bytes),
                 "status": "fallback_defaults",
             },
             warnings,
@@ -660,6 +690,8 @@ def _fit_host_touch_from_bounce(
             "mape_percent": float(mape),
             "n_points": len(x_vals),
             "fit_concurrency": int(fit_reference_concurrency),
+            "fit_payload_min_bytes": int(fit_payload_min_bytes),
+            "fit_payload_max_bytes": int(fit_payload_max_bytes),
             "status": "derived_from_bounce",
         },
         warnings,
@@ -677,11 +709,14 @@ def _compute_host_touch_sanity(
     ratio_min = float(host_touch_sanity_cfg["ratio_min"])
     ratio_max = float(host_touch_sanity_cfg["ratio_max"])
     expected_bw = host_touch_sanity_cfg.get("expected_bandwidth_Bps")
-    warn_only_if_missing_reference = bool(host_touch_sanity_cfg["warn_only_if_missing_reference"])
+    on_fail = str(host_touch_sanity_cfg.get("on_fail", "warn"))
+    on_missing_reference = str(host_touch_sanity_cfg.get("on_missing_reference", "warn"))
 
     result: Dict[str, object] = {
         "enabled": enabled,
         "source": host_touch_source,
+        "on_fail": on_fail,
+        "on_missing_reference": on_missing_reference,
         "ratio_min": ratio_min,
         "ratio_max": ratio_max,
         "stream_methodology_note": "STREAM guidance: arrays >= 4x LLC sum (or >=1M elements).",
@@ -690,6 +725,7 @@ def _compute_host_touch_sanity(
         "derived_bandwidth_Bps": float(host_touch_fit["host_touch_Bps"]),
         "ratio": None,
         "status": "disabled" if not enabled else "pass",
+        "action": "none",
         "note": "",
     }
     if not enabled:
@@ -700,26 +736,32 @@ def _compute_host_touch_sanity(
         result["reference_bandwidth_Bps"] = float(host_touch_fit["host_touch_Bps"])
         result["ratio"] = 1.0
         result["status"] = "pass"
+        result["action"] = "none"
         result["note"] = "Host-touch fit used direct measured input."
         return result
 
     if expected_bw is None:
-        result["reference_source"] = "none"
-        result["status"] = "warn_no_reference" if warn_only_if_missing_reference else "fail_no_reference"
-        result["note"] = "No measured host_touch input or expected_bandwidth_Bps reference provided."
+        result["reference_source"] = "derived_from_bounce"
+        result["status"] = "warn" if on_missing_reference == "warn" else "fail"
+        result["action"] = on_missing_reference
+        result["note"] = (
+            "No measured host_touch input or expected_bandwidth_Bps reference provided."
+        )
         return result
 
     ref_bw = float(expected_bw)
     derived_bw = float(host_touch_fit["host_touch_Bps"])
     ratio = derived_bw / max(ref_bw, 1e-12)
-    result["reference_source"] = "expected_bandwidth_Bps"
+    result["reference_source"] = "expected_bandwidth"
     result["reference_bandwidth_Bps"] = ref_bw
     result["ratio"] = ratio
     if ratio_min <= ratio <= ratio_max:
         result["status"] = "pass"
+        result["action"] = "none"
         result["note"] = "Derived host-touch bandwidth is within configured sanity range."
     else:
-        result["status"] = "warn_out_of_range"
+        result["status"] = "warn" if on_fail == "warn" else "fail"
+        result["action"] = on_fail
         result["note"] = "Derived host-touch bandwidth is outside configured sanity range."
     return result
 
@@ -789,23 +831,74 @@ def _compute_ceiling_check(
     }
 
 
+def _crosscheck_passes_policy(
+    *,
+    crosscheck_summary: Mapping[str, object] | None,
+    crosscheck_policy: Mapping[str, object],
+) -> Tuple[bool, Dict[str, object]]:
+    if (not crosscheck_summary) or ("crosscheck_mape_percent_mean" not in crosscheck_summary):
+        return False, {
+            "summary_available": False,
+            "crosscheck_pass_flag": False,
+            "crosscheck_mape_percent_mean": None,
+            "crosscheck_n_points": 0,
+            "policy_pass_mape_max": float(crosscheck_policy["pass_mape_max"]),
+            "policy_pass_points_min": int(crosscheck_policy["pass_points_min"]),
+            "threshold_pass": False,
+        }
+    pass_flag = bool(crosscheck_summary.get("crosscheck_pass", False))
+    mape_percent = float(crosscheck_summary.get("crosscheck_mape_percent_mean", float("inf")))
+    n_points = int(crosscheck_summary.get("n_points", 0))
+    pass_mape_max_percent = float(crosscheck_policy["pass_mape_max"]) * 100.0
+    pass_points_min = int(crosscheck_policy["pass_points_min"])
+    threshold_pass = (mape_percent <= pass_mape_max_percent) and (n_points >= pass_points_min)
+    return threshold_pass, {
+        "summary_available": True,
+        "crosscheck_pass_flag": pass_flag,
+        "crosscheck_mape_percent_mean": mape_percent,
+        "crosscheck_n_points": n_points,
+        "policy_pass_mape_max": float(crosscheck_policy["pass_mape_max"]),
+        "policy_pass_points_min": pass_points_min,
+        "threshold_pass": threshold_pass,
+    }
+
+
 def _resolve_direct_status(
     *,
     direct_measured: bool,
     direct_policy: Mapping[str, object],
-) -> str:
+    crosscheck_summary: Mapping[str, object] | None,
+    crosscheck_policy: Mapping[str, object],
+) -> Tuple[str, Dict[str, object]]:
     if direct_measured:
-        return "measured"
-    if bool(direct_policy["allow_crosscheck_only"]):
-        return "crosscheck_only"
+        return DIRECT_STATUS_CALIBRATED_MEASURED, {
+            "resolution_reason": "direct_measured_fit_available"
+        }
+    crosscheck_ok, crosscheck_eval = _crosscheck_passes_policy(
+        crosscheck_summary=crosscheck_summary,
+        crosscheck_policy=crosscheck_policy,
+    )
+    if bool(direct_policy["allow_crosscheck_only"]) and crosscheck_ok:
+        return DIRECT_STATUS_VALIDATED_CROSSCHECK, {
+            "resolution_reason": "crosscheck_policy_passed",
+            "crosscheck_evaluation": crosscheck_eval,
+        }
     if bool(direct_policy["allow_cited_sweep_only"]):
-        return "cited_sweep_only"
+        return DIRECT_STATUS_SWEPT_FROM_LITERATURE, {
+            "resolution_reason": "literature_sweep_fallback",
+            "crosscheck_evaluation": crosscheck_eval,
+        }
     raise ValueError(
-        "direct path is unmeasured and both crosscheck_only and cited_sweep_only fallbacks are disabled"
+        "direct path is unmeasured and neither crosscheck-policy pass nor literature fallback is available"
     )
 
 
-def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, object]:
+def run_calibration(
+    config: Dict[str, object],
+    out_dir: Path,
+    *,
+    crosscheck_summary: Mapping[str, object] | None = None,
+) -> Dict[str, object]:
     validation = ensure_validation_config(config)
     cal_cfg = ensure_calibration_config(validation)
     if not bool(cal_cfg.get("enabled", False)):
@@ -818,6 +911,12 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
     optional_paths = [str(v) for v in cal_cfg["optional_paths"]]
     fit_reference_concurrency = int(cal_cfg["fit_reference_concurrency"])
     aggregate_stat = str(cal_cfg["aggregate_stat"])
+    fit_payload_min_bytes = int(cal_cfg["fit_payload_min_bytes"])
+    fit_payload_max_bytes = int(cal_cfg["fit_payload_max_bytes"])
+    if crosscheck_summary is None:
+        crosscheck_summary_path = out_dir / "cxl_ps_crosscheck_summary.yaml"
+        if crosscheck_summary_path.exists():
+            crosscheck_summary = load_yaml(crosscheck_summary_path)
 
     measured_df, loaded_paths, missing_paths, coverage_summary, semantics_summary = _load_measured_rows(
         system_id=system_id,
@@ -867,6 +966,8 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
         "fit_model": str(cal_cfg["fit_model"]),
         "aggregate_stat": aggregate_stat,
         "fit_reference_concurrency": fit_reference_concurrency,
+        "fit_payload_min_bytes": fit_payload_min_bytes,
+        "fit_payload_max_bytes": fit_payload_max_bytes,
         "calibration_status": {},
         "direct_status": "",
         "paths": {},
@@ -876,9 +977,16 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
         "coverage_summary": coverage_summary,
         "measurement_semantics_summary": semantics_summary,
         "negative_residual_summary": {},
+        "crosscheck_evaluation": {},
         "direct_status_note": "",
+        "direct_provenance_summary": "",
+        "schema_warnings": list(cal_cfg.get("schema_warnings", [])),
         "overlay": {},
     }
+    if fit_payload_min_bytes < 4096:
+        fit["fit_warnings"].append(
+            "Small-payload regime may deviate from latency+bytes/BW model; consider raising fit window."
+        )
 
     path_fits: Dict[str, Dict[str, float | int | str]] = {}
     configured_inputs = set(cal_cfg["measured_inputs"].keys())
@@ -893,21 +1001,6 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
     for path_name in transfer_paths:
         has_measured = path_name in configured_inputs and path_name not in missing_paths
         if path_name == "direct" and not has_measured:
-            direct_status = _resolve_direct_status(
-                direct_measured=False,
-                direct_policy=cal_cfg["direct_provenance_policy"],
-            )
-            fit["calibration_status"][path_name] = direct_status
-            path_fits[path_name] = {
-                "bandwidth_Bps": float("nan"),
-                "latency_s": float("nan"),
-                "r2": float("nan"),
-                "mape_percent": float("nan"),
-                "n_points": 0,
-                "fit_concurrency": fit_reference_concurrency,
-                "calibration_status": direct_status,
-            }
-            fit["direct_status"] = direct_status
             continue
 
         if not has_measured:
@@ -920,29 +1013,39 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
             path_name=path_name,
             agg_df=agg_df,
             fit_reference_concurrency=fit_reference_concurrency,
+            fit_payload_min_bytes=fit_payload_min_bytes,
+            fit_payload_max_bytes=fit_payload_max_bytes,
         )
-        fit["calibration_status"][path_name] = "measured"
+        fit["calibration_status"][path_name] = DIRECT_STATUS_CALIBRATED_MEASURED
         path_fits[path_name] = path_fit
-        if path_name == "direct":
-            fit["direct_status"] = "measured"
 
-    if "direct" not in fit["calibration_status"]:
-        direct_measured = "direct" in path_fits and fit["calibration_status"].get("direct") == "measured"
-        fit["direct_status"] = _resolve_direct_status(
-            direct_measured=direct_measured,
-            direct_policy=cal_cfg["direct_provenance_policy"],
-        )
-        fit["calibration_status"]["direct"] = fit["direct_status"]
-        if not direct_measured:
-            path_fits["direct"] = {
-                "bandwidth_Bps": float("nan"),
-                "latency_s": float("nan"),
-                "r2": float("nan"),
-                "mape_percent": float("nan"),
-                "n_points": 0,
-                "fit_concurrency": fit_reference_concurrency,
-                "calibration_status": fit["direct_status"],
-            }
+    direct_measured = (
+        "direct" in path_fits
+        and fit["calibration_status"].get("direct") == DIRECT_STATUS_CALIBRATED_MEASURED
+    )
+    direct_status, direct_status_meta = _resolve_direct_status(
+        direct_measured=direct_measured,
+        direct_policy=cal_cfg["direct_provenance_policy"],
+        crosscheck_summary=crosscheck_summary,
+        crosscheck_policy=cal_cfg["crosscheck_policy"],
+    )
+    fit["direct_status"] = normalize_direct_status(direct_status, strict=True)
+    fit["calibration_status"]["direct"] = fit["direct_status"]
+    fit["crosscheck_evaluation"] = dict(direct_status_meta.get("crosscheck_evaluation", {}))
+    if direct_measured:
+        path_fits["direct"]["calibration_status"] = fit["direct_status"]
+    if not direct_measured:
+        path_fits["direct"] = {
+            "bandwidth_Bps": float("nan"),
+            "latency_s": float("nan"),
+            "r2": float("nan"),
+            "mape_percent": float("nan"),
+            "n_points": 0,
+            "fit_concurrency": fit_reference_concurrency,
+            "fit_payload_min_bytes": int(fit_payload_min_bytes),
+            "fit_payload_max_bytes": int(fit_payload_max_bytes),
+            "calibration_status": fit["direct_status"],
+        }
 
     for required_path in ["host_h2d", "host_d2h", "bounce"]:
         if required_path not in path_fits:
@@ -961,6 +1064,8 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
         host_touch_fit, touch_warnings = _fit_host_touch_from_measured(
             agg_df=agg_df,
             fit_reference_concurrency=fit_reference_concurrency,
+            fit_payload_min_bytes=fit_payload_min_bytes,
+            fit_payload_max_bytes=fit_payload_max_bytes,
             fallback_stage_defaults=config["stage_defaults"],
         )
         host_touch_source = "measured_stream"
@@ -968,6 +1073,8 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
         host_touch_fit, touch_warnings, negative_summary = _fit_host_touch_from_bounce(
             payloads=payloads,
             fit_reference_concurrency=fit_reference_concurrency,
+            fit_payload_min_bytes=fit_payload_min_bytes,
+            fit_payload_max_bytes=fit_payload_max_bytes,
             agg_df=agg_df,
             path_fits=path_fits,
             fallback_stage_defaults=config["stage_defaults"],
@@ -984,6 +1091,12 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
         host_touch_sanity_cfg=cal_cfg["host_touch_sanity"],
     )
     fit["host_touch_sanity"] = host_touch_sanity
+    if host_touch_sanity.get("status") == "fail":
+        if str(host_touch_sanity.get("action", "warn")) == "error":
+            raise ValueError(f"host_touch_sanity failed: {host_touch_sanity.get('note', '')}")
+        fit["fit_warnings"].append(f"host_touch_sanity: {host_touch_sanity.get('note', '')}")
+    elif str(host_touch_sanity.get("status", "")).startswith("warn"):
+        fit["fit_warnings"].append(f"host_touch_sanity: {host_touch_sanity.get('note', '')}")
 
     ceiling_cfg = cal_cfg["ceiling_check"]
     ceiling_result = _compute_ceiling_check(
@@ -997,16 +1110,19 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
         raise ValueError(f"ceiling check violation for paths: {violations}")
 
     fit["direct_provenance_policy"] = dict(cal_cfg["direct_provenance_policy"])
-    if fit["direct_status"] == "measured":
+    if fit["direct_status"] == DIRECT_STATUS_CALIBRATED_MEASURED:
         fit["direct_status_note"] = "Direct path measured and calibrated from measured CSV."
-    elif fit["direct_status"] == "crosscheck_only":
+        fit["direct_provenance_summary"] = "calibrated from measured direct path"
+    elif fit["direct_status"] == DIRECT_STATUS_VALIDATED_CROSSCHECK:
         fit["direct_status_note"] = (
             "Direct path unmeasured; validated via processor-share cross-check and not calibrated."
         )
-    elif fit["direct_status"] == "cited_sweep_only":
+        fit["direct_provenance_summary"] = "validated by cross-check, not calibrated"
+    elif fit["direct_status"] == DIRECT_STATUS_SWEPT_FROM_LITERATURE:
         fit["direct_status_note"] = (
-            "Direct path unmeasured; treated as cited+swept envelope (Melody latency/BW range)."
+            "Direct path unmeasured; treated as literature sweep envelope (Melody latency/BW range)."
         )
+        fit["direct_provenance_summary"] = "cited+swept envelope"
     fit["direct_cited_envelope"] = {
         "latency_ns_range": list(cal_cfg["direct_provenance_policy"]["cited_latency_ns_range"]),
         "bandwidth_GBps_range": list(cal_cfg["direct_provenance_policy"]["cited_bandwidth_GBps_range"]),
@@ -1039,7 +1155,7 @@ def run_calibration(config: Dict[str, object], out_dir: Path) -> Dict[str, objec
         },
     }
 
-    if fit["direct_status"] == "measured":
+    if fit["direct_status"] == DIRECT_STATUS_CALIBRATED_MEASURED:
         overlay["link_constant_overrides"][direct_link_id] = {
             "bandwidth_Bps": float(path_fits["direct"]["bandwidth_Bps"]),
             "latency_s": float(path_fits["direct"]["latency_s"]),

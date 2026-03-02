@@ -60,8 +60,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     validation_dir = Path(args.artifacts_dir) / "validation"
     validation_dir.mkdir(parents=True, exist_ok=True)
 
-    calibration_summary = run_calibration(config=config, out_dir=validation_dir)
     cross_summary = run_crosscheck(config=config, out_dir=validation_dir)
+    calibration_summary = run_calibration(
+        config=config,
+        out_dir=validation_dir,
+        crosscheck_summary=cross_summary,
+    )
     sensitivity_cfg = config
     sensitivity_links_catalog = {str(link_id): dict(link_cfg) for link_id, link_cfg in sources.LINKS.items()}
     overlay_yaml = calibration_summary.get("overlay_yaml")
@@ -89,6 +93,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         "direct_status": calibration_summary.get("direct_status", ""),
         "calibration_available": bool(calibration_summary.get("fit_yaml")),
         "crosscheck_available": bool(cross_summary.get("crosscheck_csv")),
+        "crosscheck_pass": cross_summary.get("crosscheck_pass", False),
+        "crosscheck_mape_percent_mean": cross_summary.get("crosscheck_mape_percent_mean", ""),
+        "crosscheck_mape_percent_max": cross_summary.get("crosscheck_mape_percent_max", ""),
+        "crosscheck_n_points": cross_summary.get("n_points", 0),
         "direct_cited_envelope": {},
     }
     fit_yaml = calibration_summary.get("fit_yaml")
